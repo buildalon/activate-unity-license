@@ -1,0 +1,30 @@
+name: Buildalon Activate Unity License
+description: A GitHub Action to activate a Unity Game Engine license for CI/CD workflows.
+branding:
+  color: red
+  icon: log-in
+inputs:
+  license:
+    description: 'Must be one of `Personal`, `Professional`, `Floating`.'
+    required: false
+    default: 'Personal'
+  username:
+    description: 'The email address you use for your Unity Id. Required for `Personal` and `Professional` license activations.'
+    required: true
+    default: ''
+  password:
+    description: 'The password you use for Unity Id access. Required for `Personal` and `Professional` license activations.'
+    required: true
+    default: ''
+  serial:
+    description: 'The Serial number for the seat. Required for Professional license activations.'
+    required: false
+    default: ''
+  configuration:
+    description: 'Unity License Client `services-config.json` encoded base base64 string. Required for `Floating` license activations.'
+    required: false
+    default: ''
+runs:
+  using: 'node20'
+  main: 'dist/index.js'
+  post: 'dist/index.js'
