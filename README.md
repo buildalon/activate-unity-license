@@ -2,7 +2,7 @@
 
 [![Discord](https://img.shields.io/discord/939721153688264824.svg?label=&logo=discord&logoColor=ffffff&color=7389D8&labelColor=6A7EC2)](https://discord.gg/VM9cWJ9rjH) [![actions](https://github.com/buildalon/activate-unity-license/actions/workflows/validate.yml/badge.svg?branch=main&event=push)](https://github.com/buildalon/activate-unity-license/actions/workflows/validate.yml)
 
-A GitHub Action for activating a [Unity Game Engine](https://unity.com) license on GitHub Action Runners.
+A GitHub Action to activate a [Unity Game Engine](https://unity.com) license for CI/CD workflows.
 
 ## How to use
 
