@@ -44,7 +44,7 @@ jobs:
         with:
           repository: RageAgainstThePixel/com.utilities.buildpipeine
           path: com.utilities.buildpipline
-      - uses: buildalon/unity-setup@v1
+      - uses: buildalon/unity-setup@development
         with:
           unity-version: ${{ matrix.unity-versions }}
           build-targets: ${{ matrix.build-targets }}
