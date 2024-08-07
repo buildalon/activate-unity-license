@@ -1,5 +1,7 @@
 name: validate
 on:
+  schedule:
+    - cron: '0 0 * * 0' # Run every Sunday at midnight
   push:
     branches:
       - 'main'
@@ -45,7 +47,7 @@ jobs:
         with:
           repository: RageAgainstThePixel/com.utilities.buildpipeine
           path: com.utilities.buildpipline
-      - uses: buildalon/unity-setup@development
+      - uses: buildalon/unity-setup@v1
         with:
           unity-version: ${{ matrix.unity-versions }}
           build-targets: ${{ matrix.build-targets }}
