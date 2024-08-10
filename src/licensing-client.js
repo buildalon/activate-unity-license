@@ -81,7 +81,6 @@ async function execWithMask(args) {
     try {
         core.info(`[command]"${client}" ${args.join(' ')}`);
         exitCode = await exec.exec(`"${client}"`, args, {
-            silent: true,
             listeners: {
                 stdout: (data) => {
                     output += data.toString();
@@ -89,7 +88,9 @@ async function execWithMask(args) {
                 stderr: (data) => {
                     output += data.toString();
                 }
-            }
+            },
+            silent: true,
+            ignoreReturnCode: true
         });
     } finally {
         const maskedOutput = maskSerialInOutput(output);
