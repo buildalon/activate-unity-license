@@ -16,7 +16,6 @@ async function getLicensingClient() {
         const version = process.env.UNITY_EDITOR_VERSION || editorPath.match(/(\d+\.\d+\.\d+[a-z]?\d?)/)[0];
         core.debug(`Unity Version: ${version}`);
         const major = version.split('.')[0];
-        // if 2019.3 or older, use unity hub licensing client
         useLicenseClient = major < 2020;
     } else {
         useLicenseClient = true;
