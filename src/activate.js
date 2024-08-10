@@ -4,10 +4,6 @@ const core = require('@actions/core');
 async function Activate() {
     let license = undefined;
     try {
-        const editorPath = process.env.UNITY_EDITOR_PATH;
-        if (!editorPath) {
-            throw Error("Missing UNITY_EDITOR_PATH!");
-        }
         core.saveState('isPost', true);
         await licenseClient.Version();
         let activeLicenses = await licenseClient.ShowEntitlements();
