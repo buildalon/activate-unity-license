@@ -28600,10 +28600,6 @@ const core = __nccwpck_require__(2186);
 async function Activate() {
     let license = undefined;
     try {
-        const editorPath = process.env.UNITY_EDITOR_PATH;
-        if (!editorPath) {
-            throw Error("Missing UNITY_EDITOR_PATH!");
-        }
         core.saveState('isPost', true);
         await licenseClient.Version();
         let activeLicenses = await licenseClient.ShowEntitlements();
@@ -28704,15 +28700,22 @@ let client = undefined;
 
 async function getLicensingClient() {
     core.debug('Getting Licensing Client...');
+    let useLicenseClient = false;
     const editorPath = process.env.UNITY_EDITOR_PATH;
-    const version = process.env.UNITY_EDITOR_VERSION || editorPath.match(/(\d+\.\d+\.\d+[a-z]?\d?)/)[0];
-    core.debug(`Unity Editor Path: ${editorPath}`);
-    core.debug(`Unity Version: ${version}`);
-    await fs.access(editorPath, fs.constants.X_OK);
+    if (editorPath) {
+        core.debug(`Unity Editor Path: ${editorPath}`);
+        await fs.access(editorPath, fs.constants.X_OK);
+        const version = process.env.UNITY_EDITOR_VERSION;
+        version = editorPath.match(/(\d+\.\d+\.\d+[a-z]?\d?)/)[0];
+        core.debug(`Unity Version: ${version}`);
+        const major = version.split('.')[0];
+        // if 2019.3 or older, use unity hub licensing client
+        useLicenseClient = major < 2020;
+    } else {
+        useLicenseClient = true;
+    }
     let licenseClientPath;
-    const major = version.split('.')[0];
-    // if 2019.3 or older, use unity hub licensing client
-    if (major < 2020) {
+    if (useLicenseClient) {
         const unityHubPath = process.env.UNITY_HUB_PATH || process.env.HOME;
         core.debug(`Unity Hub Path: ${unityHubPath}`);
         await fs.access(unityHubPath, fs.constants.R_OK);
