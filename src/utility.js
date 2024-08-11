@@ -65,6 +65,7 @@ async function GetLogs() {
         const auditLogPath = auditLogPaths[process.platform];
         const artifact = new DefaultArtifactClient();
         const artifactName = `LicenseLogs-${process.platform}-${new Date().toISOString()}`;
+        core.info(`Uploading logs ${artifactName}...`);
         await artifact.uploadArtifact(artifactName, [logPath, auditLogPath], {
             retentionDays: 1,
             compressionLevel: 0
