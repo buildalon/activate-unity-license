@@ -190,4 +190,4 @@ async function ReturnLicense(license) {
     }
 }
 
-module.exports = { Version, ShowEntitlements, ActivateLicense, ActivateLicenseWithConfig, ReturnLicense }
+module.exports = { Version, ShowEntitlements, ActivateLicense, ActivateLicenseWithConfig, ActivateAllEntitlements, ReturnLicense }
