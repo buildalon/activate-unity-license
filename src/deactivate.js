@@ -1,5 +1,4 @@
 const licensingClient = require('./licensing-client');
-const { GetLogs } = require('./utility');
 const core = require('@actions/core');
 
 async function Deactivate() {

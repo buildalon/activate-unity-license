@@ -2,7 +2,6 @@ const core = require('@actions/core');
 const glob = require('@actions/glob');
 const fs = require("fs").promises;
 const path = require('path');
-const { DefaultArtifactClient } = require('@actions/artifact');
 
 async function GetHubRootPath(hubPath) {
     core.debug(`searching for hub root path: ${hubPath}`);
@@ -59,51 +58,4 @@ async function findGlobPattern(pattern) {
     }
 }
 
-async function GetLogs() {
-    try {
-        const logPath = logPaths[process.platform];
-        const auditLogPath = auditLogPaths[process.platform];
-        const files = [];
-        try {
-            await fs.access(logPath, fs.constants.R_OK);
-            files.push(logPath);
-        } catch (error) {
-            core.warning(`Failed to access log file: ${logPath}`);
-        }
-        try {
-            await fs.access(auditLogPath, fs.constants.R_OK);
-            files.push(auditLogPath);
-        } catch (error) {
-            core.warning(`Failed to access log file: ${auditLogPath}`);
-        }
-        const artifact = new DefaultArtifactClient();
-        const artifactName = `LicenseLogs-${process.platform}-${new Date().toISOString().replace(/:/g, '-')}`;
-        core.info(`Uploading logs ${artifactName}...`);
-        await artifact.uploadArtifact(artifactName, ...files, process.env.HOME, {
-            retentionDays: 1,
-            compressionLevel: 0
-        });
-    } catch (error) {
-        core.warning(`Failed to upload logs!\n${error}`);
-    }
-}
-
-const rootLogDir = {
-    'win32': '%LOCALAPPDATA%\\Unity',
-    'darwin': '~/Library/Logs/Unity/',
-    'linux': '~/.config/unity3d/Unity/'
-}
-
-const logPaths = {
-    'win32': '%LOCALAPPDATA%\\Unity\\Unity.Licensing.Client.log',
-    'darwin': '~/Library/Logs/Unity/Unity.Licensing.Client.log',
-    'linux': '~/.config/unity3d/Unity/Unity.Licensing.Client.log'
-}
-
-const auditLogPaths = {
-    'win32': '%LOCALAPPDATA%\Unity\Unity.Entitlements.Audit.log',
-    'darwin': '~/Library/Logs/Unity/Unity.Entitlements.Audit.log',
-    'linux': '~/.config/unity3d/Unity/Unity.Entitlements.Audit.log'
-}
-
-module.exports = { ResolveGlobPath, GetEditorRootPath, GetHubRootPath, GetLogs };
+module.exports = { ResolveGlobPath, GetEditorRootPath, GetHubRootPath };

@@ -1,6 +1,5 @@
 const licenseClient = require('./licensing-client');
 const core = require('@actions/core');
-const { GetLogs } = require('./utility');
 
 async function Activate() {
     let license = undefined;
