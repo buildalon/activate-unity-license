@@ -58,4 +58,37 @@ async function findGlobPattern(pattern) {
     }
 }
 
-module.exports = { ResolveGlobPath, GetEditorRootPath, GetHubRootPath }
+async function CopyLogs() {
+    try {
+
+        const workspace = process.env.GITHUB_WORKSPACE;
+        const logsDir = path.join(workspace, 'Logs');
+        try {
+            await fs.access(logsDir, fs.constants.W_OK);
+        } catch (error) {
+            await fs.mkdir(logsDir, { recursive: true });
+        }
+        const logPath = logPaths[process.platform];
+        const auditLogPath = auditLogPaths[process.platform];
+        const logDest = path.join(logsDir, 'Unity.Licensing.Client.log');
+        const auditLogDest = path.join(logsDir, 'Unity.Entitlements.Audit.log');
+        await fs.copyFile(logPath, logDest);
+        await fs.copyFile(auditLogPath, auditLogDest);
+    } catch (error) {
+        core.warning(`Failed to copy logs!\n${error}`);
+    }
+}
+
+const logPaths = {
+    'win32': '%LOCALAPPDATA%\\Unity\\Unity.Licensing.Client.log',
+    'darwin': '~/Library/Logs/Unity/Unity.Licensing.Client.log',
+    'linux': '~/.config/unity3d/Unity/Unity.Licensing.Client.log'
+}
+
+const auditLogPaths = {
+    'win32': '%LOCALAPPDATA%\Unity\Unity.Entitlements.Audit.log',
+    'darwin': '~/Library/Logs/Unity/Unity.Entitlements.Audit.log',
+    'linux': '	~/.config/unity3d/Unity/Unity.Entitlements.Audit.log'
+}
+
+module.exports = { ResolveGlobPath, GetEditorRootPath, GetHubRootPath, CopyLogs };
