@@ -26,7 +26,6 @@ async function Deactivate() {
         }
         core.info(`Unity ${license} License successfully returned.`);
     } catch (error) {
-        await GetLogs();
         core.setFailed(`Failed to deactivate license!\n${error}`);
         process.exit(1);
     }
