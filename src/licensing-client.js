@@ -167,14 +167,6 @@ async function ActivateLicense(username, password, serial) {
     await execWithMask(args);
 }
 
-async function ActivateAllEntitlements(username, password, serial) {
-    const args = [`--activate-all`, `--username`, username, `--password`, password];
-    if (serial === undefined || serial.length === 0) {
-        args.push(`--include-personal`);
-    }
-    await execWithMask(args);
-}
-
 async function ActivateLicenseWithConfig(servicesConfig) {
     const servicesConfigPath = path.join(servicesPath[process.platform], 'services-config.json');
     core.debug(`Services Config Path: ${servicesConfigPath}`);
@@ -190,4 +182,4 @@ async function ReturnLicense(license) {
     }
 }
 
-module.exports = { Version, ShowEntitlements, ActivateLicense, ActivateLicenseWithConfig, ActivateAllEntitlements, ReturnLicense }
+module.exports = { Version, ShowEntitlements, ActivateLicense, ActivateLicenseWithConfig, ReturnLicense }

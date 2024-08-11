@@ -28627,7 +28627,6 @@ async function Activate() {
                 const password = core.getInput('password', { required: true });
                 const serial = core.getInput('serial', { required: license.toLowerCase().startsWith('pro') });
                 await licenseClient.ActivateLicense(username, password, serial);
-                await licenseClient.ActivateAllEntitlements(username, password, serial);
             }
             activeLicenses = await licenseClient.ShowEntitlements();
             if (!activeLicenses.includes(license.toLowerCase())) {
@@ -28669,9 +28668,10 @@ async function Deactivate() {
             const activeLicenses = await licensingClient.ShowEntitlements();
             if (license !== undefined &&
                 !activeLicenses.includes(license.toLowerCase())) {
-                core.warning(`${license} was never activated.`);
+                core.warning(`${license} is not activated.`);
+            } else {
+                await licensingClient.ReturnLicense(license);
             }
-            await licensingClient.ReturnLicense(license);
         }
         finally {
             core.endGroup();
@@ -28860,14 +28860,6 @@ async function ActivateLicense(username, password, serial) {
     await execWithMask(args);
 }
 
-async function ActivateAllEntitlements(username, password, serial) {
-    const args = [`--activate-all`, `--username`, username, `--password`, password];
-    if (serial === undefined || serial.length === 0) {
-        args.push(`--include-personal`);
-    }
-    await execWithMask(args);
-}
-
 async function ActivateLicenseWithConfig(servicesConfig) {
     const servicesConfigPath = path.join(servicesPath[process.platform], 'services-config.json');
     core.debug(`Services Config Path: ${servicesConfigPath}`);
@@ -28883,7 +28875,7 @@ async function ReturnLicense(license) {
     }
 }
 
-module.exports = { Version, ShowEntitlements, ActivateLicense, ActivateLicenseWithConfig, ActivateAllEntitlements, ReturnLicense }
+module.exports = { Version, ShowEntitlements, ActivateLicense, ActivateLicenseWithConfig, ReturnLicense }
 
 
 /***/ }),

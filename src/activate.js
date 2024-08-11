@@ -31,7 +31,6 @@ async function Activate() {
                 const password = core.getInput('password', { required: true });
                 const serial = core.getInput('serial', { required: license.toLowerCase().startsWith('pro') });
                 await licenseClient.ActivateLicense(username, password, serial);
-                await licenseClient.ActivateAllEntitlements(username, password, serial);
             }
             activeLicenses = await licenseClient.ShowEntitlements();
             if (!activeLicenses.includes(license.toLowerCase())) {
