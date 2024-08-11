@@ -66,13 +66,19 @@ async function GetLogs() {
         const artifact = new DefaultArtifactClient();
         const artifactName = `LicenseLogs-${process.platform}-${new Date().toISOString().replace(/:/g, '-')}`;
         core.info(`Uploading logs ${artifactName}...`);
-        await artifact.uploadArtifact(artifactName, [logPath, auditLogPath], {
+        await artifact.uploadArtifact(artifactName, [logPath, auditLogPath], rootLogDir[process.platform], {
             retentionDays: 1,
             compressionLevel: 0
         });
     } catch (error) {
         core.warning(`Failed to upload logs!\n${error}`);
     }
+}
+
+const rootLogDir = {
+    'win32': '%LOCALAPPDATA%\\Unity',
+    'darwin': '~/Library/Logs/Unity/',
+    'linux': '~/.config/unity3d/Unity/'
 }
 
 const logPaths = {
@@ -84,7 +90,7 @@ const logPaths = {
 const auditLogPaths = {
     'win32': '%LOCALAPPDATA%\Unity\Unity.Entitlements.Audit.log',
     'darwin': '~/Library/Logs/Unity/Unity.Entitlements.Audit.log',
-    'linux': '	~/.config/unity3d/Unity/Unity.Entitlements.Audit.log'
+    'linux': '~/.config/unity3d/Unity/Unity.Entitlements.Audit.log'
 }
 
 module.exports = { ResolveGlobPath, GetEditorRootPath, GetHubRootPath, GetLogs };
