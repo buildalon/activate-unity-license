@@ -58,4 +58,4 @@ async function findGlobPattern(pattern) {
     }
 }
 
-module.exports = { ResolveGlobPath, GetEditorRootPath, GetHubRootPath }
+module.exports = { ResolveGlobPath, GetEditorRootPath, GetHubRootPath };

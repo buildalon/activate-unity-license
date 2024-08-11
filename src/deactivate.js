@@ -16,9 +16,10 @@ async function Deactivate() {
             const activeLicenses = await licensingClient.ShowEntitlements();
             if (license !== undefined &&
                 !activeLicenses.includes(license.toLowerCase())) {
-                core.warning(`${license} was never activated.`);
+                throw Error(`Unity ${license} License is not activated!`);
+            } else {
+                await licensingClient.ReturnLicense(license);
             }
-            await licensingClient.ReturnLicense(license);
         }
         finally {
             core.endGroup();
