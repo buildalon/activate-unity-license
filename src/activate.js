@@ -1,6 +1,6 @@
 const licenseClient = require('./licensing-client');
 const core = require('@actions/core');
-const { CopyLogs } = require('./utility');
+const { GetLogs } = require('./utility');
 
 async function Activate() {
     let license = undefined;
@@ -42,7 +42,7 @@ async function Activate() {
         }
     } catch (error) {
         core.setFailed(`Unity License Activation Failed!\n${error}`);
-        CopyLogs();
+        GetLogs();
         process.exit(1);
     }
     core.info(`Unity ${license} License Activated!`);

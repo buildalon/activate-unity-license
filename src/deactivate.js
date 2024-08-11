@@ -1,5 +1,5 @@
 const licensingClient = require('./licensing-client');
-const { CopyLogs } = require('./utility');
+const { GetLogs } = require('./utility');
 const core = require('@actions/core');
 
 async function Deactivate() {
@@ -28,7 +28,7 @@ async function Deactivate() {
         core.info(`Unity ${license} License successfully returned.`);
     } catch (error) {
         core.setFailed(`Failed to deactivate license!\n${error}`);
-        CopyLogs();
+        GetLogs();
         process.exit(1);
     }
 };
