@@ -63,10 +63,23 @@ async function GetLogs() {
     try {
         const logPath = logPaths[process.platform];
         const auditLogPath = auditLogPaths[process.platform];
+        const files = [];
+        try {
+            await fs.access(logPath, fs.constants.R_OK);
+            files.push(logPath);
+        } catch (error) {
+            core.warning(`Failed to access log file: ${logPath}`);
+        }
+        try {
+            await fs.access(auditLogPath, fs.constants.R_OK);
+            files.push(auditLogPath);
+        } catch (error) {
+            core.warning(`Failed to access log file: ${auditLogPath}`);
+        }
         const artifact = new DefaultArtifactClient();
         const artifactName = `LicenseLogs-${process.platform}-${new Date().toISOString().replace(/:/g, '-')}`;
         core.info(`Uploading logs ${artifactName}...`);
-        await artifact.uploadArtifact(artifactName, [logPath, auditLogPath], process.env.HOME, {
+        await artifact.uploadArtifact(artifactName, ...files, process.env.HOME, {
             retentionDays: 1,
             compressionLevel: 0
         });
