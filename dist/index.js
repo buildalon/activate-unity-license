@@ -28691,7 +28691,7 @@ module.exports = { Deactivate }
 /***/ 917:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
-const { ResolveGlobPath, GetEditorRootPath, GetHubRootPath } = __nccwpck_require__(4345);
+const { ResolveGlobPath, GetHubRootPath } = __nccwpck_require__(4345);
 const core = __nccwpck_require__(2186);
 const exec = __nccwpck_require__(1514);
 const fs = (__nccwpck_require__(7147).promises);
@@ -28905,25 +28905,6 @@ async function GetHubRootPath(hubPath) {
     return hubRootPath;
 }
 
-async function GetEditorRootPath(editorPath) {
-    core.debug(`searching for editor root path: ${editorPath}`);
-    let editorRootPath = editorPath;
-    switch (process.platform) {
-        case 'darwin':
-            editorRootPath = path.join(editorPath, '../../../');
-            break;
-        case 'win32':
-            editorRootPath = path.join(editorPath, '../');
-            break
-        case 'linux':
-            editorRootPath = path.join(editorPath, '../');
-            break;
-    }
-    await fs.access(editorRootPath, fs.constants.R_OK);
-    core.debug(`found editor root path: ${editorRootPath}`);
-    return editorRootPath;
-}
-
 async function ResolveGlobPath(globs) {
     const globPath = path.join(...globs);
     const result = await findGlobPattern(globPath);
@@ -28943,7 +28924,7 @@ async function findGlobPattern(pattern) {
     }
 }
 
-module.exports = { ResolveGlobPath, GetEditorRootPath, GetHubRootPath };
+module.exports = { ResolveGlobPath, GetHubRootPath };
 
 
 /***/ }),

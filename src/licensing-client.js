@@ -1,4 +1,4 @@
-const { ResolveGlobPath, GetEditorRootPath, GetHubRootPath } = require('./utility');
+const { ResolveGlobPath, GetHubRootPath } = require('./utility');
 const core = require('@actions/core');
 const exec = require('@actions/exec');
 const fs = require("fs").promises;
