@@ -24,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-latest, windows-latest, macos-latest, macos-13 ]
+        os: [ ubuntu-latest, windows-latest, macos-latest]
         unity-versions:
           - 'in version file'
           - 2019.4.40f1 (ffc62b691db5)
@@ -37,8 +37,6 @@ jobs:
             build-targets: StandaloneLinux64
           - os: windows-latest
             build-targets: StandaloneWindows64
-          - os: macos-13
-            build-targets: StandaloneOSX
           - os: macos-latest
             build-targets: StandaloneOSX
     steps:
