@@ -28835,11 +28835,8 @@ async function Version() {
 }
 async function ShowEntitlements() {
     const output = await execWithMask([`--showEntitlements`]);
-    const matches = Array.from(output.matchAll(/Product Name: (?<license>.+)/g));
+    const matches = output.matchAll(/Product Name: (?<license>.+)/g);
     const licenses = [];
-    if (!matches || matches.length === 0) {
-        return undefined;
-    }
     for (const match of matches) {
         if (match.groups.license) {
             switch (match.groups.license) {
@@ -28859,7 +28856,7 @@ async function ShowEntitlements() {
     return licenses;
 }
 async function ActivateLicense(username, password, serial) {
-    let args = [`--activate-ulf`, `--username`, username, `--password`, password];
+    const args = [`--activate-ulf`, `--username`, username, `--password`, password];
     if (serial !== undefined && serial.length > 0) {
         args.push(`--serial`, serial);
         const maskedSerial = serial.slice(0, -4) + `XXXX`;

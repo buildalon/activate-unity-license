@@ -130,11 +130,8 @@ async function Version(): Promise<void> {
 
 async function ShowEntitlements(): Promise<string[]> {
     const output = await execWithMask([`--showEntitlements`]);
-    const matches = Array.from(output.matchAll(/Product Name: (?<license>.+)/g));
+    const matches = output.matchAll(/Product Name: (?<license>.+)/g);
     const licenses = [];
-    if (!matches || matches.length === 0) {
-        return undefined;
-    }
     for (const match of matches) {
         if (match.groups.license) {
             switch (match.groups.license) {
@@ -155,7 +152,7 @@ async function ShowEntitlements(): Promise<string[]> {
 }
 
 async function ActivateLicense(username: string, password: string, serial: string): Promise<void> {
-    let args = [`--activate-ulf`, `--username`, username, `--password`, password];
+    const args = [`--activate-ulf`, `--username`, username, `--password`, password];
     if (serial !== undefined && serial.length > 0) {
         args.push(`--serial`, serial);
         const maskedSerial = serial.slice(0, -4) + `XXXX`;
