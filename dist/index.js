@@ -28591,12 +28591,15 @@ exports["default"] = _default;
 
 /***/ }),
 
-/***/ 3816:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+/***/ 4132:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
-const licenseClient = __nccwpck_require__(917);
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.Activate = Activate;
+const licenseClient = __nccwpck_require__(8447);
 const core = __nccwpck_require__(2186);
-
 async function Activate() {
     let license = undefined;
     try {
@@ -28622,9 +28625,10 @@ async function Activate() {
             if (license.toLowerCase().startsWith('f')) {
                 const servicesConfig = core.getInput('services-config', { required: true });
                 await licenseClient.ActivateLicenseWithConfig(servicesConfig);
-            } else {
-                const username = core.getInput('username', { required: true });
-                const password = core.getInput('password', { required: true });
+            }
+            else {
+                const username = core.getInput('username', { required: true }).trim();
+                const password = core.getInput('password', { required: true }).trim();
                 const serial = core.getInput('serial', { required: license.toLowerCase().startsWith('pro') });
                 await licenseClient.ActivateLicense(username, password, serial);
             }
@@ -28632,27 +28636,30 @@ async function Activate() {
             if (!activeLicenses.includes(license.toLowerCase())) {
                 throw Error(`Failed to activate Unity License with ${license}!`);
             }
-        } finally {
+        }
+        finally {
             core.endGroup();
         }
-    } catch (error) {
+    }
+    catch (error) {
         core.setFailed(`Unity License Activation Failed!\n${error}`);
         process.exit(1);
     }
     core.info(`Unity ${license} License Activated!`);
 }
 
-module.exports = { Activate };
-
 
 /***/ }),
 
-/***/ 8162:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+/***/ 8146:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
-const licensingClient = __nccwpck_require__(917);
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.Deactivate = Deactivate;
+const licensingClient = __nccwpck_require__(8447);
 const core = __nccwpck_require__(2186);
-
 async function Deactivate() {
     try {
         const license = core.getState('license');
@@ -28669,7 +28676,8 @@ async function Deactivate() {
             if (license !== undefined &&
                 !activeLicenses.includes(license.toLowerCase())) {
                 throw Error(`Unity ${license} License is not activated!`);
-            } else {
+            }
+            else {
                 await licensingClient.ReturnLicense(license);
             }
         }
@@ -28677,54 +28685,57 @@ async function Deactivate() {
             core.endGroup();
         }
         core.info(`Unity ${license} License successfully returned.`);
-    } catch (error) {
+    }
+    catch (error) {
         core.setFailed(`Failed to deactivate license!\n${error}`);
         process.exit(1);
     }
-};
-
-module.exports = { Deactivate }
+}
+;
 
 
 /***/ }),
 
-/***/ 917:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+/***/ 8447:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
-const { ResolveGlobPath, GetHubRootPath } = __nccwpck_require__(4345);
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.Version = Version;
+exports.ShowEntitlements = ShowEntitlements;
+exports.ActivateLicense = ActivateLicense;
+exports.ActivateLicenseWithConfig = ActivateLicenseWithConfig;
+exports.ReturnLicense = ReturnLicense;
+const utility_1 = __nccwpck_require__(5418);
 const core = __nccwpck_require__(2186);
 const exec = __nccwpck_require__(1514);
-const fs = (__nccwpck_require__(7147).promises);
 const path = __nccwpck_require__(1017);
-
+const fs = __nccwpck_require__(7147);
 let client = undefined;
-
 async function getLicensingClient() {
     core.debug('Getting Licensing Client...');
     const unityHubPath = process.env.UNITY_HUB_PATH || process.env.HOME;
     core.debug(`Unity Hub Path: ${unityHubPath}`);
-    await fs.access(unityHubPath, fs.constants.R_OK);
-    // C:\Program Files\Unity Hub\UnityLicensingClient_V1
-    // /Applications/Unity\ Hub.app/Contents/MacOS/Unity\ Hub/UnityLicensingClient_V1
-    // ~/Applications/Unity\ Hub.AppImage/UnityLicensingClient_V1
-    const rootHubPath = await GetHubRootPath(unityHubPath);
+    await fs.promises.access(unityHubPath, fs.constants.R_OK);
+    const rootHubPath = await (0, utility_1.GetHubRootPath)(unityHubPath);
     const globs = [rootHubPath, '**'];
     if (process.platform === 'win32') {
         globs.push('Unity.Licensing.Client.exe');
-    } else {
+    }
+    else {
         globs.push('Unity.Licensing.Client');
     }
-    const licenseClientPath = await ResolveGlobPath(globs);
+    const licenseClientPath = await (0, utility_1.ResolveGlobPath)(globs);
     core.debug(`Unity Licensing Client Path: ${licenseClientPath}`);
-    await fs.access(licenseClientPath, fs.constants.X_OK);
+    await fs.promises.access(licenseClientPath, fs.constants.X_OK);
     return licenseClientPath;
 }
-
 async function execWithMask(args) {
     if (!client) {
         client = await getLicensingClient();
     }
-    await fs.access(client, fs.constants.X_OK);
+    await fs.promises.access(client, fs.constants.X_OK);
     let output = '';
     let exitCode = 0;
     try {
@@ -28741,11 +28752,14 @@ async function execWithMask(args) {
             silent: true,
             ignoreReturnCode: true
         });
-    } finally {
+    }
+    finally {
         const maskedOutput = maskSerialInOutput(output);
         const splitLines = maskedOutput.split(/\r?\n/);
         for (const line of splitLines) {
-            if (line === undefined || line.length === 0) { continue; }
+            if (line === undefined || line.length === 0) {
+                continue;
+            }
             core.info(line);
         }
         if (exitCode !== 0) {
@@ -28754,7 +28768,6 @@ async function execWithMask(args) {
     }
     return output;
 }
-
 function maskSerialInOutput(output) {
     return output.replace(/([\w-]+-XXXX)/g, (_, serial) => {
         const maskedSerial = serial.slice(0, -4) + `XXXX`;
@@ -28762,7 +28775,6 @@ function maskSerialInOutput(output) {
         return serial;
     });
 }
-
 function getExitCodeMessage(exitCode) {
     switch (exitCode) {
         case 0:
@@ -28813,24 +28825,18 @@ function getExitCodeMessage(exitCode) {
             return 'Unknown error';
     }
 }
-
 const servicesPath = {
     win32: path.join(process.env.PROGRAMDATA || '', 'Unity', 'config'),
     darwin: path.join('/Library', 'Application Support', 'Unity', 'config'),
     linux: path.join('/usr', 'share', 'unity3d', 'config')
-}
-
+};
 async function Version() {
     await execWithMask([`--version`]);
 }
-
 async function ShowEntitlements() {
     const output = await execWithMask([`--showEntitlements`]);
     const matches = output.matchAll(/Product Name: (?<license>.+)/g);
     const licenses = [];
-    if (!matches || matches.length === 0) {
-        return undefined;
-    }
     for (const match of matches) {
         if (match.groups.license) {
             switch (match.groups.license) {
@@ -28849,23 +28855,21 @@ async function ShowEntitlements() {
     }
     return licenses;
 }
-
 async function ActivateLicense(username, password, serial) {
-    let args = [`--activate-ulf`, `--username`, username, `--password`, password];
+    const args = [`--activate-ulf`, `--username`, username, `--password`, password];
     if (serial !== undefined && serial.length > 0) {
+        serial = serial.trim();
         args.push(`--serial`, serial);
         const maskedSerial = serial.slice(0, -4) + `XXXX`;
         core.setSecret(maskedSerial);
     }
     await execWithMask(args);
 }
-
 async function ActivateLicenseWithConfig(servicesConfig) {
     const servicesConfigPath = path.join(servicesPath[process.platform], 'services-config.json');
     core.debug(`Services Config Path: ${servicesConfigPath}`);
-    await fs.writeFile(servicesConfigPath, Buffer.from(servicesConfig, 'base64'));
+    await fs.promises.writeFile(servicesConfigPath, Buffer.from(servicesConfig, 'base64'));
 }
-
 async function ReturnLicense(license) {
     await execWithMask([`--return-ulf`]);
     const activeLicenses = await ShowEntitlements();
@@ -28875,19 +28879,21 @@ async function ReturnLicense(license) {
     }
 }
 
-module.exports = { Version, ShowEntitlements, ActivateLicense, ActivateLicenseWithConfig, ReturnLicense }
-
 
 /***/ }),
 
-/***/ 4345:
-/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+/***/ 5418:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.ResolveGlobPath = ResolveGlobPath;
+exports.GetHubRootPath = GetHubRootPath;
 const core = __nccwpck_require__(2186);
 const glob = __nccwpck_require__(8090);
-const fs = (__nccwpck_require__(7147).promises);
 const path = __nccwpck_require__(1017);
-
+const fs = __nccwpck_require__(7147);
 async function GetHubRootPath(hubPath) {
     core.debug(`searching for hub root path: ${hubPath}`);
     let hubRootPath = hubPath;
@@ -28897,24 +28903,22 @@ async function GetHubRootPath(hubPath) {
             break;
         case 'win32':
             hubRootPath = path.join(hubPath, '../');
-            break
+            break;
         case 'linux':
             hubRootPath = path.join(hubPath, '../');
             break;
     }
     return hubRootPath;
 }
-
 async function ResolveGlobPath(globs) {
     const globPath = path.join(...globs);
     const result = await findGlobPattern(globPath);
     if (result === undefined) {
         throw Error(`Failed to resolve glob: ${globPath}`);
     }
-    await fs.access(result, fs.constants.R_OK);
+    await fs.promises.access(result, fs.constants.R_OK);
     return result;
 }
-
 async function findGlobPattern(pattern) {
     core.debug(`searching for: ${pattern}...`);
     const globber = await glob.create(pattern);
@@ -28923,8 +28927,6 @@ async function findGlobPattern(pattern) {
         return file;
     }
 }
-
-module.exports = { ResolveGlobPath, GetHubRootPath };
 
 
 /***/ }),
@@ -30833,23 +30835,25 @@ module.exports = parseParams
 /******/ 	
 /************************************************************************/
 var __webpack_exports__ = {};
-// This entry need to be wrapped in an IIFE because it need to be isolated against other modules in the chunk.
+// This entry need to be wrapped in an IIFE because it need to be in strict mode.
 (() => {
+"use strict";
+var exports = __webpack_exports__;
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
 const core = __nccwpck_require__(2186);
-const { Activate } = __nccwpck_require__(3816);
-const { Deactivate } = __nccwpck_require__(8162);
-
+const activate_1 = __nccwpck_require__(4132);
+const deactivate_1 = __nccwpck_require__(8146);
 const IsPost = !!core.getState('isPost');
-
 const main = async () => {
     if (!IsPost) {
-        await Activate();
-    } else {
-        await Deactivate();
+        await (0, activate_1.Activate)();
+    }
+    else {
+        await (0, deactivate_1.Deactivate)();
     }
     process.exit(0);
-}
-
+};
 main();
 
 })();

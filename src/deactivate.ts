@@ -1,7 +1,7 @@
-const licensingClient = require('./licensing-client');
-const core = require('@actions/core');
+import licensingClient = require('./licensing-client');
+import core = require('@actions/core');
 
-async function Deactivate() {
+async function Deactivate(): Promise<void> {
     try {
         const license = core.getState('license');
         if (!license) {
@@ -31,4 +31,4 @@ async function Deactivate() {
     }
 };
 
-module.exports = { Deactivate }
+export { Deactivate }

@@ -1,19 +1,16 @@
-const { ResolveGlobPath, GetHubRootPath } = require('./utility');
-const core = require('@actions/core');
-const exec = require('@actions/exec');
-const fs = require("fs").promises;
-const path = require('path');
+import { ResolveGlobPath, GetHubRootPath } from './utility';
+import core = require('@actions/core');
+import exec = require('@actions/exec');
+import path = require('path');
+import fs = require('fs');
 
 let client = undefined;
 
-async function getLicensingClient() {
+async function getLicensingClient(): Promise<string> {
     core.debug('Getting Licensing Client...');
     const unityHubPath = process.env.UNITY_HUB_PATH || process.env.HOME;
     core.debug(`Unity Hub Path: ${unityHubPath}`);
-    await fs.access(unityHubPath, fs.constants.R_OK);
-    // C:\Program Files\Unity Hub\UnityLicensingClient_V1
-    // /Applications/Unity\ Hub.app/Contents/MacOS/Unity\ Hub/UnityLicensingClient_V1
-    // ~/Applications/Unity\ Hub.AppImage/UnityLicensingClient_V1
+    await fs.promises.access(unityHubPath, fs.constants.R_OK);
     const rootHubPath = await GetHubRootPath(unityHubPath);
     const globs = [rootHubPath, '**'];
     if (process.platform === 'win32') {
@@ -23,15 +20,15 @@ async function getLicensingClient() {
     }
     const licenseClientPath = await ResolveGlobPath(globs);
     core.debug(`Unity Licensing Client Path: ${licenseClientPath}`);
-    await fs.access(licenseClientPath, fs.constants.X_OK);
+    await fs.promises.access(licenseClientPath, fs.constants.X_OK);
     return licenseClientPath;
 }
 
-async function execWithMask(args) {
+async function execWithMask(args: string[]): Promise<string> {
     if (!client) {
         client = await getLicensingClient();
     }
-    await fs.access(client, fs.constants.X_OK);
+    await fs.promises.access(client, fs.constants.X_OK);
     let output = '';
     let exitCode = 0;
     try {
@@ -62,7 +59,7 @@ async function execWithMask(args) {
     return output;
 }
 
-function maskSerialInOutput(output) {
+function maskSerialInOutput(output: string): string {
     return output.replace(/([\w-]+-XXXX)/g, (_, serial) => {
         const maskedSerial = serial.slice(0, -4) + `XXXX`;
         core.setSecret(maskedSerial);
@@ -70,7 +67,7 @@ function maskSerialInOutput(output) {
     });
 }
 
-function getExitCodeMessage(exitCode) {
+function getExitCodeMessage(exitCode: number): string {
     switch (exitCode) {
         case 0:
             return 'OK';
@@ -127,17 +124,14 @@ const servicesPath = {
     linux: path.join('/usr', 'share', 'unity3d', 'config')
 }
 
-async function Version() {
+async function Version(): Promise<void> {
     await execWithMask([`--version`]);
 }
 
-async function ShowEntitlements() {
+async function ShowEntitlements(): Promise<string[]> {
     const output = await execWithMask([`--showEntitlements`]);
     const matches = output.matchAll(/Product Name: (?<license>.+)/g);
     const licenses = [];
-    if (!matches || matches.length === 0) {
-        return undefined;
-    }
     for (const match of matches) {
         if (match.groups.license) {
             switch (match.groups.license) {
@@ -157,9 +151,10 @@ async function ShowEntitlements() {
     return licenses;
 }
 
-async function ActivateLicense(username, password, serial) {
-    let args = [`--activate-ulf`, `--username`, username, `--password`, password];
+async function ActivateLicense(username: string, password: string, serial: string): Promise<void> {
+    const args = [`--activate-ulf`, `--username`, username, `--password`, password];
     if (serial !== undefined && serial.length > 0) {
+        serial = serial.trim();
         args.push(`--serial`, serial);
         const maskedSerial = serial.slice(0, -4) + `XXXX`;
         core.setSecret(maskedSerial);
@@ -167,13 +162,13 @@ async function ActivateLicense(username, password, serial) {
     await execWithMask(args);
 }
 
-async function ActivateLicenseWithConfig(servicesConfig) {
+async function ActivateLicenseWithConfig(servicesConfig: string): Promise<void> {
     const servicesConfigPath = path.join(servicesPath[process.platform], 'services-config.json');
     core.debug(`Services Config Path: ${servicesConfigPath}`);
-    await fs.writeFile(servicesConfigPath, Buffer.from(servicesConfig, 'base64'));
+    await fs.promises.writeFile(servicesConfigPath, Buffer.from(servicesConfig, 'base64'));
 }
 
-async function ReturnLicense(license) {
+async function ReturnLicense(license: string): Promise<void> {
     await execWithMask([`--return-ulf`]);
     const activeLicenses = await ShowEntitlements();
     if (license !== undefined &&
@@ -182,4 +177,4 @@ async function ReturnLicense(license) {
     }
 }
 
-module.exports = { Version, ShowEntitlements, ActivateLicense, ActivateLicenseWithConfig, ReturnLicense }
+export { Version, ShowEntitlements, ActivateLicense, ActivateLicenseWithConfig, ReturnLicense }
