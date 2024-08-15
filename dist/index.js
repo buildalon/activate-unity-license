@@ -28627,8 +28627,8 @@ async function Activate() {
                 await licenseClient.ActivateLicenseWithConfig(servicesConfig);
             }
             else {
-                const username = core.getInput('username', { required: true });
-                const password = core.getInput('password', { required: true });
+                const username = core.getInput('username', { required: true }).trim();
+                const password = core.getInput('password', { required: true }).trim();
                 const serial = core.getInput('serial', { required: license.toLowerCase().startsWith('pro') });
                 await licenseClient.ActivateLicense(username, password, serial);
             }
@@ -28858,6 +28858,7 @@ async function ShowEntitlements() {
 async function ActivateLicense(username, password, serial) {
     const args = [`--activate-ulf`, `--username`, username, `--password`, password];
     if (serial !== undefined && serial.length > 0) {
+        serial = serial.trim();
         args.push(`--serial`, serial);
         const maskedSerial = serial.slice(0, -4) + `XXXX`;
         core.setSecret(maskedSerial);

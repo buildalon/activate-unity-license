@@ -27,8 +27,8 @@ async function Activate(): Promise<void> {
                 const servicesConfig = core.getInput('services-config', { required: true });
                 await licenseClient.ActivateLicenseWithConfig(servicesConfig);
             } else {
-                const username = core.getInput('username', { required: true });
-                const password = core.getInput('password', { required: true });
+                const username = core.getInput('username', { required: true }).trim();
+                const password = core.getInput('password', { required: true }).trim();
                 const serial = core.getInput('serial', { required: license.toLowerCase().startsWith('pro') });
                 await licenseClient.ActivateLicense(username, password, serial);
             }

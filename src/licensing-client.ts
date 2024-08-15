@@ -154,6 +154,7 @@ async function ShowEntitlements(): Promise<string[]> {
 async function ActivateLicense(username: string, password: string, serial: string): Promise<void> {
     const args = [`--activate-ulf`, `--username`, username, `--password`, password];
     if (serial !== undefined && serial.length > 0) {
+        serial = serial.trim();
         args.push(`--serial`, serial);
         const maskedSerial = serial.slice(0, -4) + `XXXX`;
         core.setSecret(maskedSerial);
