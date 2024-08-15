@@ -1,8 +1,8 @@
 name: Buildalon Activate Unity License
 description: A GitHub Action to activate a Unity Game Engine license for CI/CD workflows.
 branding:
-  color: red
-  icon: log-in
+  color: 'red'
+  icon: 'log-in'
 inputs:
   license:
     description: 'Must be one of `Personal`, `Professional`, `Floating`.'

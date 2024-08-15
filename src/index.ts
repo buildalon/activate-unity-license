@@ -1,6 +1,6 @@
-const core = require('@actions/core');
-const { Activate } = require('./activate');
-const { Deactivate } = require('./deactivate');
+import core = require('@actions/core');
+import { Activate } from './activate';
+import { Deactivate } from './deactivate';
 
 const IsPost = !!core.getState('isPost');
 
