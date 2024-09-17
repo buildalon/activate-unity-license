@@ -24,25 +24,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-latest, windows-latest, macos-latest]
-        unity-versions: [2019.x, 2020.x, 2021.x, 2022.x, 6000.x]
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        unity-version: [2021.x, 2022.x, 6000.x]
         include:
           - os: ubuntu-latest
-            build-targets: StandaloneLinux64
+            build-target: StandaloneLinux64
           - os: windows-latest
-            build-targets: StandaloneWindows64
+            build-target: StandaloneWindows64
           - os: macos-latest
-            build-targets: StandaloneOSX
+            build-target: StandaloneOSX
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with:
-          repository: RageAgainstThePixel/com.utilities.buildpipeine
-          path: com.utilities.buildpipline
       - uses: buildalon/unity-setup@v1
         with:
-          unity-version: ${{ matrix.unity-versions }}
-          build-targets: ${{ matrix.build-targets }}
+          version-file: 'None'
+          unity-version: ${{ matrix.unity-version }}
+          build-targets: ${{ matrix.build-target }}
       - uses: ./ # buildalon/action-activate-unity-license
         with:
           license: Personal
