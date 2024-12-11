@@ -28631,18 +28631,21 @@ async function Activate() {
                 const pro = license.toLowerCase().startsWith('pro');
                 let username = core.getInput('username', { required: pro }).trim();
                 let password = core.getInput('password', { required: pro }).trim();
-                if (!username && !password) {
-                    const encodedUsername = process_1.env['UNITY_USERNAME'];
-                    const encodedPassword = process_1.env['UNITY_PASSWORD'];
-                    if (encodedUsername && encodedPassword) {
-                        username = Buffer.from(encodedUsername, 'base64').toString('utf-8');
-                        password = Buffer.from(encodedPassword, 'base64').toString('utf-8');
-                    }
-                    else {
-                        throw Error('Username and Password are required for Unity License Activation!');
-                    }
-                }
                 const serial = core.getInput('serial', { required: pro });
+                if (!username) {
+                    const encodedUsername = process_1.env['UNITY_USERNAME_BASE64'];
+                    if (!encodedUsername) {
+                        throw Error('Username is required for Unity License Activation!');
+                    }
+                    username = Buffer.from(encodedUsername, 'base64').toString('utf-8');
+                }
+                if (!password) {
+                    const encodedPassword = process_1.env['UNITY_PASSWORD_BASE64'];
+                    if (!encodedPassword) {
+                        throw Error('Password is required for Unity License Activation!');
+                    }
+                    password = Buffer.from(encodedPassword, 'base64').toString('utf-8');
+                }
                 await licenseClient.ActivateLicense(username, password, serial);
             }
             activeLicenses = await licenseClient.ShowEntitlements();
