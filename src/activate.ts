@@ -34,7 +34,7 @@ async function Activate(): Promise<void> {
                 const serial = core.getInput('serial', { required: pro });
 
                 if (!username) {
-                    const encodedUsername = env['UNITY_USERNAME'];
+                    const encodedUsername = env['UNITY_USERNAME_BASE64'];
                     if (!encodedUsername) {
                         throw Error('Username is required for Unity License Activation!');
                     }
@@ -43,7 +43,7 @@ async function Activate(): Promise<void> {
                 }
 
                 if (!password) {
-                    const encodedPassword = env['UNITY_PASSWORD'];
+                    const encodedPassword = env['UNITY_PASSWORD_BASE64'];
                     if (!encodedPassword) {
                         throw Error('Password is required for Unity License Activation!');
                     }
