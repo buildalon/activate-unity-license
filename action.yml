@@ -10,11 +10,11 @@ inputs:
     default: 'Personal'
   username:
     description: 'The email address you use for your Unity Id. Required for `Personal` and `Professional` license activations.'
-    required: true
+    required: false
     default: ''
   password:
     description: 'The password you use for Unity Id access. Required for `Personal` and `Professional` license activations.'
-    required: true
+    required: false
     default: ''
   serial:
     description: 'The Serial number for the seat. Required for Professional license activations.'
