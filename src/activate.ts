@@ -1,3 +1,4 @@
+import { env } from 'process';
 import licenseClient = require('./licensing-client');
 import core = require('@actions/core');
 
@@ -27,9 +28,29 @@ async function Activate(): Promise<void> {
                 const servicesConfig = core.getInput('services-config', { required: true });
                 await licenseClient.ActivateLicenseWithConfig(servicesConfig);
             } else {
-                const username = core.getInput('username', { required: true }).trim();
-                const password = core.getInput('password', { required: true }).trim();
-                const serial = core.getInput('serial', { required: license.toLowerCase().startsWith('pro') });
+                const pro = license.toLowerCase().startsWith('pro');
+                let username = core.getInput('username', { required: pro }).trim();
+                let password = core.getInput('password', { required: pro }).trim();
+                const serial = core.getInput('serial', { required: pro });
+
+                if (!username) {
+                    const encodedUsername = env['UNITY_USERNAME_BASE64'];
+                    if (!encodedUsername) {
+                        throw Error('Username is required for Unity License Activation!');
+                    }
+
+                    username = Buffer.from(encodedUsername, 'base64').toString('utf-8');
+                }
+
+                if (!password) {
+                    const encodedPassword = env['UNITY_PASSWORD_BASE64'];
+                    if (!encodedPassword) {
+                        throw Error('Password is required for Unity License Activation!');
+                    }
+
+                    password = Buffer.from(encodedPassword, 'base64').toString('utf-8');
+                }
+
                 await licenseClient.ActivateLicense(username, password, serial);
             }
             activeLicenses = await licenseClient.ShowEntitlements();
