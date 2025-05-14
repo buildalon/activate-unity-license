@@ -24,7 +24,7 @@ async function getLicensingClient(): Promise<string> {
     return licenseClientPath;
 }
 
-async function execWithMask(args: string[]): Promise<string> {
+async function execWithMask(args: string[], attempt: number | null = null): Promise<string> {
     if (!client) {
         client = await getLicensingClient();
     }
@@ -53,9 +53,12 @@ async function execWithMask(args: string[]): Promise<string> {
             core.info(line);
         }
         if (exitCode !== 0) {
-            if (exitCode > 21) {
+            if (attempt === null) {
+                attempt = 0;
+            }
+            if (exitCode > 21 && attempt < 3) {
                 core.error(`Unity Licensing Client failed with exit code ${exitCode}. Retrying...`);
-                return await execWithMask(args);
+                return await execWithMask(args, ++attempt);
             }
             throw Error(getExitCodeMessage(exitCode));
         }

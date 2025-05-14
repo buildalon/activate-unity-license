@@ -28243,7 +28243,7 @@ async function getLicensingClient() {
     await fs.promises.access(licenseClientPath, fs.constants.X_OK);
     return licenseClientPath;
 }
-async function execWithMask(args) {
+async function execWithMask(args, attempt = null) {
     if (!client) {
         client = await getLicensingClient();
     }
@@ -28275,9 +28275,12 @@ async function execWithMask(args) {
             core.info(line);
         }
         if (exitCode !== 0) {
-            if (exitCode > 21) {
+            if (attempt === null) {
+                attempt = 0;
+            }
+            if (exitCode > 21 && attempt < 3) {
                 core.error(`Unity Licensing Client failed with exit code ${exitCode}. Retrying...`);
-                return await execWithMask(args);
+                return await execWithMask(args, ++attempt);
             }
             throw Error(getExitCodeMessage(exitCode));
         }
