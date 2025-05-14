@@ -53,6 +53,10 @@ async function execWithMask(args: string[]): Promise<string> {
             core.info(line);
         }
         if (exitCode !== 0) {
+            if (exitCode > 21) {
+                core.error(`Unity Licensing Client failed with exit code ${exitCode}. Retrying...`);
+                return await execWithMask(args);
+            }
             throw Error(getExitCodeMessage(exitCode));
         }
     }

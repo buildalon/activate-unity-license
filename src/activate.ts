@@ -2,7 +2,7 @@ import { env } from 'process';
 import licenseClient = require('./licensing-client');
 import core = require('@actions/core');
 
-async function Activate(): Promise<void> {
+export async function Activate(): Promise<void> {
     let license = undefined;
     try {
         core.saveState('isPost', true);
@@ -66,5 +66,3 @@ async function Activate(): Promise<void> {
     }
     core.info(`Unity ${license} License Activated!`);
 }
-
-export { Activate }
