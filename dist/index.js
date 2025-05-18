@@ -28094,15 +28094,15 @@ module.exports = {
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.Activate = Activate;
-const process_1 = __nccwpck_require__(7282);
-const licenseClient = __nccwpck_require__(8447);
 const core = __nccwpck_require__(2186);
+const process_1 = __nccwpck_require__(7282);
+const licensing_client_1 = __nccwpck_require__(8447);
 async function Activate() {
     let license = undefined;
     try {
         core.saveState('isPost', true);
-        await licenseClient.Version();
-        let activeLicenses = await licenseClient.ShowEntitlements();
+        await (0, licensing_client_1.Version)();
+        let activeLicenses = await (0, licensing_client_1.ShowEntitlements)();
         license = core.getInput('license', { required: true });
         switch (license.toLowerCase()) {
             case 'professional':
@@ -28121,13 +28121,13 @@ async function Activate() {
         try {
             if (license.toLowerCase().startsWith('f')) {
                 const servicesConfig = core.getInput('services-config', { required: true });
-                await licenseClient.ActivateLicenseWithConfig(servicesConfig);
+                await (0, licensing_client_1.ActivateLicenseWithConfig)(servicesConfig);
             }
             else {
-                const pro = license.toLowerCase().startsWith('pro');
-                let username = core.getInput('username', { required: pro }).trim();
-                let password = core.getInput('password', { required: pro }).trim();
-                const serial = core.getInput('serial', { required: pro });
+                const isPro = license.toLowerCase().startsWith('pro');
+                let username = core.getInput('username', { required: isPro }).trim();
+                let password = core.getInput('password', { required: isPro }).trim();
+                const serial = core.getInput('serial', { required: isPro });
                 if (!username) {
                     const encodedUsername = process_1.env['UNITY_USERNAME_BASE64'];
                     if (!encodedUsername) {
@@ -28142,9 +28142,9 @@ async function Activate() {
                     }
                     password = Buffer.from(encodedPassword, 'base64').toString('utf-8');
                 }
-                await licenseClient.ActivateLicense(username, password, serial);
+                await (0, licensing_client_1.ActivateLicense)(username, password, serial);
             }
-            activeLicenses = await licenseClient.ShowEntitlements();
+            activeLicenses = await (0, licensing_client_1.ShowEntitlements)();
             if (!activeLicenses.includes(license.toLowerCase())) {
                 throw Error(`Failed to activate Unity License with ${license}!`);
             }
