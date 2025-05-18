@@ -128,11 +128,11 @@ const servicesPath = {
     linux: path.join('/usr', 'share', 'unity3d', 'config')
 }
 
-async function Version(): Promise<void> {
+export async function Version(): Promise<void> {
     await execWithMask([`--version`]);
 }
 
-async function ShowEntitlements(): Promise<string[]> {
+export async function ShowEntitlements(): Promise<string[]> {
     const output = await execWithMask([`--showEntitlements`]);
     const matches = output.matchAll(/Product Name: (?<license>.+)/g);
     const licenses = [];
@@ -155,7 +155,7 @@ async function ShowEntitlements(): Promise<string[]> {
     return licenses;
 }
 
-async function ActivateLicense(username: string, password: string, serial: string): Promise<void> {
+export async function ActivateLicense(username: string, password: string, serial: string): Promise<void> {
     const args = [`--activate-ulf`, `--username`, username, `--password`, password];
     if (serial !== undefined && serial.length > 0) {
         serial = serial.trim();
@@ -166,13 +166,13 @@ async function ActivateLicense(username: string, password: string, serial: strin
     await execWithMask(args);
 }
 
-async function ActivateLicenseWithConfig(servicesConfig: string): Promise<void> {
+export async function ActivateLicenseWithConfig(servicesConfig: string): Promise<void> {
     const servicesConfigPath = path.join(servicesPath[process.platform], 'services-config.json');
     core.debug(`Services Config Path: ${servicesConfigPath}`);
     await fs.promises.writeFile(servicesConfigPath, Buffer.from(servicesConfig, 'base64'));
 }
 
-async function ReturnLicense(license: string): Promise<void> {
+export async function ReturnLicense(license: string): Promise<void> {
     await execWithMask([`--return-ulf`]);
     const activeLicenses = await ShowEntitlements();
     if (license !== undefined &&
@@ -180,5 +180,3 @@ async function ReturnLicense(license: string): Promise<void> {
         throw Error(`${license} was not returned.`);
     }
 }
-
-export { Version, ShowEntitlements, ActivateLicense, ActivateLicenseWithConfig, ReturnLicense }
