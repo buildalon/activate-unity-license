@@ -29,4 +29,4 @@ export async function Deactivate(): Promise<void> {
         core.setFailed(`Failed to deactivate license!\n${error}`);
         process.exit(1);
     }
-};
+}
