@@ -3,7 +3,7 @@ import glob = require('@actions/glob');
 import path = require('path');
 import fs = require('fs');
 
-async function GetHubRootPath(hubPath: string): Promise<string> {
+export async function GetHubRootPath(hubPath: string): Promise<string> {
     core.debug(`searching for hub root path: ${hubPath}`);
     let hubRootPath = hubPath;
     switch (process.platform) {
@@ -20,7 +20,7 @@ async function GetHubRootPath(hubPath: string): Promise<string> {
     return hubRootPath;
 }
 
-async function ResolveGlobPath(globs: string[]): Promise<string> {
+export async function ResolveGlobPath(globs: string[]): Promise<string> {
     const globPath = path.join(...globs);
     const result = await findGlobPattern(globPath);
     if (result === undefined) {
@@ -30,7 +30,7 @@ async function ResolveGlobPath(globs: string[]): Promise<string> {
     return result;
 }
 
-async function findGlobPattern(pattern: string): Promise<string | undefined> {
+export async function findGlobPattern(pattern: string): Promise<string | undefined> {
     core.debug(`searching for: ${pattern}...`);
     const globber = await glob.create(pattern);
     for await (const file of globber.globGenerator()) {
@@ -38,5 +38,3 @@ async function findGlobPattern(pattern: string): Promise<string | undefined> {
         return file;
     }
 }
-
-export { ResolveGlobPath, GetHubRootPath }

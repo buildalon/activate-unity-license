@@ -1,7 +1,7 @@
 import licensingClient = require('./licensing-client');
 import core = require('@actions/core');
 
-async function Deactivate(): Promise<void> {
+export async function Deactivate(): Promise<void> {
     try {
         const license = core.getState('license');
         if (!license) {
@@ -29,6 +29,4 @@ async function Deactivate(): Promise<void> {
         core.setFailed(`Failed to deactivate license!\n${error}`);
         process.exit(1);
     }
-};
-
-export { Deactivate }
+}
