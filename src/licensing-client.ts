@@ -57,7 +57,7 @@ async function execWithMask(args: string[], attempt: number = 0): Promise<string
                 core.error(`Unity Licensing Client failed with exit code ${exitCode}. Retrying...`);
                 return await execWithMask(args, ++attempt);
             } else {
-                throw Error(`Unity Licensing Client failed with exit code ${exitCode}: ${getExitCodeMessage(exitCode)}`);
+                throw new Error(`Unity Licensing Client failed with exit code ${exitCode}: ${getExitCodeMessage(exitCode)}`);
             }
         }
     }
