@@ -56,8 +56,9 @@ async function execWithMask(args: string[], attempt: number = 0): Promise<string
             if (exitCode > 21 && attempt < 3) {
                 core.error(`Unity Licensing Client failed with exit code ${exitCode}. Retrying...`);
                 return await execWithMask(args, ++attempt);
+            } else {
+                throw new Error(`Unity Licensing Client failed with exit code ${exitCode}: ${getExitCodeMessage(exitCode)}`);
             }
-            throw Error(getExitCodeMessage(exitCode));
         }
     }
     return output;
@@ -118,7 +119,7 @@ function getExitCodeMessage(exitCode: number): string {
         case 21:
             return 'Returning floating lease failed';
         default:
-            return 'Unknown error';
+            return `Unknown Error`;
     }
 }
 
