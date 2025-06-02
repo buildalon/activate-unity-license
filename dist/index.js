@@ -28278,7 +28278,9 @@ async function execWithMask(args, attempt = 0) {
                 core.error(`Unity Licensing Client failed with exit code ${exitCode}. Retrying...`);
                 return await execWithMask(args, ++attempt);
             }
-            throw Error(getExitCodeMessage(exitCode));
+            else {
+                throw Error(`Unity Licensing Client failed with exit code ${exitCode}: ${getExitCodeMessage(exitCode)}`);
+            }
         }
     }
     return output;
@@ -28337,7 +28339,7 @@ function getExitCodeMessage(exitCode) {
         case 21:
             return 'Returning floating lease failed';
         default:
-            return 'Unknown error';
+            return `Unknown Error`;
     }
 }
 const servicesPath = {
