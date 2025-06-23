@@ -163,6 +163,8 @@ export async function ActivateLicense(username: string, password: string, serial
         args.push(`--serial`, serial);
         const maskedSerial = serial.slice(0, -4) + `XXXX`;
         core.setSecret(maskedSerial);
+    } else {
+        args.push(`--include-personal`);
     }
     await execWithMask(args);
 }
