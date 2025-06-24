@@ -1,6 +1,6 @@
 {
   "name": "activate-unity-license",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "description": "A GitHub Action to activate a Unity Game Engine license for CI/CD workflows.",
   "author": "buildalon",
   "license": "MIT",
@@ -26,7 +26,7 @@
     "@actions/glob": "^0.4.0"
   },
   "devDependencies": {
-    "@types/node": "^22.15.29",
+    "@types/node": "^22.15.32",
     "@vercel/ncc": "^0.34.0",
     "shx": "^0.3.4",
     "typescript": "^5.8.3"
