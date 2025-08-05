@@ -29,11 +29,11 @@ This action requires several secrets that need to be setup in the repository or 
 
 | name | description | required |
 | ---- | ----------- | -------- |
-| `license` | Must be one of `Personal`, `Professional`, or `Floating` | Defaults to `Personal` |
-| `username` | The email address you use for your Unity Id | Required for `Personal` and `Professional` license activations |
-| `password` | The password you use for Unity Id access | Required for `Personal` and `Professional` license activations |
-| `serial` | The Serial number for the seat | Required for `Professional` license activations |
-| `configuration` | Unity License Client `services-config.json` encoded as base64 string | Required for `Floating` license activations |
+| `license` | Must be one of `personal`, `professional`, `floating`, or `industry`. | Defaults to `personal` |
+| `username` | The email address you use for your Unity Id | Required for `personal`, `professional`, and `industry` license activations |
+| `password` | The password you use for Unity Id access | Required for `personal`, `professional`, and `industry` license activations |
+| `serial` | The Serial number for the seat | Required for `professional` license activations, but not named seats. |
+| `configuration` | Unity License Client `services-config.json` encoded as base64 string | Required for `floating` license activations |
 
 ### workflow
 
@@ -41,7 +41,7 @@ This action requires several secrets that need to be setup in the repository or 
 steps:
   - uses: buildalon/activate-unity-license@v1
     with:
-      license: 'Personal' # Choose license type to use [ Personal, Professional, Floating ]
+      license: personal # Choose license type to use [ personal, professional, floating, industry ]
       username: ${{ secrets.UNITY_USERNAME }}
       password: ${{ secrets.UNITY_PASSWORD }}
       # serial: ${{ secrets.UNITY_SERIAL }} # Required for pro activations

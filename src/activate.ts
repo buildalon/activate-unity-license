@@ -6,37 +6,39 @@ import {
     ShowEntitlements,
     Version,
 } from './licensing-client';
+import { LicenseType } from './types';
 
 export async function Activate(): Promise<void> {
-    let license = undefined;
+    let license: LicenseType | undefined = undefined;
     try {
         core.saveState('isPost', true);
         await Version();
         let activeLicenses = await ShowEntitlements();
-        license = core.getInput('license', { required: true });
-        switch (license.toLowerCase()) {
-            case 'professional':
-            case 'personal':
-            case 'floating':
+        license = core.getInput('license', { required: true }) as LicenseType;
+        switch (license) {
+            case LicenseType.professional:
+            case LicenseType.personal:
+            case LicenseType.floating:
+            case LicenseType.industry:
                 break;
             default:
-                throw Error(`Invalid License: ${license}! Must be Professional, Personal, or Floating.`);
+                throw Error(`Invalid License: ${license}! Must be one of: ${Object.values(LicenseType).join(', ')}`);
         }
         core.saveState('license', license);
-        if (activeLicenses.includes(license.toLocaleLowerCase())) {
+        if (activeLicenses.includes(license)) {
             core.warning(`Unity ${license} License already activated!`);
             return;
         }
         core.startGroup('Attempting to activate Unity License...');
         try {
-            if (license.toLowerCase().startsWith('f')) {
+            if (license === LicenseType.floating) {
                 const servicesConfig = core.getInput('services-config', { required: true });
                 await ActivateLicenseWithConfig(servicesConfig);
             } else {
-                const isPro = license.toLowerCase().startsWith('pro');
+                const isPro = license === LicenseType.professional;
                 let username = core.getInput('username', { required: isPro }).trim();
                 let password = core.getInput('password', { required: isPro }).trim();
-                const serial = core.getInput('serial', { required: isPro });
+                const serial = core.getInput('serial');
                 if (!username) {
                     const encodedUsername = env['UNITY_USERNAME_BASE64'];
                     if (!encodedUsername) {
@@ -53,10 +55,10 @@ export async function Activate(): Promise<void> {
 
                     password = Buffer.from(encodedPassword, 'base64').toString('utf-8');
                 }
-                await ActivateLicense(username, password, serial);
+                await ActivateLicense(license, username, password, serial);
             }
             activeLicenses = await ShowEntitlements();
-            if (!activeLicenses.includes(license.toLowerCase())) {
+            if (!activeLicenses.includes(license)) {
                 throw Error(`Failed to activate Unity License with ${license}!`);
             }
         } finally {

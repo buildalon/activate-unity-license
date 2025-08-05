@@ -1,9 +1,10 @@
 import licensingClient = require('./licensing-client');
 import core = require('@actions/core');
+import { LicenseType } from './types';
 
 export async function Deactivate(): Promise<void> {
     try {
-        const license = core.getState('license');
+        const license: LicenseType | undefined = core.getState('license') as LicenseType | undefined;
         if (!license) {
             throw Error(`Failed to get post license state!`);
         }
@@ -15,7 +16,7 @@ export async function Deactivate(): Promise<void> {
         try {
             const activeLicenses = await licensingClient.ShowEntitlements();
             if (license !== undefined &&
-                !activeLicenses.includes(license.toLowerCase())) {
+                !activeLicenses.includes(license)) {
                 throw Error(`Unity ${license} License is not activated!`);
             } else {
                 await licensingClient.ReturnLicense(license);
@@ -26,7 +27,7 @@ export async function Deactivate(): Promise<void> {
         }
         core.info(`Unity ${license} License successfully returned.`);
     } catch (error) {
-        core.setFailed(`Failed to deactivate license!\n${error}`);
-        process.exit(1);
+        core.error(`Failed to deactivate license!\n${error}`);
+        process.exit(0);
     }
 }

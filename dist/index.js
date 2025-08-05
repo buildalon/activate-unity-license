@@ -28097,6 +28097,7 @@ exports.Activate = Activate;
 const core = __nccwpck_require__(2186);
 const process_1 = __nccwpck_require__(7282);
 const licensing_client_1 = __nccwpck_require__(8447);
+const types_1 = __nccwpck_require__(5077);
 async function Activate() {
     let license = undefined;
     try {
@@ -28104,30 +28105,31 @@ async function Activate() {
         await (0, licensing_client_1.Version)();
         let activeLicenses = await (0, licensing_client_1.ShowEntitlements)();
         license = core.getInput('license', { required: true });
-        switch (license.toLowerCase()) {
-            case 'professional':
-            case 'personal':
-            case 'floating':
+        switch (license) {
+            case types_1.LicenseType.professional:
+            case types_1.LicenseType.personal:
+            case types_1.LicenseType.floating:
+            case types_1.LicenseType.industry:
                 break;
             default:
-                throw Error(`Invalid License: ${license}! Must be Professional, Personal, or Floating.`);
+                throw Error(`Invalid License: ${license}! Must be one of: ${Object.values(types_1.LicenseType).join(', ')}`);
         }
         core.saveState('license', license);
-        if (activeLicenses.includes(license.toLocaleLowerCase())) {
+        if (activeLicenses.includes(license)) {
             core.warning(`Unity ${license} License already activated!`);
             return;
         }
         core.startGroup('Attempting to activate Unity License...');
         try {
-            if (license.toLowerCase().startsWith('f')) {
+            if (license === types_1.LicenseType.floating) {
                 const servicesConfig = core.getInput('services-config', { required: true });
                 await (0, licensing_client_1.ActivateLicenseWithConfig)(servicesConfig);
             }
             else {
-                const isPro = license.toLowerCase().startsWith('pro');
+                const isPro = license === types_1.LicenseType.professional;
                 let username = core.getInput('username', { required: isPro }).trim();
                 let password = core.getInput('password', { required: isPro }).trim();
-                const serial = core.getInput('serial', { required: isPro });
+                const serial = core.getInput('serial');
                 if (!username) {
                     const encodedUsername = process_1.env['UNITY_USERNAME_BASE64'];
                     if (!encodedUsername) {
@@ -28142,10 +28144,10 @@ async function Activate() {
                     }
                     password = Buffer.from(encodedPassword, 'base64').toString('utf-8');
                 }
-                await (0, licensing_client_1.ActivateLicense)(username, password, serial);
+                await (0, licensing_client_1.ActivateLicense)(license, username, password, serial);
             }
             activeLicenses = await (0, licensing_client_1.ShowEntitlements)();
-            if (!activeLicenses.includes(license.toLowerCase())) {
+            if (!activeLicenses.includes(license)) {
                 throw Error(`Failed to activate Unity License with ${license}!`);
             }
         }
@@ -28186,7 +28188,7 @@ async function Deactivate() {
         try {
             const activeLicenses = await licensingClient.ShowEntitlements();
             if (license !== undefined &&
-                !activeLicenses.includes(license.toLowerCase())) {
+                !activeLicenses.includes(license)) {
                 throw Error(`Unity ${license} License is not activated!`);
             }
             else {
@@ -28199,8 +28201,8 @@ async function Deactivate() {
         core.info(`Unity ${license} License successfully returned.`);
     }
     catch (error) {
-        core.setFailed(`Failed to deactivate license!\n${error}`);
-        process.exit(1);
+        core.error(`Failed to deactivate license!\n${error}`);
+        process.exit(0);
     }
 }
 
@@ -28223,6 +28225,7 @@ const core = __nccwpck_require__(2186);
 const exec = __nccwpck_require__(1514);
 const path = __nccwpck_require__(1017);
 const fs = __nccwpck_require__(7147);
+const types_1 = __nccwpck_require__(5077);
 let client = undefined;
 async function getLicensingClient() {
     core.debug('Getting Licensing Client...');
@@ -28358,13 +28361,13 @@ async function ShowEntitlements() {
         if (match.groups.license) {
             switch (match.groups.license) {
                 case 'Unity Pro':
-                    if (!licenses.includes('professional')) {
-                        licenses.push('professional');
+                    if (!licenses.includes(types_1.LicenseType.professional)) {
+                        licenses.push(types_1.LicenseType.professional);
                     }
                     break;
                 case 'Unity Personal':
-                    if (!licenses.includes('personal')) {
-                        licenses.push('personal');
+                    if (!licenses.includes(types_1.LicenseType.personal)) {
+                        licenses.push(types_1.LicenseType.personal);
                     }
                     break;
             }
@@ -28372,8 +28375,8 @@ async function ShowEntitlements() {
     }
     return licenses;
 }
-async function ActivateLicense(username, password, serial) {
-    const args = [`--activate-ulf`, `--username`, username, `--password`, password];
+async function ActivateLicense(license, username, password, serial) {
+    const args = [`--activate-ulf`];
     if (serial !== undefined && serial.length > 0) {
         serial = serial.trim();
         args.push(`--serial`, serial);
@@ -28381,6 +28384,12 @@ async function ActivateLicense(username, password, serial) {
         core.setSecret(maskedSerial);
     }
     else {
+        if (license !== types_1.LicenseType.personal) {
+            args.push(`--serial`);
+        }
+    }
+    args.push(`--username`, username, `--password`, password);
+    if (license === types_1.LicenseType.personal) {
         args.push(`--include-personal`);
     }
     await execWithMask(args);
@@ -28394,10 +28403,28 @@ async function ReturnLicense(license) {
     await execWithMask([`--return-ulf`]);
     const activeLicenses = await ShowEntitlements();
     if (license !== undefined &&
-        activeLicenses.includes(license.toLowerCase())) {
+        activeLicenses.includes(license)) {
         throw Error(`${license} was not returned.`);
     }
 }
+
+
+/***/ }),
+
+/***/ 5077:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.LicenseType = void 0;
+var LicenseType;
+(function (LicenseType) {
+    LicenseType["personal"] = "personal";
+    LicenseType["professional"] = "professional";
+    LicenseType["floating"] = "floating";
+    LicenseType["industry"] = "industry";
+})(LicenseType || (exports.LicenseType = LicenseType = {}));
 
 
 /***/ }),

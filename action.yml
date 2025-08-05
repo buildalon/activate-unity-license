@@ -5,15 +5,15 @@ branding:
   icon: 'log-in'
 inputs:
   license:
-    description: 'Must be one of `Personal`, `Professional`, `Floating`.'
+    description: 'Must be one of `personal`, `professional`, `floating`, or `industry`.'
     required: false
-    default: 'Personal'
+    default: 'personal'
   username:
-    description: 'The email address you use for your Unity Id. Required for `Personal` and `Professional` license activations.'
+    description: 'The email address you use for your Unity Id. Required for `personal`, `professional`, and `industry` license activations.'
     required: false
     default: ''
   password:
-    description: 'The password you use for Unity Id access. Required for `Personal` and `Professional` license activations.'
+    description: 'The password you use for Unity Id access. Required for `personal`, `professional`, and `industry` license activations.'
     required: false
     default: ''
   serial:
@@ -21,7 +21,7 @@ inputs:
     required: false
     default: ''
   configuration:
-    description: 'Unity License Client `services-config.json` encoded base base64 string. Required for `Floating` license activations.'
+    description: 'Unity License Client `services-config.json` encoded base base64 string. Required for `floating` license activations.'
     required: false
     default: ''
 runs:
