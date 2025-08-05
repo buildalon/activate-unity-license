@@ -164,8 +164,7 @@ export async function ActivateLicense(license: LicenseType, username: string, pa
         args.push(`--serial`, serial);
         const maskedSerial = serial.slice(0, -4) + `XXXX`;
         core.setSecret(maskedSerial);
-    }
-    else {
+    } else {
         if (license !== LicenseType.personal) {
             args.push(`--serial`);
         }
