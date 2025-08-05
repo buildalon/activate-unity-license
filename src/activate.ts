@@ -14,7 +14,8 @@ export async function Activate(): Promise<void> {
         core.saveState('isPost', true);
         await Version();
         let activeLicenses = await ShowEntitlements();
-        license = core.getInput('license', { required: true }) as LicenseType;
+        const licenseInput = core.getInput('license', { required: true });
+        license = licenseInput.toLowerCase() as LicenseType;
         switch (license) {
             case LicenseType.professional:
             case LicenseType.personal:

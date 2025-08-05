@@ -28104,7 +28104,8 @@ async function Activate() {
         core.saveState('isPost', true);
         await (0, licensing_client_1.Version)();
         let activeLicenses = await (0, licensing_client_1.ShowEntitlements)();
-        license = core.getInput('license', { required: true });
+        const licenseInput = core.getInput('license', { required: true });
+        license = licenseInput.toLowerCase();
         switch (license) {
             case types_1.LicenseType.professional:
             case types_1.LicenseType.personal:
