@@ -170,7 +170,7 @@ export async function ActivateLicense(license: LicenseType, username: string, pa
             args.push(`--serial`);
         }
     }
-    args.push(`--username`, username, `--password`, password)
+    args.push(`--username`, username, `--password`, password);
     if (license === LicenseType.personal) {
         args.push(`--include-personal`);
     }
