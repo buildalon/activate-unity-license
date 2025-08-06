@@ -28371,6 +28371,11 @@ async function ShowEntitlements() {
                         licenses.push(types_1.LicenseType.personal);
                     }
                     break;
+                case 'Unity Industry':
+                    if (!licenses.includes(types_1.LicenseType.industry)) {
+                        licenses.push(types_1.LicenseType.industry);
+                    }
+                    break;
             }
         }
     }
