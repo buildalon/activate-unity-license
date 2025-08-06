@@ -14,11 +14,13 @@ async function getLicensingClient(): Promise<string> {
     await fs.promises.access(unityHubPath, fs.constants.R_OK);
     const rootHubPath = await GetHubRootPath(unityHubPath);
     const globs = [rootHubPath, '**'];
+
     if (process.platform === 'win32') {
         globs.push('Unity.Licensing.Client.exe');
     } else {
         globs.push('Unity.Licensing.Client');
     }
+
     const licenseClientPath = await ResolveGlobPath(globs);
     core.debug(`Unity Licensing Client Path: ${licenseClientPath}`);
     await fs.promises.access(licenseClientPath, fs.constants.X_OK);
@@ -29,9 +31,12 @@ async function execWithMask(args: string[], attempt: number = 0): Promise<string
     if (!client) {
         client = await getLicensingClient();
     }
+
     await fs.promises.access(client, fs.constants.X_OK);
+
     let output = '';
     let exitCode = 0;
+
     try {
         core.info(`[command]"${client}" ${args.join(' ')}`);
         exitCode = await exec.exec(`"${client}"`, args, {
@@ -49,10 +54,12 @@ async function execWithMask(args: string[], attempt: number = 0): Promise<string
     } finally {
         const maskedOutput = maskSerialInOutput(output);
         const splitLines = maskedOutput.split(/\r?\n/);
+
         for (const line of splitLines) {
-            if (line === undefined || line.length === 0) { continue; }
+            if (!line || line.trim().length === 0) { continue; }
             core.info(line);
         }
+
         if (exitCode !== 0) {
             if (exitCode > 21 && attempt < 3) {
                 core.error(`Unity Licensing Client failed with exit code ${exitCode}. Retrying...`);
@@ -163,21 +170,23 @@ export async function ShowEntitlements(): Promise<LicenseType[]> {
 }
 
 export async function ActivateLicense(license: LicenseType, username: string, password: string, serial: string | undefined): Promise<void> {
-    const args = [`--activate-ulf`];
+    const args = [
+        `--activate-ulf`,
+        `--username`, username,
+        `--password`, password,
+    ];
+
     if (serial !== undefined && serial.length > 0) {
         serial = serial.trim();
         args.push(`--serial`, serial);
         const maskedSerial = serial.slice(0, -4) + `XXXX`;
         core.setSecret(maskedSerial);
-    } else {
-        if (license !== LicenseType.personal) {
-            args.push(`--serial`);
-        }
     }
-    args.push(`--username`, username, `--password`, password);
+
     if (license === LicenseType.personal) {
         args.push(`--include-personal`);
     }
+
     await execWithMask(args);
 }
 

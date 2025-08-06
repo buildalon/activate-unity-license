@@ -28127,23 +28127,28 @@ async function Activate() {
                 await (0, licensing_client_1.ActivateLicenseWithConfig)(servicesConfig);
             }
             else {
-                const isPro = license === types_1.LicenseType.professional;
-                let username = core.getInput('username', { required: isPro }).trim();
-                let password = core.getInput('password', { required: isPro }).trim();
+                let username = core.getInput('username', { required: false }).trim();
+                let password = core.getInput('password', { required: false }).trim();
                 const serial = core.getInput('serial');
                 if (!username) {
                     const encodedUsername = process_1.env['UNITY_USERNAME_BASE64'];
                     if (!encodedUsername) {
                         throw Error('Username is required for Unity License Activation!');
                     }
-                    username = Buffer.from(encodedUsername, 'base64').toString('utf-8');
+                    username = Buffer.from(encodedUsername, 'base64').toString('utf-8').trim();
+                }
+                if (username.length === 0 || !username.includes('@')) {
+                    throw Error('Username must be your Unity ID email address!');
                 }
                 if (!password) {
                     const encodedPassword = process_1.env['UNITY_PASSWORD_BASE64'];
                     if (!encodedPassword) {
                         throw Error('Password is required for Unity License Activation!');
                     }
-                    password = Buffer.from(encodedPassword, 'base64').toString('utf-8');
+                    password = Buffer.from(encodedPassword, 'base64').toString('utf-8').trim();
+                }
+                if (password.length === 0) {
+                    throw Error('Password is required for Unity License Activation!');
                 }
                 await (0, licensing_client_1.ActivateLicense)(license, username, password, serial);
             }
@@ -28272,7 +28277,7 @@ async function execWithMask(args, attempt = 0) {
         const maskedOutput = maskSerialInOutput(output);
         const splitLines = maskedOutput.split(/\r?\n/);
         for (const line of splitLines) {
-            if (line === undefined || line.length === 0) {
+            if (!line || line.trim().length === 0) {
                 continue;
             }
             core.info(line);
@@ -28382,19 +28387,17 @@ async function ShowEntitlements() {
     return licenses;
 }
 async function ActivateLicense(license, username, password, serial) {
-    const args = [`--activate-ulf`];
+    const args = [
+        `--activate-ulf`,
+        `--username`, username,
+        `--password`, password,
+    ];
     if (serial !== undefined && serial.length > 0) {
         serial = serial.trim();
         args.push(`--serial`, serial);
         const maskedSerial = serial.slice(0, -4) + `XXXX`;
         core.setSecret(maskedSerial);
     }
-    else {
-        if (license !== types_1.LicenseType.personal) {
-            args.push(`--serial`);
-        }
-    }
-    args.push(`--username`, username, `--password`, password);
     if (license === types_1.LicenseType.personal) {
         args.push(`--include-personal`);
     }
