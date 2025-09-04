@@ -28110,7 +28110,6 @@ async function Activate() {
             case types_1.LicenseType.professional:
             case types_1.LicenseType.personal:
             case types_1.LicenseType.floating:
-            case types_1.LicenseType.industry:
                 break;
             default:
                 throw Error(`Invalid License: ${license}! Must be one of: ${Object.values(types_1.LicenseType).join(', ')}`);
@@ -28180,34 +28179,35 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.Deactivate = Deactivate;
 const licensingClient = __nccwpck_require__(8447);
 const core = __nccwpck_require__(2186);
+const types_1 = __nccwpck_require__(5077);
 async function Deactivate() {
     try {
         const license = core.getState('license');
         if (!license) {
-            throw Error(`Failed to get post license state!`);
-        }
-        core.debug(`post state: ${license}`);
-        if (license.startsWith('f')) {
+            core.error(`Failed to get license state!`);
             return;
         }
-        core.startGroup(`Unity License Deactivation...`);
+        core.debug(`post state: ${license}`);
+        if (license === types_1.LicenseType.floating) {
+            return;
+        }
+        core.startGroup(`Unity ${license} License Deactivation...`);
         try {
             const activeLicenses = await licensingClient.ShowEntitlements();
             if (license !== undefined &&
-                !activeLicenses.includes(license)) {
-                throw Error(`Unity ${license} License is not activated!`);
-            }
-            else {
+                activeLicenses.includes(license)) {
                 await licensingClient.ReturnLicense(license);
+                core.info(`Unity ${license} License successfully returned.`);
             }
         }
         finally {
             core.endGroup();
         }
-        core.info(`Unity ${license} License successfully returned.`);
     }
     catch (error) {
         core.error(`Failed to deactivate license!\n${error}`);
+    }
+    finally {
         process.exit(0);
     }
 }
@@ -28376,11 +28376,6 @@ async function ShowEntitlements() {
                         licenses.push(types_1.LicenseType.personal);
                     }
                     break;
-                case 'Unity Industry':
-                    if (!licenses.includes(types_1.LicenseType.industry)) {
-                        licenses.push(types_1.LicenseType.industry);
-                    }
-                    break;
             }
         }
     }
@@ -28432,7 +28427,6 @@ var LicenseType;
     LicenseType["personal"] = "personal";
     LicenseType["professional"] = "professional";
     LicenseType["floating"] = "floating";
-    LicenseType["industry"] = "industry";
 })(LicenseType || (exports.LicenseType = LicenseType = {}));
 
 
@@ -30425,7 +30419,6 @@ const main = async () => {
     else {
         await (0, deactivate_1.Deactivate)();
     }
-    process.exit(0);
 };
 main();
 

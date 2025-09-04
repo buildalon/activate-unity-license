@@ -21,7 +21,6 @@ export async function Activate(): Promise<void> {
             case LicenseType.professional:
             case LicenseType.personal:
             case LicenseType.floating:
-            case LicenseType.industry:
                 break;
             default:
                 throw Error(`Invalid License: ${license}! Must be one of: ${Object.values(LicenseType).join(', ')}`);

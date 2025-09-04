@@ -158,11 +158,6 @@ export async function ShowEntitlements(): Promise<LicenseType[]> {
                         licenses.push(LicenseType.personal);
                     }
                     break;
-                case 'Unity Industry':
-                    if (!licenses.includes(LicenseType.industry)) {
-                        licenses.push(LicenseType.industry);
-                    }
-                    break;
             }
         }
     }

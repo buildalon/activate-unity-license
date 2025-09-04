@@ -7,34 +7,33 @@ export async function Deactivate(): Promise<void> {
         const license: LicenseType | undefined = core.getState('license') as LicenseType | undefined;
 
         if (!license) {
-            throw Error(`Failed to get post license state!`);
+            core.error(`Failed to get license state!`);
+            return;
         }
 
         core.debug(`post state: ${license}`);
 
-        if (license.startsWith('f')) {
+        if (license === LicenseType.floating) {
             return;
         }
 
-        core.startGroup(`Unity License Deactivation...`);
+        core.startGroup(`Unity ${license} License Deactivation...`);
 
         try {
             const activeLicenses = await licensingClient.ShowEntitlements();
 
             if (license !== undefined &&
-                !activeLicenses.includes(license)) {
-                throw Error(`Unity ${license} License is not activated!`);
-            } else {
+                activeLicenses.includes(license)) {
                 await licensingClient.ReturnLicense(license);
+                core.info(`Unity ${license} License successfully returned.`);
             }
         }
         finally {
             core.endGroup();
         }
-
-        core.info(`Unity ${license} License successfully returned.`);
     } catch (error) {
         core.error(`Failed to deactivate license!\n${error}`);
+    } finally {
         process.exit(0);
     }
 }
