@@ -3,6 +3,7 @@ import core = require('@actions/core');
 import exec = require('@actions/exec');
 import path = require('path');
 import fs = require('fs');
+import { LicenseType } from './types';
 
 let client = undefined;
 
@@ -13,11 +14,13 @@ async function getLicensingClient(): Promise<string> {
     await fs.promises.access(unityHubPath, fs.constants.R_OK);
     const rootHubPath = await GetHubRootPath(unityHubPath);
     const globs = [rootHubPath, '**'];
+
     if (process.platform === 'win32') {
         globs.push('Unity.Licensing.Client.exe');
     } else {
         globs.push('Unity.Licensing.Client');
     }
+
     const licenseClientPath = await ResolveGlobPath(globs);
     core.debug(`Unity Licensing Client Path: ${licenseClientPath}`);
     await fs.promises.access(licenseClientPath, fs.constants.X_OK);
@@ -28,9 +31,12 @@ async function execWithMask(args: string[], attempt: number = 0): Promise<string
     if (!client) {
         client = await getLicensingClient();
     }
+
     await fs.promises.access(client, fs.constants.X_OK);
+
     let output = '';
     let exitCode = 0;
+
     try {
         core.info(`[command]"${client}" ${args.join(' ')}`);
         exitCode = await exec.exec(`"${client}"`, args, {
@@ -48,10 +54,12 @@ async function execWithMask(args: string[], attempt: number = 0): Promise<string
     } finally {
         const maskedOutput = maskSerialInOutput(output);
         const splitLines = maskedOutput.split(/\r?\n/);
+
         for (const line of splitLines) {
-            if (line === undefined || line.length === 0) { continue; }
+            if (!line || line.trim().length === 0) { continue; }
             core.info(line);
         }
+
         if (exitCode !== 0) {
             if (exitCode > 21 && attempt < 3) {
                 core.error(`Unity Licensing Client failed with exit code ${exitCode}. Retrying...`);
@@ -133,39 +141,49 @@ export async function Version(): Promise<void> {
     await execWithMask([`--version`]);
 }
 
-export async function ShowEntitlements(): Promise<string[]> {
+export async function ShowEntitlements(): Promise<LicenseType[]> {
     const output = await execWithMask([`--showEntitlements`]);
     const matches = output.matchAll(/Product Name: (?<license>.+)/g);
-    const licenses = [];
+    const licenses: LicenseType[] = [];
     for (const match of matches) {
         if (match.groups.license) {
             switch (match.groups.license) {
                 case 'Unity Pro':
-                    if (!licenses.includes('professional')) {
-                        licenses.push('professional');
+                    if (!licenses.includes(LicenseType.professional)) {
+                        licenses.push(LicenseType.professional);
                     }
                     break;
                 case 'Unity Personal':
-                    if (!licenses.includes('personal')) {
-                        licenses.push('personal');
+                    if (!licenses.includes(LicenseType.personal)) {
+                        licenses.push(LicenseType.personal);
                     }
                     break;
+                default:
+                    throw Error(`Unsupported license type: ${match.groups.license}`);
             }
         }
     }
     return licenses;
 }
 
-export async function ActivateLicense(username: string, password: string, serial: string): Promise<void> {
-    const args = [`--activate-ulf`, `--username`, username, `--password`, password];
+export async function ActivateLicense(license: LicenseType, username: string, password: string, serial: string | undefined): Promise<void> {
+    const args = [
+        `--activate-ulf`,
+        `--username`, username,
+        `--password`, password,
+    ];
+
     if (serial !== undefined && serial.length > 0) {
         serial = serial.trim();
         args.push(`--serial`, serial);
         const maskedSerial = serial.slice(0, -4) + `XXXX`;
         core.setSecret(maskedSerial);
-    } else {
+    }
+
+    if (license === LicenseType.personal) {
         args.push(`--include-personal`);
     }
+
     await execWithMask(args);
 }
 
@@ -175,11 +193,11 @@ export async function ActivateLicenseWithConfig(servicesConfig: string): Promise
     await fs.promises.writeFile(servicesConfigPath, Buffer.from(servicesConfig, 'base64'));
 }
 
-export async function ReturnLicense(license: string): Promise<void> {
+export async function ReturnLicense(license: LicenseType): Promise<void> {
     await execWithMask([`--return-ulf`]);
     const activeLicenses = await ShowEntitlements();
     if (license !== undefined &&
-        activeLicenses.includes(license.toLowerCase())) {
+        activeLicenses.includes(license)) {
         throw Error(`${license} was not returned.`);
     }
 }
