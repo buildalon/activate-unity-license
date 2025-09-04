@@ -28103,7 +28103,6 @@ async function Activate() {
     try {
         core.saveState('isPost', true);
         await (0, licensing_client_1.Version)();
-        let activeLicenses = await (0, licensing_client_1.ShowEntitlements)();
         const licenseInput = core.getInput('license', { required: true });
         license = licenseInput.toLowerCase();
         switch (license) {
@@ -28115,9 +28114,10 @@ async function Activate() {
                 throw Error(`Invalid License: ${license}! Must be one of: ${Object.values(types_1.LicenseType).join(', ')}`);
         }
         core.saveState('license', license);
+        let activeLicenses = await (0, licensing_client_1.ShowEntitlements)();
         if (activeLicenses.includes(license)) {
-            core.warning(`Unity ${license} License already activated!`);
-            return;
+            core.info(`Unity ${license} License already activated!`);
+            process.exit(0);
         }
         core.startGroup('Attempting to activate Unity License...');
         try {
@@ -28159,12 +28159,12 @@ async function Activate() {
         finally {
             core.endGroup();
         }
+        core.info(`Unity ${license} License Activated!`);
     }
     catch (error) {
         core.setFailed(`Unity License Activation Failed!\n${error}`);
         process.exit(1);
     }
-    core.info(`Unity ${license} License Activated!`);
 }
 
 
@@ -28376,6 +28376,8 @@ async function ShowEntitlements() {
                         licenses.push(types_1.LicenseType.personal);
                     }
                     break;
+                default:
+                    throw Error(`Unsupported license type: ${match.groups.license}`);
             }
         }
     }

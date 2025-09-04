@@ -10,10 +10,10 @@ import { LicenseType } from './types';
 
 export async function Activate(): Promise<void> {
     let license: LicenseType | undefined = undefined;
+
     try {
         core.saveState('isPost', true);
         await Version();
-        let activeLicenses = await ShowEntitlements();
         const licenseInput = core.getInput('license', { required: true });
         license = licenseInput.toLowerCase() as LicenseType;
 
@@ -27,10 +27,11 @@ export async function Activate(): Promise<void> {
         }
 
         core.saveState('license', license);
+        let activeLicenses = await ShowEntitlements();
 
         if (activeLicenses.includes(license)) {
-            core.warning(`Unity ${license} License already activated!`);
-            return;
+            core.info(`Unity ${license} License already activated!`);
+            process.exit(0);
         }
 
         core.startGroup('Attempting to activate Unity License...');
@@ -41,9 +42,7 @@ export async function Activate(): Promise<void> {
                 await ActivateLicenseWithConfig(servicesConfig);
             } else {
                 let username = core.getInput('username', { required: false }).trim();
-
                 let password = core.getInput('password', { required: false }).trim();
-
                 const serial = core.getInput('serial');
 
                 if (!username) {
@@ -85,10 +84,10 @@ export async function Activate(): Promise<void> {
         } finally {
             core.endGroup();
         }
+
+        core.info(`Unity ${license} License Activated!`);
     } catch (error) {
         core.setFailed(`Unity License Activation Failed!\n${error}`);
         process.exit(1);
     }
-
-    core.info(`Unity ${license} License Activated!`);
 }

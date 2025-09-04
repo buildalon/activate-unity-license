@@ -158,6 +158,8 @@ export async function ShowEntitlements(): Promise<LicenseType[]> {
                         licenses.push(LicenseType.personal);
                     }
                     break;
+                default:
+                    throw Error(`Unsupported license type: ${match.groups.license}`);
             }
         }
     }
