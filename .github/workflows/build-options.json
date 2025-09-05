@@ -5,6 +5,7 @@
     "macos-latest"
   ],
   "unity-version": [
+    "4.7.2",
     "5.6.7f1 (e80cc3114ac1)",
     "2021.x",
     "2022.x",
@@ -24,13 +25,17 @@
     {
       "os": "macos-latest",
       "build-target": "StandaloneOSX"
-    },
-    {
-      "os": "windows-latest",
-      "unity-version": "4.7.2"
     }
   ],
   "exclude": [
+    {
+      "os": "ubuntu-latest",
+      "unity-version": "4.7.2"
+    },
+    {
+      "os": "macos-latest",
+      "unity-version": "4.7.2"
+    },
     {
       "os": "ubuntu-latest",
       "unity-version": "5.6.7f1 (e80cc3114ac1)"
