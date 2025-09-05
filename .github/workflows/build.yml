@@ -33,9 +33,7 @@ jobs:
           license: Personal
           username: ${{ secrets.UNITY_USERNAME }}
           password: ${{ secrets.UNITY_PASSWORD }}
-      - uses: buildalon/create-unity-project@v1
+      - uses: buildalon/unity-action@v2
         timeout-minutes: 10
         with:
-          project-name: Test Project
-          project-directory: ./Unity Project
-          template-name: com.unity.template.3d(-cross-platform)?
+          args: '-quit -nographics -batchmode -createProject "${{ github.workspace }}/Test Project"'
