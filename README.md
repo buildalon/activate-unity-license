@@ -34,16 +34,18 @@ This action requires several secrets that need to be setup in the repository or 
 | `password` | The ***password*** you use for Unity Id access | Required for `personal` and `professional` license activations |
 | `serial` | The ***Serial number*** for the seat | Required for `professional` license activations, but not named seats. |
 | `configuration` | Unity License Client `services-config.json` encoded as base64 string | Required for `floating` license activations |
+| `license-version` | Must be one of `4.x` (Unity 4.x), `5.x` (Unity 5.x), `6.x` (Unity 2017+) | Defaults to `6.x` |
 
 ### workflow
 
 ```yaml
 steps:
-  - uses: buildalon/activate-unity-license@v1
+  - uses: RageAgainstThePixel/activate-unity-license@v1
     with:
-      license: personal # Choose license type to use [ personal, professional, floating ]
-      username: ${{ secrets.UNITY_USERNAME }} # Your Unity Id email address
-      password: ${{ secrets.UNITY_PASSWORD }} # Your Unity Id password
+      license: 'Personal' # Choose license type to use [ Personal, Professional, Floating ]
+      username: ${{ secrets.UNITY_USERNAME }}
+      password: ${{ secrets.UNITY_PASSWORD }}
       # serial: ${{ secrets.UNITY_SERIAL }} # Required for pro activations
       # configuration: ${{ secrets.UNITY_SERVICES_CONFIG }} # Required for floating license activations
+      # license-version: '6.x' # Optional, defaults to '6.x', can be set to '5.x' for Unity 5.x licenses
 ```
