@@ -24,6 +24,9 @@ inputs:
     description: 'Unity License Client `services-config.json` encoded base base64 string. Required for `floating` license activations.'
     required: false
     default: ''
+  license-version:
+    description: 'Must be one of `5.x` (Unity 5.x), `6.x` (Unity 2017+)'
+    required: false
 runs:
   using: 'node20'
   main: 'dist/index.js'

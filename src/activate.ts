@@ -23,7 +23,7 @@ export async function Activate(): Promise<void> {
             case LicenseType.floating:
                 break;
             default:
-                throw Error(`Invalid License: ${license}! Must be one of: ${Object.values(LicenseType).join(', ')}`);
+                throw Error(`Invalid License: ${licenseInput}! Must be one of: ${Object.values(LicenseType).join(', ')}`);
         }
 
         core.saveState('license', license);
@@ -55,7 +55,9 @@ export async function Activate(): Promise<void> {
                     username = Buffer.from(encodedUsername, 'base64').toString('utf-8').trim();
                 }
 
-                if (username.length === 0 || !username.includes('@')) {
+                const emailRegex: RegExp = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+                if (username.length === 0 || !emailRegex.test(username)) {
                     throw Error('Username must be your Unity ID email address!');
                 }
 
