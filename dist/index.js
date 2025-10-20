@@ -33752,14 +33752,8 @@ async function Deactivate() {
             return;
         }
         core.startGroup(`Unity ${license} License Deactivation...`);
-        const licensingClient = new unity_cli_1.LicensingClient();
         try {
-            const activeLicenses = await licensingClient.GetActiveEntitlements();
-            if (license !== undefined &&
-                activeLicenses.includes(license)) {
-                await licensingClient.Deactivate(license);
-                core.info(`Unity ${license} License successfully returned.`);
-            }
+            await new unity_cli_1.LicensingClient().Deactivate(license);
         }
         finally {
             core.endGroup();

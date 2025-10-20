@@ -21,16 +21,8 @@ export async function Deactivate(): Promise<void> {
 
         core.startGroup(`Unity ${license} License Deactivation...`);
 
-        const licensingClient = new LicensingClient();
-
         try {
-            const activeLicenses = await licensingClient.GetActiveEntitlements();
-
-            if (license !== undefined &&
-                activeLicenses.includes(license)) {
-                await licensingClient.Deactivate(license);
-                core.info(`Unity ${license} License successfully returned.`);
-            }
+            await new LicensingClient().Deactivate(license);
         }
         finally {
             core.endGroup();
