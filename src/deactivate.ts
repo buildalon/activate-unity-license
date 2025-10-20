@@ -1,6 +1,8 @@
-import licensingClient = require('./licensing-client');
 import core = require('@actions/core');
-import { LicenseType } from './types';
+import {
+    LicenseType,
+    LicensingClient
+} from '@rage-against-the-pixel/unity-cli';
 
 export async function Deactivate(): Promise<void> {
     try {
@@ -19,12 +21,14 @@ export async function Deactivate(): Promise<void> {
 
         core.startGroup(`Unity ${license} License Deactivation...`);
 
+        const licensingClient = new LicensingClient();
+
         try {
-            const activeLicenses = await licensingClient.ShowEntitlements();
+            const activeLicenses = await licensingClient.GetActiveEntitlements();
 
             if (license !== undefined &&
                 activeLicenses.includes(license)) {
-                await licensingClient.ReturnLicense(license);
+                await licensingClient.Deactivate(license);
                 core.info(`Unity ${license} License successfully returned.`);
             }
         }
