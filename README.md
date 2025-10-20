@@ -40,7 +40,7 @@ This action requires several secrets that need to be setup in the repository or 
 
 ```yaml
 steps:
-  - uses: RageAgainstThePixel/activate-unity-license@v2
+  - uses: buildalon/activate-unity-license@v2
     with:
       license: 'Personal' # Choose license type to use [ Personal, Professional, Floating ]
       username: ${{ secrets.UNITY_USERNAME }}
