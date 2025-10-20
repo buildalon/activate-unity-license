@@ -19,17 +19,12 @@ export async function Deactivate(): Promise<void> {
             return;
         }
 
-        core.startGroup(`Unity ${license} License Deactivation...`);
-
-        try {
-            await new LicensingClient().Deactivate(license);
-        }
-        finally {
-            core.endGroup();
-        }
+        core.info(`Unity ${license} License Deactivation...`);
+        await new LicensingClient().Deactivate(license);
     } catch (error) {
         core.error(`Failed to deactivate license!\n${error}`);
     } finally {
+        // always exit 0 to not fail the job if deactivation fails
         process.exit(0);
     }
 }
