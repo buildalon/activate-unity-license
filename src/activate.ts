@@ -53,7 +53,7 @@ export async function Activate(): Promise<void> {
                         throw Error('Username is required for Unity License Activation!');
                     }
 
-                    username = Buffer.from(encodedUsername, 'base64').toString('utf-8');
+                    username = Buffer.from(encodedUsername, 'base64').toString('utf-8').trim();
                 }
 
                 const emailRegex: RegExp = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -69,7 +69,7 @@ export async function Activate(): Promise<void> {
                         throw Error('Password is required for Unity License Activation!');
                     }
 
-                    password = Buffer.from(encodedPassword, 'base64').toString('utf-8');
+                    password = Buffer.from(encodedPassword, 'base64').toString('utf-8').trim();
                 }
 
                 if (password.length === 0) {

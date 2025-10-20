@@ -33694,7 +33694,7 @@ async function Activate() {
                     if (!encodedUsername) {
                         throw Error('Username is required for Unity License Activation!');
                     }
-                    username = Buffer.from(encodedUsername, 'base64').toString('utf-8');
+                    username = Buffer.from(encodedUsername, 'base64').toString('utf-8').trim();
                 }
                 const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
                 if (username.length === 0 || !emailRegex.test(username)) {
@@ -33705,7 +33705,7 @@ async function Activate() {
                     if (!encodedPassword) {
                         throw Error('Password is required for Unity License Activation!');
                     }
-                    password = Buffer.from(encodedPassword, 'base64').toString('utf-8');
+                    password = Buffer.from(encodedPassword, 'base64').toString('utf-8').trim();
                 }
                 if (password.length === 0) {
                     throw Error('Password is required for Unity License Activation!');
