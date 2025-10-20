@@ -23,7 +23,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v5
-      - uses: buildalon/unity-setup@development
+      - uses: buildalon/unity-setup@v2
         with:
           version-file: None
           unity-version: ${{ matrix.unity-version }}
