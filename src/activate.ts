@@ -31,7 +31,7 @@ export async function Activate(): Promise<void> {
             process.exit(0);
         }
 
-        core.info(`Attempting to activate Unity License...`);
+        core.info('Attempting to activate Unity License...');
 
         let servicesConfig: string | undefined = undefined;
         let username: string | undefined = undefined;
