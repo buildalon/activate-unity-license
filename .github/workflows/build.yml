@@ -23,7 +23,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v5
-      - uses: buildalon/unity-setup@v2
+      - uses: buildalon/unity-setup@main
         with:
           version-file: None
           unity-version: ${{ matrix.unity-version }}
@@ -33,7 +33,7 @@ jobs:
           license: Personal
           username: ${{ secrets.UNITY_USERNAME }}
           password: ${{ secrets.UNITY_PASSWORD }}
-      - uses: buildalon/unity-action@v2
+      - uses: buildalon/unity-action@main
         timeout-minutes: 10
         with:
           args: '-quit -nographics -batchmode -createProject "${{ github.workspace }}/Test Project"'
