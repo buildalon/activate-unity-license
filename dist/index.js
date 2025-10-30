@@ -3533,7 +3533,7 @@ class LicensingClient {
             await fs.promises.access(this.unityHub.rootDirectory, fs.constants.R_OK);
         }
         catch (error) {
-            await this.unityHub.Install();
+            throw new Error('Unity Hub is not installed or not accessible. Please install Unity Hub before using the Licensing Client.');
         }
         const licensingClientExecutable = process.platform === 'win32' ? 'Unity.Licensing.Client.exe' : 'Unity.Licensing.Client';
         const licenseClientPath = await (0, utilities_1.ResolveGlobToPath)([this.unityHub.rootDirectory, '**', licensingClientExecutable]);
@@ -4235,32 +4235,41 @@ class UnityEditor {
             this.version = version;
         }
         this.autoAddNoGraphics = this.version.isGreaterThan('2018.0.0');
+        // ensure metadata.hub.json exists and has a productName entry
         const hubMetaDataPath = path.join(this.editorRootPath, 'metadata.hub.json');
-        if (!fs.existsSync(hubMetaDataPath)) {
-            const metadata = {
-                productName: `Unity ${this.version.version.toString()}`,
-                entitlements: [],
-                releaseStream: '',
-                isLTS: null
-            };
-            fs.writeFileSync(hubMetaDataPath, JSON.stringify(metadata), { encoding: 'utf-8' });
-        }
-        else {
-            const metadataContent = fs.readFileSync(hubMetaDataPath, { encoding: 'utf-8' });
-            const metadata = JSON.parse(metadataContent);
-            if (!metadata.productName) {
-                // projectName must be the first property
-                const newMetadata = {
-                    productName: `Unity ${this.version.version.toString()}`
+        try {
+            // check if we have permissions to write to this file
+            fs.accessSync(hubMetaDataPath, fs.constants.W_OK);
+            if (!fs.existsSync(hubMetaDataPath)) {
+                const metadata = {
+                    productName: `Unity ${this.version.version.toString()}`,
+                    entitlements: [],
+                    releaseStream: '',
+                    isLTS: null
                 };
-                Object.keys(metadata).forEach(key => {
-                    if (key === 'productName') {
-                        return;
-                    }
-                    newMetadata[key] = metadata[key];
-                });
-                fs.writeFileSync(hubMetaDataPath, JSON.stringify(newMetadata), { encoding: 'utf-8' });
+                fs.writeFileSync(hubMetaDataPath, JSON.stringify(metadata), { encoding: 'utf-8' });
             }
+            else {
+                const metadataContent = fs.readFileSync(hubMetaDataPath, { encoding: 'utf-8' });
+                const metadata = JSON.parse(metadataContent);
+                if (!metadata.productName) {
+                    // projectName must be the first property
+                    const newMetadata = {
+                        productName: `Unity ${this.version.version.toString()}`
+                    };
+                    Object.keys(metadata).forEach(key => {
+                        if (key === 'productName') {
+                            return;
+                        }
+                        newMetadata[key] = metadata[key];
+                    });
+                    fs.writeFileSync(hubMetaDataPath, JSON.stringify(newMetadata), { encoding: 'utf-8' });
+                }
+            }
+        }
+        catch (error) {
+            // ignore - we just won't be able to update the metadata file
+            this.logger.debug(`No write access to Unity editor root path: ${this.editorRootPath}`);
         }
     }
     /**
@@ -4843,40 +4852,55 @@ class UnityHub {
      * @param autoUpdate If true, automatically updates the Unity Hub if it is already installed. Default is true.
      * @returns The path to the Unity Hub executable.
      */
-    async Install(autoUpdate = true) {
+    async Install(autoUpdate = true, version) {
+        if (autoUpdate && version) {
+            throw new Error('Cannot use autoUpdate with version.');
+        }
         let isInstalled = false;
         try {
             await fs.promises.access(this.executable, fs.constants.X_OK);
             isInstalled = true;
         }
         catch {
-            await this.installHub();
+            await this.installHub(version);
         }
         if (isInstalled && autoUpdate) {
             const installedVersion = await this.getInstalledHubVersion();
             this.logger.ci(`Installed Unity Hub version: ${installedVersion.version}`);
-            let latestVersion = undefined;
-            try {
-                latestVersion = await this.getLatestHubVersion();
-                this.logger.ci(`Latest Unity Hub version: ${latestVersion.version}`);
+            let versionToInstall = null;
+            if (!version) {
+                try {
+                    versionToInstall = await this.getLatestHubVersion();
+                    this.logger.ci(`Latest Unity Hub version: ${versionToInstall.version}`);
+                }
+                catch (error) {
+                    this.logger.warn(`Failed to get latest Unity Hub version: ${error}`);
+                }
             }
-            catch (error) {
-                this.logger.warn(`Failed to get latest Unity Hub version: ${error}`);
+            else {
+                versionToInstall = (0, semver_1.coerce)(version);
             }
-            if (latestVersion && (0, semver_1.compare)(installedVersion, latestVersion) < 0) {
-                this.logger.info(`Updating Unity Hub from ${installedVersion.version} to ${latestVersion.version}...`);
+            if (versionToInstall === null ||
+                !versionToInstall &&
+                    !(0, semver_1.valid)(versionToInstall)) {
+                throw new Error(`Invalid Unity Hub version to install: ${versionToInstall}`);
+            }
+            const mustInstall = version || (versionToInstall && (0, semver_1.compare)(installedVersion, versionToInstall) < 0);
+            if (mustInstall) {
+                this.logger.info(`Updating Unity Hub from ${installedVersion.version} to ${versionToInstall.version}...`);
                 if (process.platform === 'darwin') {
                     await (0, utilities_1.Exec)('sudo', ['rm', '-rf', this.rootDirectory], { silent: true, showCommand: true });
-                    await this.installHub();
+                    await this.installHub(version);
                 }
                 else if (process.platform === 'win32') {
-                    const uninstaller = path.join(path.dirname(this.executable), 'Uninstall Unity Hub.exe');
+                    const uninstaller = path.join(this.rootDirectory, 'Uninstall Unity Hub.exe');
                     await (0, utilities_1.Exec)('powershell', [
                         '-NoProfile',
                         '-Command',
                         `Start-Process -FilePath '${uninstaller}' -ArgumentList '/S' -Verb RunAs -Wait`
                     ], { silent: true, showCommand: true });
-                    await this.installHub();
+                    await (0, utilities_1.DeleteDirectory)(this.rootDirectory);
+                    await this.installHub(version);
                 }
                 else if (process.platform === 'linux') {
                     await (0, utilities_1.Exec)('sudo', ['sh', '-c', `#!/bin/bash
@@ -4884,7 +4908,10 @@ set -e
 wget -qO - https://hub.unity3d.com/linux/keys/public | gpg --dearmor | sudo tee /usr/share/keyrings/Unity_Technologies_ApS.gpg >/dev/null
 sudo sh -c 'echo "deb [signed-by=/usr/share/keyrings/Unity_Technologies_ApS.gpg] https://hub.unity3d.com/linux/repos/deb stable main" > /etc/apt/sources.list.d/unityhub.list'
 sudo apt-get update --allow-releaseinfo-change
-sudo apt-get install -y --no-install-recommends --only-upgrade unityhub`]);
+sudo apt-get install -y --no-install-recommends --only-upgrade unityhub${version ? '=' + version : ''}`]);
+                }
+                else {
+                    throw new Error(`Unsupported platform: ${process.platform}`);
                 }
             }
             else {
@@ -4894,11 +4921,19 @@ sudo apt-get install -y --no-install-recommends --only-upgrade unityhub`]);
         await fs.promises.access(this.executable, fs.constants.X_OK);
         return this.executable;
     }
-    async installHub() {
-        this.logger.ci(`Installing Unity Hub...`);
+    async installHub(version) {
+        this.logger.ci(`Installing Unity Hub${version ? ' ' + version : ''}...`);
+        if (!version) {
+            switch (process.platform) {
+                case 'win32':
+                case 'darwin':
+                    version = 'prod';
+                    break;
+            }
+        }
         switch (process.platform) {
             case 'win32': {
-                const url = 'https://public-cdn.cloud.unity3d.com/hub/prod/UnityHubSetup.exe';
+                const url = `https://public-cdn.cloud.unity3d.com/hub/${version}/UnityHubSetup.exe`;
                 const downloadPath = path.join((0, utilities_1.GetTempDir)(), 'UnityHubSetup.exe');
                 await (0, utilities_1.DownloadFile)(url, downloadPath);
                 this.logger.info(`Running Unity Hub installer...`);
@@ -4917,7 +4952,7 @@ sudo apt-get install -y --no-install-recommends --only-upgrade unityhub`]);
                 break;
             }
             case 'darwin': {
-                const baseUrl = 'https://public-cdn.cloud.unity3d.com/hub/prod';
+                const baseUrl = `https://public-cdn.cloud.unity3d.com/hub/${version}`;
                 const url = `${baseUrl}/UnityHubSetup-${process.arch}.dmg`;
                 const downloadPath = path.join((0, utilities_1.GetTempDir)(), `UnityHubSetup-${process.arch}.dmg`);
                 await (0, utilities_1.DownloadFile)(url, downloadPath);
@@ -4966,11 +5001,12 @@ wget -qO - https://hub.unity3d.com/linux/keys/public | gpg --dearmor | tee /usr/
 echo "deb [signed-by=/usr/share/keyrings/Unity_Technologies_ApS.gpg] https://hub.unity3d.com/linux/repos/deb stable main" > /etc/apt/sources.list.d/unityhub.list
 echo "deb https://archive.ubuntu.com/ubuntu jammy main universe" | tee /etc/apt/sources.list.d/jammy.list
 apt-get update
-apt-get install -y --no-install-recommends unityhub ffmpeg libgtk2.0-0 libglu1-mesa libgconf-2-4 libncurses5
+apt-get install -y --no-install-recommends unityhub${version ? '=' + version : ''} ffmpeg libgtk2.0-0 libglu1-mesa libgconf-2-4 libncurses5
 apt-get clean
 sed -i 's/^\\(.*DISPLAY=:.*XAUTHORITY=.*\\)\\( "\\$@" \\)2>&1$/\\1\\2/' /usr/bin/xvfb-run
 printf '#!/bin/bash\nxvfb-run --auto-servernum /opt/unityhub/unityhub "$@" 2>/dev/null' | tee /usr/bin/unity-hub >/dev/null
 chmod 777 /usr/bin/unity-hub
+which unityhub || { echo "Unity Hub installation failed"; exit 1; }
 hubPath=$(which unityhub)
 
 if [ -z "$hubPath" ]; then
@@ -4985,7 +5021,8 @@ chmod -R 777 "$hubPath"`]);
                 throw new Error(`Unsupported platform: ${process.platform}`);
         }
         await fs.promises.access(this.executable, fs.constants.X_OK);
-        this.logger.debug(`Unity Hub install complete`);
+        const installedVersion = await this.getInstalledHubVersion();
+        this.logger.info(`Unity Hub ${installedVersion} installed successfully.`);
     }
     async getInstalledHubVersion() {
         let asarPath = undefined;
@@ -5005,8 +5042,15 @@ chmod -R 777 "$hubPath"`]);
         catch {
             throw new Error('Unity Hub is not installed.');
         }
-        const fileBuffer = asar.extractFile(asarPath, 'package.json');
-        const packageJson = JSON.parse(fileBuffer.toString());
+        asar.uncacheAll();
+        const fileBuffer = asar.extractFile(asarPath, 'package.json').toString('utf-8');
+        let packageJson;
+        try {
+            packageJson = JSON.parse(fileBuffer);
+        }
+        catch (error) {
+            throw new Error(`Failed to parse Unity Hub package.json: ${error}\n${fileBuffer}`);
+        }
         const version = (0, semver_1.coerce)(packageJson.version);
         if (!version || !(0, semver_1.valid)(version)) {
             throw new Error(`Failed to parse Unity Hub version: ${packageJson.version}`);
@@ -6259,7 +6303,7 @@ async function Exec(command, args, options = { silent: false, showCommand: true 
             }
         }
         if (exitCode !== 0) {
-            throw new Error(`${command} failed with exit code ${exitCode}`);
+            throw new Error(`${command} failed with exit code ${exitCode}\n${output}`);
         }
     }
     return output;
@@ -37844,7 +37888,9 @@ class AST {
         if (this.#root === this)
             this.#fillNegs();
         if (!this.type) {
-            const noEmpty = this.isStart() && this.isEnd();
+            const noEmpty = this.isStart() &&
+                this.isEnd() &&
+                !this.#parts.some(s => typeof s !== 'string');
             const src = this.#parts
                 .map(p => {
                 const [re, _, hasMagic, uflag] = typeof p === 'string'
@@ -38000,10 +38046,7 @@ class AST {
                 }
             }
             if (c === '*') {
-                if (noEmpty && glob === '*')
-                    re += starNoEmpty;
-                else
-                    re += star;
+                re += noEmpty && glob === '*' ? starNoEmpty : star;
                 hasMagic = true;
                 continue;
             }
@@ -38191,16 +38234,24 @@ exports.escape = void 0;
 /**
  * Escape all magic characters in a glob pattern.
  *
- * If the {@link windowsPathsNoEscape | GlobOptions.windowsPathsNoEscape}
+ * If the {@link MinimatchOptions.windowsPathsNoEscape}
  * option is used, then characters are escaped by wrapping in `[]`, because
  * a magic character wrapped in a character class can only be satisfied by
  * that exact character.  In this mode, `\` is _not_ escaped, because it is
  * not interpreted as a magic character, but instead as a path separator.
+ *
+ * If the {@link MinimatchOptions.magicalBraces} option is used,
+ * then braces (`{` and `}`) will be escaped.
  */
-const escape = (s, { windowsPathsNoEscape = false, } = {}) => {
+const escape = (s, { windowsPathsNoEscape = false, magicalBraces = false, } = {}) => {
     // don't need to escape +@! because we escape the parens
     // that make those magic, and escaping ! as [!] isn't valid,
     // because [!]] is a valid glob class meaning not ']'.
+    if (magicalBraces) {
+        return windowsPathsNoEscape
+            ? s.replace(/[?*()[\]{}]/g, '[$&]')
+            : s.replace(/[?*()[\]\\{}]/g, '\\$&');
+    }
     return windowsPathsNoEscape
         ? s.replace(/[?*()[\]]/g, '[$&]')
         : s.replace(/[?*()[\]\\]/g, '\\$&');
@@ -38856,7 +38907,7 @@ class Minimatch {
             }
         }
         // resolve and reduce . and .. portions in the file as well.
-        // dont' need to do the second phase, because it's only one string[]
+        // don't need to do the second phase, because it's only one string[]
         const { optimizationLevel = 1 } = this.options;
         if (optimizationLevel >= 2) {
             file = this.levelTwoFileOptimize(file);
@@ -39109,14 +39160,25 @@ class Minimatch {
                     }
                 }
                 else if (next === undefined) {
-                    pp[i - 1] = prev + '(?:\\/|' + twoStar + ')?';
+                    pp[i - 1] = prev + '(?:\\/|\\/' + twoStar + ')?';
                 }
                 else if (next !== exports.GLOBSTAR) {
                     pp[i - 1] = prev + '(?:\\/|\\/' + twoStar + '\\/)' + next;
                     pp[i + 1] = exports.GLOBSTAR;
                 }
             });
-            return pp.filter(p => p !== exports.GLOBSTAR).join('/');
+            const filtered = pp.filter(p => p !== exports.GLOBSTAR);
+            // For partial matches, we need to make the pattern match
+            // any prefix of the full path. We do this by generating
+            // alternative patterns that match progressively longer prefixes.
+            if (this.partial && filtered.length >= 1) {
+                const prefixes = [];
+                for (let i = 1; i <= filtered.length; i++) {
+                    prefixes.push(filtered.slice(0, i).join('/'));
+                }
+                return '(?:' + prefixes.join('|') + ')';
+            }
+            return filtered.join('/');
         })
             .join('|');
         // need to wrap in parens if we had more than one thing with |,
@@ -39125,6 +39187,10 @@ class Minimatch {
         // must match entire pattern
         // ending in a * or ** will make it less strict.
         re = '^' + open + re + close + '$';
+        // In partial mode, '/' should always match as it's a valid prefix for any pattern
+        if (this.partial) {
+            re = '^(?:\\/|' + open + re.slice(1, -1) + close + ')$';
+        }
         // can match anything, as long as it's not this.
         if (this.negate)
             re = '^(?!' + re + ').+$';
@@ -39241,21 +39307,35 @@ exports.unescape = void 0;
 /**
  * Un-escape a string that has been escaped with {@link escape}.
  *
- * If the {@link windowsPathsNoEscape} option is used, then square-brace
- * escapes are removed, but not backslash escapes.  For example, it will turn
- * the string `'[*]'` into `*`, but it will not turn `'\\*'` into `'*'`,
- * becuase `\` is a path separator in `windowsPathsNoEscape` mode.
+ * If the {@link MinimatchOptions.windowsPathsNoEscape} option is used, then
+ * square-bracket escapes are removed, but not backslash escapes.
  *
- * When `windowsPathsNoEscape` is not set, then both brace escapes and
+ * For example, it will turn the string `'[*]'` into `*`, but it will not
+ * turn `'\\*'` into `'*'`, because `\` is a path separator in
+ * `windowsPathsNoEscape` mode.
+ *
+ * When `windowsPathsNoEscape` is not set, then both square-bracket escapes and
  * backslash escapes are removed.
  *
  * Slashes (and backslashes in `windowsPathsNoEscape` mode) cannot be escaped
  * or unescaped.
+ *
+ * When `magicalBraces` is not set, escapes of braces (`{` and `}`) will not be
+ * unescaped.
  */
-const unescape = (s, { windowsPathsNoEscape = false, } = {}) => {
+const unescape = (s, { windowsPathsNoEscape = false, magicalBraces = true, } = {}) => {
+    if (magicalBraces) {
+        return windowsPathsNoEscape
+            ? s.replace(/\[([^\/\\])\]/g, '$1')
+            : s
+                .replace(/((?!\\).|^)\[([^\/\\])\]/g, '$1$2')
+                .replace(/\\([^\/])/g, '$1');
+    }
     return windowsPathsNoEscape
-        ? s.replace(/\[([^\/\\])\]/g, '$1')
-        : s.replace(/((?!\\).|^)\[([^\/\\])\]/g, '$1$2').replace(/\\([^\/])/g, '$1');
+        ? s.replace(/\[([^\/\\{}])\]/g, '$1')
+        : s
+            .replace(/((?!\\).|^)\[([^\/\\{}])\]/g, '$1$2')
+            .replace(/\\([^\/{}])/g, '$1');
 };
 exports.unescape = unescape;
 //# sourceMappingURL=unescape.js.map
@@ -52927,21 +53007,35 @@ const parseClass = (glob, position) => {
 /**
  * Un-escape a string that has been escaped with {@link escape}.
  *
- * If the {@link windowsPathsNoEscape} option is used, then square-brace
- * escapes are removed, but not backslash escapes.  For example, it will turn
- * the string `'[*]'` into `*`, but it will not turn `'\\*'` into `'*'`,
- * becuase `\` is a path separator in `windowsPathsNoEscape` mode.
+ * If the {@link MinimatchOptions.windowsPathsNoEscape} option is used, then
+ * square-bracket escapes are removed, but not backslash escapes.
  *
- * When `windowsPathsNoEscape` is not set, then both brace escapes and
+ * For example, it will turn the string `'[*]'` into `*`, but it will not
+ * turn `'\\*'` into `'*'`, because `\` is a path separator in
+ * `windowsPathsNoEscape` mode.
+ *
+ * When `windowsPathsNoEscape` is not set, then both square-bracket escapes and
  * backslash escapes are removed.
  *
  * Slashes (and backslashes in `windowsPathsNoEscape` mode) cannot be escaped
  * or unescaped.
+ *
+ * When `magicalBraces` is not set, escapes of braces (`{` and `}`) will not be
+ * unescaped.
  */
-const unescape_unescape = (s, { windowsPathsNoEscape = false, } = {}) => {
+const unescape_unescape = (s, { windowsPathsNoEscape = false, magicalBraces = true, } = {}) => {
+    if (magicalBraces) {
+        return windowsPathsNoEscape
+            ? s.replace(/\[([^\/\\])\]/g, '$1')
+            : s
+                .replace(/((?!\\).|^)\[([^\/\\])\]/g, '$1$2')
+                .replace(/\\([^\/])/g, '$1');
+    }
     return windowsPathsNoEscape
-        ? s.replace(/\[([^\/\\])\]/g, '$1')
-        : s.replace(/((?!\\).|^)\[([^\/\\])\]/g, '$1$2').replace(/\\([^\/])/g, '$1');
+        ? s.replace(/\[([^\/\\{}])\]/g, '$1')
+        : s
+            .replace(/((?!\\).|^)\[([^\/\\{}])\]/g, '$1$2')
+            .replace(/\\([^\/{}])/g, '$1');
 };
 //# sourceMappingURL=unescape.js.map
 ;// CONCATENATED MODULE: ./node_modules/@electron/asar/node_modules/minimatch/dist/esm/ast.js
@@ -53359,7 +53453,9 @@ class AST {
         if (this.#root === this)
             this.#fillNegs();
         if (!this.type) {
-            const noEmpty = this.isStart() && this.isEnd();
+            const noEmpty = this.isStart() &&
+                this.isEnd() &&
+                !this.#parts.some(s => typeof s !== 'string');
             const src = this.#parts
                 .map(p => {
                 const [re, _, hasMagic, uflag] = typeof p === 'string'
@@ -53515,10 +53611,7 @@ class AST {
                 }
             }
             if (c === '*') {
-                if (noEmpty && glob === '*')
-                    re += starNoEmpty;
-                else
-                    re += star;
+                re += noEmpty && glob === '*' ? starNoEmpty : star;
                 hasMagic = true;
                 continue;
             }
@@ -53537,16 +53630,24 @@ class AST {
 /**
  * Escape all magic characters in a glob pattern.
  *
- * If the {@link windowsPathsNoEscape | GlobOptions.windowsPathsNoEscape}
+ * If the {@link MinimatchOptions.windowsPathsNoEscape}
  * option is used, then characters are escaped by wrapping in `[]`, because
  * a magic character wrapped in a character class can only be satisfied by
  * that exact character.  In this mode, `\` is _not_ escaped, because it is
  * not interpreted as a magic character, but instead as a path separator.
+ *
+ * If the {@link MinimatchOptions.magicalBraces} option is used,
+ * then braces (`{` and `}`) will be escaped.
  */
-const escape_escape = (s, { windowsPathsNoEscape = false, } = {}) => {
+const escape_escape = (s, { windowsPathsNoEscape = false, magicalBraces = false, } = {}) => {
     // don't need to escape +@! because we escape the parens
     // that make those magic, and escaping ! as [!] isn't valid,
     // because [!]] is a valid glob class meaning not ']'.
+    if (magicalBraces) {
+        return windowsPathsNoEscape
+            ? s.replace(/[?*()[\]{}]/g, '[$&]')
+            : s.replace(/[?*()[\]\\{}]/g, '\\$&');
+    }
     return windowsPathsNoEscape
         ? s.replace(/[?*()[\]]/g, '[$&]')
         : s.replace(/[?*()[\]\\]/g, '\\$&');
@@ -54186,7 +54287,7 @@ class Minimatch {
             }
         }
         // resolve and reduce . and .. portions in the file as well.
-        // dont' need to do the second phase, because it's only one string[]
+        // don't need to do the second phase, because it's only one string[]
         const { optimizationLevel = 1 } = this.options;
         if (optimizationLevel >= 2) {
             file = this.levelTwoFileOptimize(file);
@@ -54439,14 +54540,25 @@ class Minimatch {
                     }
                 }
                 else if (next === undefined) {
-                    pp[i - 1] = prev + '(?:\\/|' + twoStar + ')?';
+                    pp[i - 1] = prev + '(?:\\/|\\/' + twoStar + ')?';
                 }
                 else if (next !== GLOBSTAR) {
                     pp[i - 1] = prev + '(?:\\/|\\/' + twoStar + '\\/)' + next;
                     pp[i + 1] = GLOBSTAR;
                 }
             });
-            return pp.filter(p => p !== GLOBSTAR).join('/');
+            const filtered = pp.filter(p => p !== GLOBSTAR);
+            // For partial matches, we need to make the pattern match
+            // any prefix of the full path. We do this by generating
+            // alternative patterns that match progressively longer prefixes.
+            if (this.partial && filtered.length >= 1) {
+                const prefixes = [];
+                for (let i = 1; i <= filtered.length; i++) {
+                    prefixes.push(filtered.slice(0, i).join('/'));
+                }
+                return '(?:' + prefixes.join('|') + ')';
+            }
+            return filtered.join('/');
         })
             .join('|');
         // need to wrap in parens if we had more than one thing with |,
@@ -54455,6 +54567,10 @@ class Minimatch {
         // must match entire pattern
         // ending in a * or ** will make it less strict.
         re = '^' + open + re + close + '$';
+        // In partial mode, '/' should always match as it's a valid prefix for any pattern
+        if (this.partial) {
+            re = '^(?:\\/|' + open + re.slice(1, -1) + close + ')$';
+        }
         // can match anything, as long as it's not this.
         if (this.negate)
             re = '^(?!' + re + ').+$';
@@ -55340,21 +55456,35 @@ const brace_expressions_parseClass = (glob, position) => {
 /**
  * Un-escape a string that has been escaped with {@link escape}.
  *
- * If the {@link windowsPathsNoEscape} option is used, then square-brace
- * escapes are removed, but not backslash escapes.  For example, it will turn
- * the string `'[*]'` into `*`, but it will not turn `'\\*'` into `'*'`,
- * becuase `\` is a path separator in `windowsPathsNoEscape` mode.
+ * If the {@link MinimatchOptions.windowsPathsNoEscape} option is used, then
+ * square-bracket escapes are removed, but not backslash escapes.
  *
- * When `windowsPathsNoEscape` is not set, then both brace escapes and
+ * For example, it will turn the string `'[*]'` into `*`, but it will not
+ * turn `'\\*'` into `'*'`, because `\` is a path separator in
+ * `windowsPathsNoEscape` mode.
+ *
+ * When `windowsPathsNoEscape` is not set, then both square-bracket escapes and
  * backslash escapes are removed.
  *
  * Slashes (and backslashes in `windowsPathsNoEscape` mode) cannot be escaped
  * or unescaped.
+ *
+ * When `magicalBraces` is not set, escapes of braces (`{` and `}`) will not be
+ * unescaped.
  */
-const esm_unescape_unescape = (s, { windowsPathsNoEscape = false, } = {}) => {
+const esm_unescape_unescape = (s, { windowsPathsNoEscape = false, magicalBraces = true, } = {}) => {
+    if (magicalBraces) {
+        return windowsPathsNoEscape
+            ? s.replace(/\[([^\/\\])\]/g, '$1')
+            : s
+                .replace(/((?!\\).|^)\[([^\/\\])\]/g, '$1$2')
+                .replace(/\\([^\/])/g, '$1');
+    }
     return windowsPathsNoEscape
-        ? s.replace(/\[([^\/\\])\]/g, '$1')
-        : s.replace(/((?!\\).|^)\[([^\/\\])\]/g, '$1$2').replace(/\\([^\/])/g, '$1');
+        ? s.replace(/\[([^\/\\{}])\]/g, '$1')
+        : s
+            .replace(/((?!\\).|^)\[([^\/\\{}])\]/g, '$1$2')
+            .replace(/\\([^\/{}])/g, '$1');
 };
 //# sourceMappingURL=unescape.js.map
 ;// CONCATENATED MODULE: ./node_modules/glob/node_modules/minimatch/dist/esm/ast.js
@@ -55772,7 +55902,9 @@ class ast_AST {
         if (this.#root === this)
             this.#fillNegs();
         if (!this.type) {
-            const noEmpty = this.isStart() && this.isEnd();
+            const noEmpty = this.isStart() &&
+                this.isEnd() &&
+                !this.#parts.some(s => typeof s !== 'string');
             const src = this.#parts
                 .map(p => {
                 const [re, _, hasMagic, uflag] = typeof p === 'string'
@@ -55928,10 +56060,7 @@ class ast_AST {
                 }
             }
             if (c === '*') {
-                if (noEmpty && glob === '*')
-                    re += ast_starNoEmpty;
-                else
-                    re += ast_star;
+                re += noEmpty && glob === '*' ? ast_starNoEmpty : ast_star;
                 hasMagic = true;
                 continue;
             }
@@ -55950,16 +56079,24 @@ class ast_AST {
 /**
  * Escape all magic characters in a glob pattern.
  *
- * If the {@link windowsPathsNoEscape | GlobOptions.windowsPathsNoEscape}
+ * If the {@link MinimatchOptions.windowsPathsNoEscape}
  * option is used, then characters are escaped by wrapping in `[]`, because
  * a magic character wrapped in a character class can only be satisfied by
  * that exact character.  In this mode, `\` is _not_ escaped, because it is
  * not interpreted as a magic character, but instead as a path separator.
+ *
+ * If the {@link MinimatchOptions.magicalBraces} option is used,
+ * then braces (`{` and `}`) will be escaped.
  */
-const esm_escape_escape = (s, { windowsPathsNoEscape = false, } = {}) => {
+const esm_escape_escape = (s, { windowsPathsNoEscape = false, magicalBraces = false, } = {}) => {
     // don't need to escape +@! because we escape the parens
     // that make those magic, and escaping ! as [!] isn't valid,
     // because [!]] is a valid glob class meaning not ']'.
+    if (magicalBraces) {
+        return windowsPathsNoEscape
+            ? s.replace(/[?*()[\]{}]/g, '[$&]')
+            : s.replace(/[?*()[\]\\{}]/g, '\\$&');
+    }
     return windowsPathsNoEscape
         ? s.replace(/[?*()[\]]/g, '[$&]')
         : s.replace(/[?*()[\]\\]/g, '\\$&');
@@ -56599,7 +56736,7 @@ class esm_Minimatch {
             }
         }
         // resolve and reduce . and .. portions in the file as well.
-        // dont' need to do the second phase, because it's only one string[]
+        // don't need to do the second phase, because it's only one string[]
         const { optimizationLevel = 1 } = this.options;
         if (optimizationLevel >= 2) {
             file = this.levelTwoFileOptimize(file);
@@ -56852,14 +56989,25 @@ class esm_Minimatch {
                     }
                 }
                 else if (next === undefined) {
-                    pp[i - 1] = prev + '(?:\\/|' + twoStar + ')?';
+                    pp[i - 1] = prev + '(?:\\/|\\/' + twoStar + ')?';
                 }
                 else if (next !== esm_GLOBSTAR) {
                     pp[i - 1] = prev + '(?:\\/|\\/' + twoStar + '\\/)' + next;
                     pp[i + 1] = esm_GLOBSTAR;
                 }
             });
-            return pp.filter(p => p !== esm_GLOBSTAR).join('/');
+            const filtered = pp.filter(p => p !== esm_GLOBSTAR);
+            // For partial matches, we need to make the pattern match
+            // any prefix of the full path. We do this by generating
+            // alternative patterns that match progressively longer prefixes.
+            if (this.partial && filtered.length >= 1) {
+                const prefixes = [];
+                for (let i = 1; i <= filtered.length; i++) {
+                    prefixes.push(filtered.slice(0, i).join('/'));
+                }
+                return '(?:' + prefixes.join('|') + ')';
+            }
+            return filtered.join('/');
         })
             .join('|');
         // need to wrap in parens if we had more than one thing with |,
@@ -56868,6 +57016,10 @@ class esm_Minimatch {
         // must match entire pattern
         // ending in a * or ** will make it less strict.
         re = '^' + open + re + close + '$';
+        // In partial mode, '/' should always match as it's a valid prefix for any pattern
+        if (this.partial) {
+            re = '^(?:\\/|' + open + re.slice(1, -1) + close + ')$';
+        }
         // can match anything, as long as it's not this.
         if (this.negate)
             re = '^(?!' + re + ').+$';
