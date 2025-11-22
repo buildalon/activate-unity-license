@@ -36,4 +36,4 @@ jobs:
       - uses: buildalon/unity-action@main
         timeout-minutes: 10
         with:
-          args: '-quit -nographics -batchmode -createProject "${{ github.workspace }}/Test Project"'
+          args: -quit -nographics -createProject "${{ github.workspace }}/Test Project"
