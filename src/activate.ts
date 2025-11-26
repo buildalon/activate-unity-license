@@ -79,7 +79,7 @@ export async function Activate(): Promise<void> {
         const token = await licensingClient.Activate({ licenseType, servicesConfig, serial, username, password }, true);
 
         if (token) {
-            core.setOutput('activation-token', token);
+            core.saveState('activation-token', token);
         }
 
         activeLicenses = await licensingClient.GetActiveEntitlements();

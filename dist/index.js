@@ -34936,7 +34936,10 @@ async function Activate() {
                 throw Error('Password is required for Unity License Activation!');
             }
         }
-        await licensingClient.Activate({ licenseType, servicesConfig, serial, username, password }, true);
+        const token = await licensingClient.Activate({ licenseType, servicesConfig, serial, username, password }, true);
+        if (token) {
+            core.saveState('activation-token', token);
+        }
         activeLicenses = await licensingClient.GetActiveEntitlements();
         if (!activeLicenses.includes(licenseType)) {
             throw Error(`Failed to activate Unity License with ${licenseType}!`);
@@ -34968,12 +34971,10 @@ async function Deactivate() {
             core.error(`Failed to get license state!`);
             return;
         }
+        const token = core.getState('activation-token');
         core.debug(`post state: ${license}`);
-        if (license === unity_cli_1.LicenseType.floating) {
-            return;
-        }
         core.info(`Unity ${license} License Deactivation...`);
-        await new unity_cli_1.LicensingClient().Deactivate(license);
+        await new unity_cli_1.LicensingClient().Deactivate(license, token);
     }
     catch (error) {
         core.error(`Failed to deactivate license!\n${error}`);
