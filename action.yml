@@ -21,7 +21,7 @@ inputs:
     required: false
     default: ''
   configuration:
-    description: 'Unity License Client `services-config.json` encoded base base64 string. Required for `floating` license activations.'
+    description: 'Unity License Client configuration file `services-config.json` path, raw json, or json encoded as base64 string. Required for `floating` license activations.'
     required: false
     default: ''
   license-version:

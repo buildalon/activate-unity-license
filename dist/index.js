@@ -3583,7 +3583,7 @@ class LicensingClient {
         switch (process.platform) {
             case 'win32':
                 // %PROGRAMDATA%\Unity\Config
-                servicesConfigDirectory = path.join(process.env.PROGRAMDATA || '', 'Unity', 'Config');
+                servicesConfigDirectory = path.join(process.env.PROGRAMDATA || 'C:\\ProgramData', 'Unity', 'Config');
                 break;
             case 'darwin':
                 // /Library/Application Support/Unity/config
@@ -3600,24 +3600,90 @@ class LicensingClient {
         if (!fs.existsSync(servicesConfigDirectory)) {
             fs.mkdirSync(servicesConfigDirectory, { recursive: true });
         }
+        if (process.platform !== 'win32') {
+            fs.chmodSync(servicesConfigDirectory, 0o755);
+        }
+        fs.accessSync(servicesConfigDirectory, fs.constants.R_OK | fs.constants.W_OK);
         return path.join(servicesConfigDirectory, 'services-config.json');
+    }
+    resolveServicesConfigContent(input) {
+        const trimmedInput = input.trim();
+        if (trimmedInput.length === 0) {
+            throw new Error('Services config value is empty. Provide a file path, JSON, or base64 encoded JSON string.');
+        }
+        const rawJson = (0, utilities_1.tryParseJson)(trimmedInput);
+        if (rawJson) {
+            return rawJson;
+        }
+        try {
+            const base64Regex = /^[A-Za-z0-9+/]*={0,2}$/;
+            if (base64Regex.test(trimmedInput)) {
+                const decoded = Buffer.from(trimmedInput, 'base64').toString('utf-8').trim();
+                const decodedJson = (0, utilities_1.tryParseJson)(decoded);
+                if (decodedJson) {
+                    return decodedJson;
+                }
+            }
+            else {
+                throw new Error('Input does not match base64 format.');
+            }
+        }
+        catch (error) {
+            throw new Error(`Failed to decode services config as base64: ${error}`);
+        }
+        throw new Error('Services config value is not a valid JSON string or base64 encoded JSON string.');
+    }
+    async setupServicesConfig(configSource) {
+        const servicesConfigPath = this.servicesConfigPath();
+        if (fs.existsSync(configSource)) {
+            fs.copyFileSync(configSource, servicesConfigPath);
+        }
+        else {
+            const configContent = this.resolveServicesConfigContent(configSource);
+            fs.writeFileSync(servicesConfigPath, configContent, { encoding: 'utf-8' });
+        }
+        if (process.platform !== 'win32') {
+            fs.chmodSync(servicesConfigPath, 0o644);
+        }
+        fs.accessSync(servicesConfigPath, fs.constants.R_OK);
+        return servicesConfigPath;
     }
     /**
      * Gets the path to the Unity Licensing Client log file.
      * @see https://docs.unity.com/en-us/licensing-server/troubleshooting-client#logs
      * @returns The path to the log file.
      */
-    logPath() {
+    static ClientLogPath() {
         switch (process.platform) {
             case 'win32':
                 // $env:LOCALAPPDATA\Unity\Unity.Licensing.Client.log
                 return path.join(process.env.LOCALAPPDATA || '', 'Unity', 'Unity.Licensing.Client.log');
             case 'darwin':
                 // ~/Library/Logs/Unity/Unity.Licensing.Client.log
-                return path.join(os.homedir(), 'Library', 'Logs', 'Unity', 'Unity.Licensing.Client.log');
+                return path.join(process.env.HOME || '', 'Library', 'Logs', 'Unity', 'Unity.Licensing.Client.log');
             case 'linux':
                 // ~/.config/unity3d/Unity/Unity.Licensing.Client.log
-                return path.join(os.homedir(), '.config', 'unity3d', 'Unity', 'Unity.Licensing.Client.log');
+                return path.join(process.env.HOME || '', '.config', 'unity3d', 'Unity', 'Unity.Licensing.Client.log');
+            default:
+                throw new Error(`Unsupported platform: ${process.platform}`);
+        }
+    }
+    /**
+     * Gets the path to the Unity Licensing Client audit log file.
+     * @see https://docs.unity.com/en-us/licensing-server/troubleshooting-client#logs
+     * @returns The path to the audit log file.
+     */
+    static ClientAuditLogPath() {
+        switch (process.platform) {
+            case 'win32':
+                // $env:LOCALAPPDATA\Unity\Unity.Entitlements.Audit.log
+                return path.join(process.env.LOCALAPPDATA || '', 'Unity', 'Unity.Entitlements.Audit.log');
+            case 'darwin':
+                // ~/Library/Logs/Unity/Unity.Entitlements.Audit.log
+                return path.join(process.env.HOME || '', 'Library', 'Logs', 'Unity', 'Unity.Entitlements.Audit.log');
+            case 'linux':
+                // ~/.config/unity3d/Unity/Unity.Entitlements.Audit.log
+                return path.join(process.env.HOME || '', '.config', 'unity3d', 'Unity', 'Unity.Entitlements.Audit.log');
             default:
                 throw new Error(`Unsupported platform: ${process.platform}`);
         }
@@ -3847,6 +3913,69 @@ class LicensingClient {
     async Context() {
         await this.exec(['--showContext']);
     }
+    async getClientLogSize() {
+        try {
+            const stats = await fs.promises.stat(LicensingClient.ClientLogPath());
+            return stats.size;
+        }
+        catch (error) {
+            if (error.code === 'ENOENT') {
+                return 0;
+            }
+            throw error;
+        }
+    }
+    async waitForLicenseServerConfiguration(timeoutMs = 30_000, pollIntervalMs = 1_000) {
+        const logPath = LicensingClient.ClientLogPath();
+        const configuredPattern = /Floating license server URL is:\s*(?<url>[^\s]+)\s*\(via config file\)/;
+        const notConfiguredPattern = /Floating license server is not configured/;
+        const deadline = Date.now() + timeoutMs;
+        let offset = await this.getClientLogSize();
+        let remainder = '';
+        while (Date.now() < deadline) {
+            let newChunk = '';
+            try {
+                const stats = await fs.promises.stat(logPath);
+                if (stats.size > offset) {
+                    const length = stats.size - offset;
+                    const handle = await fs.promises.open(logPath, 'r');
+                    try {
+                        const buffer = Buffer.alloc(length);
+                        await handle.read(buffer, 0, length, offset);
+                        newChunk = buffer.toString('utf-8');
+                        offset = stats.size;
+                    }
+                    finally {
+                        await handle.close();
+                    }
+                }
+            }
+            catch (error) {
+                if (error.code !== 'ENOENT') {
+                    this.logger.error(`Failed to inspect licensing client log: ${error}`);
+                    continue;
+                }
+            }
+            if (newChunk.length > 0) {
+                remainder += newChunk;
+                const lines = remainder.split(/\r?\n/);
+                remainder = lines.pop() ?? '';
+                for (const line of lines) {
+                    const configuredMatch = line.match(configuredPattern);
+                    if (configuredMatch && configuredMatch.groups?.url) {
+                        this.logger.info(`License server configured with URL: ${configuredMatch.groups.url}`);
+                        return;
+                    }
+                    if (notConfiguredPattern.test(line)) {
+                        this.logger.debug('Floating license server is not configured. Waiting for configuration...');
+                    }
+                }
+            }
+            await this.exec(['--showContext'], true);
+            await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+        }
+        throw new Error(`Timed out waiting for floating license server configuration. Check '${logPath}' for details.`);
+    }
     /**
      * Activates a Unity license.
      * @param options The activation options including license type, services config, serial, username, and password.
@@ -3855,8 +3984,18 @@ class LicensingClient {
      * @throws Error if activation fails or required parameters are missing.
      */
     async Activate(options, skipEntitlementCheck = false) {
+        let servicesConfigPath;
+        if (options.licenseType === LicenseType.floating) {
+            if (!options.servicesConfig) {
+                throw new Error('Services config path is required for floating license activation');
+            }
+            servicesConfigPath = await this.setupServicesConfig(options.servicesConfig);
+            this.logger.debug(`Using services config at: ${servicesConfigPath}`);
+        }
+        // For floating licenses, skip the entitlement check
+        skipEntitlementCheck = options.licenseType === LicenseType.floating;
         if (!skipEntitlementCheck) {
-            let activeLicenses = await this.GetActiveEntitlements();
+            const activeLicenses = await this.GetActiveEntitlements();
             if (activeLicenses.includes(options.licenseType)) {
                 this.logger.info(`License of type '${options.licenseType}' is already active, skipping activation`);
                 return;
@@ -3864,17 +4003,7 @@ class LicensingClient {
         }
         switch (options.licenseType) {
             case LicenseType.floating: {
-                if (!options.servicesConfig) {
-                    throw new Error('Services config path is required for floating license activation');
-                }
-                const servicesConfigPath = this.servicesConfigPath();
-                if (fs.existsSync(options.servicesConfig)) {
-                    fs.copyFileSync(options.servicesConfig, servicesConfigPath);
-                }
-                else {
-                    fs.writeFileSync(servicesConfigPath, Buffer.from(options.servicesConfig, 'base64'));
-                }
-                this.logger.debug(`Using services config at: ${servicesConfigPath}`);
+                await this.waitForLicenseServerConfiguration();
                 const output = await this.exec([`--acquire-floating`], true);
                 const tokenMatch = output.match(/with token:\s*"(?<token>[\w-]+)"/);
                 if (!tokenMatch || !tokenMatch.groups || !tokenMatch.groups['token']) {
@@ -3923,10 +4052,7 @@ class LicensingClient {
      * @throws Error if deactivation fails.
      */
     async Deactivate(licenseType, token) {
-        const activeLicenses = await this.GetActiveEntitlements();
-        if (activeLicenses.includes(licenseType)) {
-            await this.returnLicense(licenseType, token);
-        }
+        await this.returnLicense(licenseType, token);
     }
     /**
      * Shows the currently active entitlements/licenses.
@@ -3986,11 +4112,18 @@ class LicensingClient {
             await this.exec([`--return-floating`, token]);
         }
         else {
-            await this.exec([`--return-ulf`]);
-        }
-        const activeLicenses = await this.GetActiveEntitlements();
-        if (activeLicenses.includes(licenseType)) {
-            throw new Error(`Failed to return license of type '${licenseType}'`);
+            let activeLicenses = await this.GetActiveEntitlements();
+            if (activeLicenses.includes(licenseType)) {
+                await this.exec([`--return-ulf`]);
+            }
+            else {
+                this.logger.info(`No active license of type '${licenseType}' found`);
+                return;
+            }
+            activeLicenses = await this.GetActiveEntitlements();
+            if (activeLicenses.includes(licenseType)) {
+                throw new Error(`Failed to return license of type '${licenseType}'`);
+            }
         }
         this.logger.info(`Successfully returned license of type '${licenseType}'`);
     }
@@ -4720,6 +4853,22 @@ class UnityEditor {
         return editorRootPath;
     }
     /**
+     * Gets the path to the Unity Editor log directory.
+     * @returns The path to the Unity Editor logs directory.
+     */
+    static GetEditorLogsDirectory() {
+        switch (process.platform) {
+            case 'win32':
+                return path.join(process.env.LOCALAPPDATA || '', 'Unity', 'Editor');
+            case 'darwin':
+                return path.join(process.env.HOME || '', 'Library', 'Logs', 'Unity');
+            case 'linux':
+                return path.join(process.env.HOME || '', '.config', 'unity3d', 'Editor');
+            default:
+                throw new Error(`Unsupported platform: ${process.platform}`);
+        }
+    }
+    /**
      * Uninstall the Unity Editor.
      */
     async Uninstall() {
@@ -5050,15 +5199,19 @@ class UnityHub {
             throw new Error('Cannot use autoUpdate with version.');
         }
         let isInstalled = false;
+        let installedVersion = undefined;
         try {
             await fs.promises.access(this.executable, fs.constants.X_OK);
+            installedVersion = await this.getInstalledHubVersion();
             isInstalled = true;
         }
         catch {
             await this.installHub(version);
         }
         if (isInstalled && autoUpdate) {
-            const installedVersion = await this.getInstalledHubVersion();
+            if (!installedVersion) {
+                installedVersion = await this.getInstalledHubVersion();
+            }
             this.logger.ci(`Installed Unity Hub version: ${installedVersion.version}`);
             let versionToInstall = null;
             if (!version) {
@@ -5897,6 +6050,46 @@ done
         }
         return moduleMap;
     }
+    /**
+     * Returns the path to the Unity Hub log file.
+     * @see https://docs.unity.com/en-us/licensing-server/troubleshooting-client#logs
+     * @returns The Unity Hub log file path.
+     */
+    static LogPath() {
+        switch (process.platform) {
+            case 'win32':
+                // %APPDATA%\UnityHub\logs\info-log.json
+                return path.join(process.env.APPDATA || '', 'UnityHub', 'logs', 'info-log.json');
+            case 'darwin':
+                // ~/Library/Application Support/UnityHub/logs/info-log.json
+                return path.join(process.env.HOME || '', 'Library', 'Application Support', 'UnityHub', 'logs', 'info-log.json');
+            case 'linux':
+                // ~/.config/UnityHub/logs/info-log.json
+                return path.join(process.env.HOME || '', '.config', 'UnityHub', 'logs', 'info-log.json');
+            default:
+                throw new Error(`Unsupported platform: ${process.platform}`);
+        }
+    }
+    /**
+     * Returns the path to the Unity Package Manager log file.
+     * @see https://docs.unity3d.com/Manual/LogFiles.html
+     * @returns The Unity Package Manager log file path.
+     */
+    static PackageManagerLogsPath() {
+        switch (process.platform) {
+            case 'win32':
+                // C:\Users\username\AppData\Local\Unity\Editor\upm.log
+                return path.join(process.env.LOCALAPPDATA || '', 'Unity', 'Editor', 'upm.log');
+            case 'darwin':
+                // ~/Library/Logs/Unity/upm.log
+                return path.join(process.env.HOME || '', 'Library', 'Logs', 'Unity', 'upm.log');
+            case 'linux':
+                // ~/.config/unity3d/upm.log
+                return path.join(process.env.HOME || '', '.config', 'unity3d', 'upm.log');
+            default:
+                throw new Error(`Unsupported platform: ${process.platform}`);
+        }
+    }
 }
 exports.UnityHub = UnityHub;
 //# sourceMappingURL=unity-hub.js.map
@@ -6656,13 +6849,12 @@ function formatMemoryLeakTable(memLeaks) {
 }
 function buildUtpLogPath(logPath) {
     const parsed = path.parse(logPath);
-    const utpFileName = `utp-${parsed.name}.json`;
+    const utpFileName = `${parsed.name}-utp-json.log`;
     return parsed.dir ? path.join(parsed.dir, utpFileName) : utpFileName;
 }
 async function writeUtpTelemetryLog(filePath, entries, logger) {
     try {
-        const content = `${JSON.stringify(entries, null, 2)}\n`;
-        await fs.promises.writeFile(filePath, content, 'utf8');
+        await fs.promises.writeFile(filePath, `${JSON.stringify(entries)}\n`, 'utf8');
     }
     catch (error) {
         logger.warn(`Failed to write UTP telemetry log (${filePath}): ${error}`);
@@ -6697,13 +6889,41 @@ function TailLogFile(logPath, projectPath) {
         telemetryFlushed = true;
         await writeUtpTelemetryLog(utpLogPath, telemetry, logger);
     };
-    const writeStdout = (content, restoreTable = true) => {
+    const writeStdoutThenTableContent = (content, restoreTable = true) => {
         actionTableRenderer.prepareForContent();
         process.stdout.write(content);
         if (restoreTable) {
             renderActionTable();
         }
     };
+    function printUTP(utp) {
+        // switch utp types, fallback to json if we don't have a toString() implementation or a type implementation
+        switch (utp.type) {
+            case 'Action': {
+                const actionEntry = utp;
+                const tableChanged = actionAccumulator.record(actionEntry);
+                if (tableChanged) {
+                    renderActionTable();
+                }
+                break;
+            }
+            case 'MemoryLeaks':
+                logger.debug(formatMemoryLeakTable(utp));
+                break;
+            case 'PlayerBuildInfo': {
+                const infoEntry = utp;
+                const changed = actionAccumulator.recordPlayerBuildInfo(infoEntry);
+                if (changed) {
+                    renderActionTable();
+                }
+                break;
+            }
+            default:
+                // Print raw JSON for unhandled UTP types
+                writeStdoutThenTableContent(`${JSON.stringify(utp)}\n`);
+                break;
+        }
+    }
     async function readNewLogContent() {
         try {
             if (!fs.existsSync(logPath)) {
@@ -6776,33 +6996,8 @@ function TailLogFile(logPath, projectPath) {
                                             }
                                         }
                                     }
-                                    else {
-                                        // switch utp types, fallback to json if we don't have a toString() implementation or a type implementation
-                                        switch (utp.type) {
-                                            case 'Action': {
-                                                const actionEntry = utp;
-                                                const tableChanged = actionAccumulator.record(actionEntry);
-                                                if (tableChanged) {
-                                                    renderActionTable();
-                                                }
-                                                break;
-                                            }
-                                            case 'MemoryLeaks':
-                                                logger.debug(formatMemoryLeakTable(utp));
-                                                break;
-                                            case 'PlayerBuildInfo': {
-                                                const infoEntry = utp;
-                                                const changed = actionAccumulator.recordPlayerBuildInfo(infoEntry);
-                                                if (changed) {
-                                                    renderActionTable();
-                                                }
-                                                break;
-                                            }
-                                            default:
-                                                // Print raw JSON for unhandled UTP types
-                                                writeStdout(`${jsonPart}\n`);
-                                                break;
-                                        }
+                                    else if (logging_1.Logger.instance.logLevel === logging_1.LogLevel.UTP) {
+                                        printUTP(utp);
                                     }
                                 }
                                 catch (error) {
@@ -6811,7 +7006,7 @@ function TailLogFile(logPath, projectPath) {
                             }
                             else {
                                 if (logging_1.Logger.instance.logLevel !== logging_1.LogLevel.UTP) {
-                                    writeStdout(`${line}\n`);
+                                    process.stdout.write(`${line}\n`);
                                 }
                             }
                         }
@@ -6841,7 +7036,7 @@ function TailLogFile(logPath, projectPath) {
                 await readNewLogContent();
                 try {
                     // write a final newline to separate log output
-                    writeStdout('\n');
+                    process.stdout.write('\n');
                 }
                 catch (error) {
                     if (error.code !== 'EPIPE') {
@@ -7312,6 +7507,7 @@ exports.TestFileAccess = TestFileAccess;
 exports.KillProcess = KillProcess;
 exports.KillChildProcesses = KillChildProcesses;
 exports.isProcessElevated = isProcessElevated;
+exports.tryParseJson = tryParseJson;
 const os = __importStar(__nccwpck_require__(2037));
 const fs = __importStar(__nccwpck_require__(7147));
 const path = __importStar(__nccwpck_require__(1017));
@@ -7778,6 +7974,18 @@ async function isProcessElevated() {
         "(New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)"
     ], { silent: true, showCommand: false });
     return output.trim().toLowerCase() === 'true';
+}
+function tryParseJson(content) {
+    if (!content) {
+        return undefined;
+    }
+    try {
+        JSON.parse(content);
+        return content;
+    }
+    catch {
+        return undefined;
+    }
 }
 //# sourceMappingURL=utilities.js.map
 
@@ -34897,10 +35105,12 @@ async function Activate() {
                 throw Error(`Invalid License: ${licenseInput}! Must be one of: ${Object.values(unity_cli_1.LicenseType).join(', ')}`);
         }
         core.saveState('license', licenseType);
-        let activeLicenses = await licensingClient.GetActiveEntitlements();
-        if (activeLicenses.includes(licenseType)) {
-            core.info(`Unity ${licenseType} License already activated!`);
-            process.exit(0);
+        if (licenseType !== unity_cli_1.LicenseType.floating) {
+            let activeLicenses = await licensingClient.GetActiveEntitlements();
+            if (activeLicenses.includes(licenseType)) {
+                core.info(`Unity ${licenseType} License already activated!`);
+                process.exit(0);
+            }
         }
         core.info('Attempting to activate Unity License...');
         let servicesConfig = undefined;
@@ -34940,9 +35150,11 @@ async function Activate() {
         if (token) {
             core.saveState('activation-token', token);
         }
-        activeLicenses = await licensingClient.GetActiveEntitlements();
-        if (!activeLicenses.includes(licenseType)) {
-            throw Error(`Failed to activate Unity License with ${licenseType}!`);
+        if (licenseType !== unity_cli_1.LicenseType.floating) {
+            let activeLicenses = await licensingClient.GetActiveEntitlements();
+            if (!activeLicenses.includes(licenseType)) {
+                throw Error(`Failed to activate Unity License with ${licenseType}!`);
+            }
         }
         core.info(`Unity ${licenseType} License Activated!`);
     }
