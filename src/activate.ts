@@ -24,11 +24,14 @@ export async function Activate(): Promise<void> {
         }
 
         core.saveState('license', licenseType);
-        let activeLicenses = await licensingClient.GetActiveEntitlements();
 
-        if (activeLicenses.includes(licenseType)) {
-            core.info(`Unity ${licenseType} License already activated!`);
-            process.exit(0);
+        if (licenseType !== LicenseType.floating) {
+            let activeLicenses = await licensingClient.GetActiveEntitlements();
+
+            if (activeLicenses.includes(licenseType)) {
+                core.info(`Unity ${licenseType} License already activated!`);
+                process.exit(0);
+            }
         }
 
         core.info('Attempting to activate Unity License...');
@@ -76,11 +79,18 @@ export async function Activate(): Promise<void> {
             }
         }
 
-        await licensingClient.Activate({ licenseType, servicesConfig, serial, username, password }, true);
-        activeLicenses = await licensingClient.GetActiveEntitlements();
+        const token = await licensingClient.Activate({ licenseType, servicesConfig, serial, username, password }, true);
 
-        if (!activeLicenses.includes(licenseType)) {
-            throw Error(`Failed to activate Unity License with ${licenseType}!`);
+        if (token) {
+            core.saveState('activation-token', token);
+        }
+
+        if (licenseType !== LicenseType.floating) {
+            let activeLicenses = await licensingClient.GetActiveEntitlements();
+
+            if (!activeLicenses.includes(licenseType)) {
+                throw Error(`Failed to activate Unity License with ${licenseType}!`);
+            }
         }
 
         core.info(`Unity ${licenseType} License Activated!`);

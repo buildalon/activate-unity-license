@@ -13,14 +13,10 @@ export async function Deactivate(): Promise<void> {
             return;
         }
 
+        const token = core.getState('activation-token');
         core.debug(`post state: ${license}`);
-
-        if (license === LicenseType.floating) {
-            return;
-        }
-
         core.info(`Unity ${license} License Deactivation...`);
-        await new LicensingClient().Deactivate(license);
+        await new LicensingClient().Deactivate(license, token);
     } catch (error) {
         core.error(`Failed to deactivate license!\n${error}`);
     } finally {
