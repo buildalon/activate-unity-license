@@ -33,7 +33,7 @@ This action requires several secrets that need to be setup in the repository or 
 | `username` | The ***email address*** you use for your Unity Id | Required for `personal`, `professional` license activations |
 | `password` | The ***password*** you use for Unity Id access | Required for `personal` and `professional` license activations |
 | `serial` | The ***Serial number*** for the seat | Required for `professional` license activations, but not named seats. |
-| `configuration` | Unity License Client configuration file `services-config.json` path, raw json, or json encoded as base64 string. | Required for `floating` license activations |
+| `configuration` | Unity License Client `services-config.json` path, raw json, or json encoded as base64 string. | Required for `floating` license activations |
 | `license-version` | Must be one of `4.x` (Unity 4.x), `5.x` (Unity 5.x), `6.x` (Unity 2017+) | Defaults to `6.x` |
 
 ### workflow
@@ -49,3 +49,4 @@ steps:
       # configuration: ${{ secrets.UNITY_SERVICES_CONFIG }} # Required for floating license activations
       # license-version: '6.x' # Optional, defaults to '6.x', can be set to '5.x' for Unity 5.x licenses
 ```
+

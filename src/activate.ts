@@ -42,7 +42,28 @@ export async function Activate(): Promise<void> {
         let serial: string | undefined = undefined;
 
         if (licenseType === LicenseType.floating) {
-            servicesConfig = core.getInput('services-config', { required: true });
+            const configuration = core.getInput('configuration', { required: false }).trim();
+            const legacyServicesConfig = core.getInput('services-config', { required: false }).trim();
+
+            if (legacyServicesConfig) {
+                core.warning(
+                    'Input `services-config` is deprecated; use `configuration` instead.',
+                );
+            }
+
+            if (configuration && legacyServicesConfig) {
+                core.warning(
+                    'Both `configuration` and `services-config` were set; `configuration` is used.',
+                );
+            }
+
+            servicesConfig = configuration || legacyServicesConfig;
+
+            if (!servicesConfig) {
+                throw Error(
+                    'Unity License Client configuration is required for floating license activations. Use the `configuration` input.',
+                );
+            }
         } else {
             username = core.getInput('username', { required: false }).trim();
             password = core.getInput('password', { required: false }).trim();
