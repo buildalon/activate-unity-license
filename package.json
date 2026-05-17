@@ -27,7 +27,7 @@
     "@rage-against-the-pixel/unity-cli": "^2.0.0"
   },
   "devDependencies": {
-    "@types/node": "^22.19.18",
+    "@types/node": "^22.19.19",
     "@vercel/ncc": "^0.34.0",
     "shx": "^0.4.0",
     "typescript": "^5.9.3"
