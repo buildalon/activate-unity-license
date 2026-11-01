@@ -1,16 +1,16 @@
 import core = require('@actions/core');
 import {
+    ActivateLicense,
     LicenseType,
-    LicensingClient,
 } from '@rage-against-the-pixel/unity-cli';
+import { ClassifyFailure, LICENSE_EXHAUSTED_MARKER } from '@rage-against-the-pixel/unity-cli/dist/failure-markers';
+import { SEAT_FIX } from './deactivate';
 
 export async function Activate(): Promise<void> {
-    let licensingClient: LicensingClient;
     let licenseType: LicenseType | undefined = undefined;
 
     try {
         core.saveState('isPost', true);
-        licensingClient = new LicensingClient(core.getInput('license-version'));
         const licenseInput = core.getInput('license', { required: true });
         licenseType = licenseInput.toLowerCase() as LicenseType;
 
@@ -23,17 +23,13 @@ export async function Activate(): Promise<void> {
                 throw Error(`Invalid License: ${licenseInput}! Must be one of: ${Object.values(LicenseType).join(', ')}`);
         }
 
-        core.saveState('license', licenseType);
+        const returnLicense = (core.getInput('return-license') || 'auto').trim().toLowerCase();
 
-        if (licenseType !== LicenseType.floating) {
-            let activeLicenses = await licensingClient.GetActiveEntitlements();
-
-            if (activeLicenses.includes(licenseType)) {
-                core.info(`Unity ${licenseType} License already activated!`);
-                process.exit(0);
-            }
+        if (!['auto', 'always', 'never'].includes(returnLicense)) {
+            throw Error(`Invalid return-license: ${returnLicense}! Must be one of: auto, always, never`);
         }
 
+        core.saveState('return-license', returnLicense);
         core.info('Attempting to activate Unity License...');
 
         let servicesConfig: string | undefined = undefined;
@@ -98,24 +94,39 @@ export async function Activate(): Promise<void> {
             if (password.length === 0) {
                 throw Error('Password is required for Unity License Activation!');
             }
+
+            core.setSecret(username);
+            core.setSecret(password);
+
+            if (serial) {
+                core.setSecret(serial);
+            }
         }
 
-        const token = await licensingClient.Activate({ licenseType, servicesConfig, serial, username, password }, true);
+        // tries a cached license file (UNITY_LICENSE) and the official Unity CLI before the Unity Licensing Client;
+        // 4.x and 5.x editors are detected from the installed editor and use their own license version
+        const token = await ActivateLicense({ licenseType, servicesConfig, serial, username, password });
+        // saved only once activation succeeded, so a failed activation never returns a license it did not activate
+        core.saveState('license', licenseType);
 
         if (token) {
             core.saveState('activation-token', token);
         }
 
-        if (licenseType !== LicenseType.floating) {
-            let activeLicenses = await licensingClient.GetActiveEntitlements();
-
-            if (!activeLicenses.includes(licenseType)) {
-                throw Error(`Failed to activate Unity License with ${licenseType}!`);
-            }
-        }
-
         core.info(`Unity ${licenseType} License Activated!`);
     } catch (error) {
+        // a seat limit or network failure gets a notice titled with its marker, so a rerun workflow can retry it
+        const message = error instanceof Error ? error.message : String(error);
+        const marker = ClassifyFailure(message);
+
+        if (marker) {
+            core.notice(`Retryable failure: ${message}`, { title: marker });
+        }
+
+        if (marker === LICENSE_EXHAUSTED_MARKER && licenseType === LicenseType.professional) {
+            core.warning(`The Unity professional serial may have no free activations. ${SEAT_FIX}`);
+        }
+
         core.setFailed(`Unity License Activation Failed!\n${error}`);
         process.exit(1);
     }

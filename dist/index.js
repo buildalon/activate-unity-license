@@ -3324,7 +3324,14 @@ async function CheckAndroidSdkInstalled(editor, projectPath) {
     const javaSdk = await getJDKPath(editor);
     await execSdkManager(sdkManagerPath, javaSdk, ['--licenses']);
     await execSdkManager(sdkManagerPath, javaSdk, ['--update']);
-    await execSdkManager(sdkManagerPath, javaSdk, ['platform-tools', `platforms;android-${androidTargetSdk}`]);
+    try {
+        await execSdkManager(sdkManagerPath, javaSdk, ['platform-tools', `platforms;android-${androidTargetSdk}`]);
+    }
+    catch (error) {
+        // sdkmanager sometimes fails to unzip a package it just downloaded; a second attempt downloads it again
+        logger.warn(`${error}\nRetrying the Android SDK install...`);
+        await execSdkManager(sdkManagerPath, javaSdk, ['platform-tools', `platforms;android-${androidTargetSdk}`]);
+    }
     sdkPath = await getAndroidSdkPath(editor, androidTargetSdk);
     if (!sdkPath) {
         throw new Error(`Failed to install android-${androidTargetSdk} in ${editor.editorRootPath}`);
@@ -3523,6 +3530,75 @@ async function execSdkManager(sdkManagerPath, javaPath, args) {
 
 /***/ }),
 
+/***/ 8545:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.TRANSIENT_FAILURE_MARKER = exports.LICENSE_EXHAUSTED_MARKER = void 0;
+exports.ClassifyFailure = ClassifyFailure;
+exports.FindLicenseExhaustedLine = FindLicenseExhaustedLine;
+exports.ReportFailure = ReportFailure;
+const logging_1 = __nccwpck_require__(4486);
+const unity_security_1 = __nccwpck_require__(2954);
+/** Annotation title for a failure a later rerun can clear because a license seat was taken. */
+exports.LICENSE_EXHAUSTED_MARKER = 'unity-license-exhausted';
+/** Annotation title for a network or CDN failure a later rerun can clear. */
+exports.TRANSIENT_FAILURE_MARKER = 'unity-transient-failure';
+// only phrases that name a seat or activation limit: the licensing client's generic "seat activation failed" and
+// "acquiring license failed" also cover a wrong password or a revoked license, which a rerun would only repeat.
+// Literal alternations only, so matching stays linear on any message.
+const LICENSE_EXHAUSTED_PATTERN = /activations? limit|maximum number of activations|max activations|no free seats?|no available seats?|seat limit|0 free entitlements|sign-in rate limit/i;
+// a refused connection usually means a wrong host or port, which a rerun repeats, so it is not listed
+const TRANSIENT_PATTERN = /HTTP 5\d\d|Bad Gateway|Service Unavailable|Gateway Time-?out|ECONNRESET|ECONNABORTED|ETIMEDOUT|EAI_AGAIN|socket hang up/i;
+/**
+ * The marker for a failure a rerun after other jobs finish can clear, if the message names one.
+ * @param message The error message.
+ * @returns The marker, or undefined for a failure a rerun would repeat.
+ */
+function ClassifyFailure(message) {
+    if (LICENSE_EXHAUSTED_PATTERN.test(message)) {
+        return exports.LICENSE_EXHAUSTED_MARKER;
+    }
+    // Node reports a download cut off mid-stream with a bare "aborted"
+    if (TRANSIENT_PATTERN.test(message) || /^(Error: )?aborted$/.test(message.trim())) {
+        return exports.TRANSIENT_FAILURE_MARKER;
+    }
+    return undefined;
+}
+/**
+ * The first line that names an exhausted license seat, such as the licensing client's "0 free entitlements" in the
+ * Editor log of a run that stopped on exit 198, so the error that ends the run can carry it.
+ * @param lines The lines to look through.
+ * @returns The line, trimmed, or undefined when none names one.
+ */
+function FindLicenseExhaustedLine(lines) {
+    return lines.map(line => line.trim()).find(line => ClassifyFailure(line) === exports.LICENSE_EXHAUSTED_MARKER);
+}
+/**
+ * Logs a command failure. Failures a rerun can clear get a notice annotation titled with their marker, which the
+ * rerun workflow looks for; every failure is then logged as an error as before. The marker is a notice because GitHub
+ * keeps only 10 error annotations per step, and a step that already reported editor errors would drop it.
+ * @param error The error that ended the command.
+ */
+function ReportFailure(error) {
+    const message = error instanceof Error ? error.message : String(error);
+    // a titled error annotation, so the alert reads as Unity's own on the run summary; a rerun would only repeat it
+    if (error instanceof unity_security_1.UnitySecurityAlertError) {
+        logging_1.Logger.instance.annotate(logging_1.LogLevel.ERROR, message, undefined, undefined, undefined, undefined, undefined, error.title);
+        return;
+    }
+    const marker = ClassifyFailure(message);
+    if (marker) {
+        logging_1.Logger.instance.annotate(logging_1.LogLevel.INFO, `Retryable failure: ${message}`, undefined, undefined, undefined, undefined, undefined, marker);
+    }
+    logging_1.Logger.instance.error(message);
+}
+//# sourceMappingURL=failure-markers.js.map
+
+/***/ }),
+
 /***/ 9644:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
@@ -3628,18 +3704,32 @@ class GitHubActionsLoggerProvider {
         process.stdout.write(`::${level}${metadata}::${this.escapeGitHubCommandValue(message)}\n`);
     }
     mask(message) {
-        process.stdout.write(`::add-mask::${message}\n`);
+        // add-mask covers one line, so a multi-line value is masked line by line
+        for (const line of message.split(/\r?\n/)) {
+            if (line.length > 0) {
+                process.stdout.write(`::add-mask::${line}\n`);
+            }
+        }
     }
     setEnvironmentVariable(name, value) {
         const githubEnv = process.env.GITHUB_ENV;
-        if (githubEnv) {
+        // a line break would let the value set other variables
+        if (githubEnv && !/[\r\n]/.test(`${name}${value}`)) {
             fs.appendFileSync(githubEnv, `${name}=${value}\n`, { encoding: 'utf8' });
         }
     }
     setOutput(name, value) {
         const githubOutput = process.env.GITHUB_OUTPUT;
-        if (githubOutput) {
+        // a line break would let the value set other outputs
+        if (githubOutput && !/[\r\n]/.test(`${name}${value}`)) {
             fs.appendFileSync(githubOutput, `${name}=${value}\n`, { encoding: 'utf8' });
+        }
+    }
+    addPath(directory) {
+        const githubPath = process.env.GITHUB_PATH;
+        // a line break would let the value add more than one PATH entry
+        if (githubPath && !/[\r\n]/.test(directory)) {
+            fs.appendFileSync(githubPath, `${directory}\n`, { encoding: 'utf8' });
         }
     }
     appendStepSummary(summary) {
@@ -3691,13 +3781,14 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 __exportStar(__nccwpck_require__(2774), exports);
 __exportStar(__nccwpck_require__(4115), exports);
 __exportStar(__nccwpck_require__(4486), exports);
+__exportStar(__nccwpck_require__(7992), exports);
 __exportStar(__nccwpck_require__(8944), exports);
-__exportStar(__nccwpck_require__(1723), exports);
+__exportStar(__nccwpck_require__(9874), exports);
 __exportStar(__nccwpck_require__(8468), exports);
+__exportStar(__nccwpck_require__(2954), exports);
 __exportStar(__nccwpck_require__(3331), exports);
 __exportStar(__nccwpck_require__(9746), exports);
 __exportStar(__nccwpck_require__(6753), exports);
-__exportStar(__nccwpck_require__(7501), exports);
 //# sourceMappingURL=index.js.map
 
 /***/ }),
@@ -3742,23 +3833,56 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.LicensingClient = exports.LicenseType = void 0;
+exports.LicensingClientDiagnostic = LicensingClientDiagnostic;
+exports.GetLegacyLicenseVersion = GetLegacyLicenseVersion;
+exports.ActivateLicense = ActivateLicense;
+exports.IsSharedRunnerIdentity = IsSharedRunnerIdentity;
+exports.ReturnLicense = ReturnLicense;
+exports.PrintLicenseContext = PrintLicenseContext;
+exports.GetLicenseFilePath = GetLicenseFilePath;
 const os = __importStar(__nccwpck_require__(2037));
 const fs = __importStar(__nccwpck_require__(7147));
 const path = __importStar(__nccwpck_require__(1017));
 const child_process_1 = __nccwpck_require__(2081);
 const logging_1 = __nccwpck_require__(4486);
-const unity_hub_1 = __nccwpck_require__(1723);
+const unity_cli_1 = __nccwpck_require__(7992);
 const utilities_1 = __nccwpck_require__(9746);
+const process_tracker_1 = __nccwpck_require__(6375);
 var LicenseType;
 (function (LicenseType) {
     LicenseType["personal"] = "personal";
     LicenseType["professional"] = "professional";
     LicenseType["floating"] = "floating";
 })(LicenseType || (exports.LicenseType = LicenseType = {}));
+/**
+ * The v3 licensing client, which drives Unity.Licensing.Client directly.
+ * v4 uses it as the fallback when the official Unity CLI cannot activate or return a license,
+ * for example a personal license on a headless runner, and for Unity 4.x and 5.x editors.
+ */
+/** How long one Unity Licensing Client command may run. */
+const LICENSING_CLIENT_TIMEOUT_MS = 10 * 60 * 1000;
+// literal alternations only, so matching stays linear on any line
+const LICENSING_DIAGNOSTIC_PATTERN = /error|fail|seat|entitlement|activation|limit|denied|invalid|expired/i;
+/**
+ * The lines of sanitized licensing client output that say why a command failed, such as a seat limit.
+ * @param lines The client output, already sanitized.
+ * @returns At most the last 3 matching lines, each cut to 300 characters, or undefined when none match.
+ */
+function LicensingClientDiagnostic(lines) {
+    const matches = lines
+        .map(line => line.trim())
+        .filter(line => line.length > 0 && LICENSING_DIAGNOSTIC_PATTERN.test(line))
+        .slice(-3)
+        .map(line => line.length > 300 ? `${line.slice(0, 300)}...` : line);
+    return matches.length > 0 ? matches.join('\n') : undefined;
+}
 class LicensingClient {
-    unityHub = new unity_hub_1.UnityHub();
     logger = logging_1.Logger.instance;
     licenseClientPath;
+    secrets = [];
+    isLicenseClientPatched = false;
+    /** Where the 4.x/5.x license link lives, and the folders the client may have written Unity_lic.ulf to. */
+    legacyLicense;
     licenseVersion;
     /**
      * Creates an instance of LicensingClient.
@@ -3767,19 +3891,185 @@ class LicensingClient {
     constructor(licenseVersion = undefined) {
         this.licenseVersion = licenseVersion;
     }
+    /**
+     * Finds Unity.Licensing.Client: UNITY_LICENSING_CLIENT_PATH, then the copy the official Unity CLI manages,
+     * then the Hub's external modules folder, then the client bundled with the editor in UNITY_EDITOR_PATH.
+     * @returns The licensing client executable.
+     */
     async init() {
-        try {
-            await fs.promises.access(this.unityHub.executable, fs.constants.R_OK);
-            await fs.promises.access(this.unityHub.rootDirectory, fs.constants.R_OK);
-        }
-        catch (error) {
-            throw new Error('Unity Hub is not installed or not accessible. Please install Unity Hub before using the Licensing Client.');
-        }
         const licensingClientExecutable = process.platform === 'win32' ? 'Unity.Licensing.Client.exe' : 'Unity.Licensing.Client';
-        const licenseClientPath = await (0, utilities_1.ResolveGlobToPath)([this.unityHub.rootDirectory, '**', licensingClientExecutable]);
+        let licenseClientPath = process.env.UNITY_LICENSING_CLIENT_PATH;
+        const legacyVersion = this.licenseVersion ?? GetLegacyLicenseVersion();
+        if (!licenseClientPath && process.platform === 'darwin' && (legacyVersion === '4.x' || legacyVersion === '5.x')) {
+            // the macOS client the Unity CLI downloads cannot be patched for 4.x/5.x, so use the one Unity Hub bundled
+            licenseClientPath = await LicensingClient.getHubBundledClient();
+        }
+        if (!licenseClientPath) {
+            try {
+                const cli = await unity_cli_1.UnityCli.Get();
+                licenseClientPath = await cli.GetLicensingClientPath();
+            }
+            catch (error) {
+                this.logger.debug(`The Unity CLI did not report a licensing client: ${error}`);
+            }
+        }
+        if (!licenseClientPath) {
+            const candidates = LicensingClient.externalModulesDirectories()
+                .map(directory => [directory, '**', licensingClientExecutable]);
+            const editorPath = process.env.UNITY_EDITOR_PATH;
+            if (editorPath && editorPath.length > 0) {
+                candidates.push([path.dirname(editorPath), '**', 'Licensing', 'Client', licensingClientExecutable]);
+            }
+            licenseClientPath = await (0, utilities_1.ResolvePathCandidates)(candidates);
+        }
+        if (!licenseClientPath) {
+            throw new Error('Failed to find Unity.Licensing.Client. Set UNITY_LICENSING_CLIENT_PATH to its location.');
+        }
+        await LicensingClient.ensureMacLicenseDirectory();
         this.licenseClientPath = licenseClientPath;
         await fs.promises.access(this.licenseClientPath, fs.constants.X_OK);
+        this.logger.debug(`Using Unity Licensing Client at ${this.licenseClientPath}`);
         return this.licenseClientPath;
+    }
+    /**
+     * Extracts the licensing client bundled with Unity Hub 3.12.0 on macOS. Its resolver is a separate assembly that
+     * the 4.x/5.x patch works on, unlike the single-file macOS client the Unity CLI downloads, whose licenses stay 6.x.
+     * Only the client is copied out; the Hub is not installed.
+     * @returns The extracted client executable.
+     */
+    static async getHubBundledClient() {
+        const hubVersion = '3.12.0';
+        const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
+        const cacheDirectory = await LicensingClient.privateDirectory(`hub-client-${hubVersion}-${arch}`);
+        const findClient = async () => (await fs.promises.readdir(cacheDirectory, { recursive: true }))
+            .map(entry => path.join(cacheDirectory, entry.toString()))
+            .find(entry => path.basename(entry) === 'Unity.Licensing.Client' && fs.statSync(entry).isFile());
+        if (fs.existsSync(cacheDirectory)) {
+            const cached = await findClient();
+            if (cached) {
+                return cached;
+            }
+        }
+        const dmgPath = path.join((0, utilities_1.GetTempDir)(), `UnityHubSetup-${hubVersion}-${arch}.dmg`);
+        const mountPoint = path.join((0, utilities_1.GetTempDir)(), `UnityHub-${hubVersion}-${arch}`);
+        // pinned so a tampered download never reaches the client that receives the Unity ID
+        const dmgSha256 = {
+            'x64': '1b5e9698b6353cb814618ea12c6ca014d50fc33efe086da6b67e5b442a77bb3e',
+            'arm64': '0026d98a375d926090b144ca3d54e982612aa24a59404e004e333dc34c4b832a',
+        };
+        await (0, utilities_1.DownloadFile)(`https://public-cdn.cloud.unity3d.com/hub/${hubVersion}/UnityHubSetup-${arch}.dmg`, dmgPath, { sha256: dmgSha256[arch] });
+        await fs.promises.mkdir(mountPoint, { recursive: true });
+        try {
+            await (0, utilities_1.Exec)('hdiutil', ['attach', dmgPath, '-nobrowse', '-readonly', '-mountpoint', mountPoint], { silent: true, showCommand: true });
+            try {
+                const client = await (0, utilities_1.ResolveGlobToPath)([mountPoint, '**', 'Unity.Licensing.Client']);
+                const sourceDirectory = LicensingClient.clientRootDirectory(client);
+                await fs.promises.rm(cacheDirectory, { recursive: true, force: true });
+                await fs.promises.cp(sourceDirectory, cacheDirectory, { recursive: true, verbatimSymlinks: true });
+            }
+            finally {
+                await (0, utilities_1.Exec)('hdiutil', ['detach', mountPoint, '-quiet'], { silent: true, showCommand: true });
+            }
+        }
+        finally {
+            await fs.promises.rm(dmgPath, { force: true });
+        }
+        const extracted = await findClient();
+        if (!extracted) {
+            throw new Error(`Failed to extract Unity.Licensing.Client from Unity Hub ${hubVersion}`);
+        }
+        logging_1.Logger.instance.info(`Using the Unity Licensing Client bundled with Unity Hub ${hubVersion}: ${extracted}`);
+        return extracted;
+    }
+    /**
+     * On macOS the client writes Unity_lic.ulf to /Library/Application Support/Unity. When that folder is missing or not
+     * writable it asks for an administrator password in a dialog, which never returns on a headless runner.
+     * The Unity Hub installer used to create it; without the Hub, it is created here with non-interactive sudo.
+     */
+    static async ensureMacLicenseDirectory() {
+        if (process.platform !== 'darwin') {
+            return;
+        }
+        const directory = '/Library/Application Support/Unity';
+        try {
+            await fs.promises.access(directory, fs.constants.W_OK);
+            return;
+        }
+        catch {
+            // missing or not writable
+        }
+        // owned by the current user rather than world-writable
+        const user = os.userInfo().username;
+        for (const args of [['-n', 'mkdir', '-p', directory], ['-n', 'chown', user, directory], ['-n', 'chmod', '755', directory]]) {
+            const exitCode = await new Promise((resolve) => {
+                const child = (0, child_process_1.spawn)('sudo', args, { stdio: 'ignore' });
+                child.on('error', () => resolve(1));
+                child.on('close', (code) => resolve(code ?? 1));
+            });
+            if (exitCode !== 0) {
+                logging_1.Logger.instance.warn(`Could not prepare ${directory} (sudo ${args.slice(1).join(' ')} exited with code ${exitCode}). Activation may wait for an administrator password.`);
+                return;
+            }
+        }
+    }
+    /**
+     * Gets a folder under ~/.unity-cli/licensing that only the current user can read and write, creating it when needed.
+     * Used instead of the shared temp folder for the patched licensing client and the license it writes.
+     * @param name The folder name.
+     */
+    static async privateDirectory(name) {
+        const root = path.join(os.homedir(), '.unity-cli', 'licensing');
+        await fs.promises.mkdir(root, { recursive: true, mode: 0o700 });
+        if (process.platform !== 'win32') {
+            await fs.promises.chmod(root, 0o700);
+        }
+        return path.join(root, name);
+    }
+    /**
+     * The folder that holds the whole licensing client: the bundle root for a macOS bundle (…/Contents/MacOS/client), otherwise the executable's folder.
+     */
+    static clientRootDirectory(clientPath) {
+        const macOSDirectory = path.dirname(clientPath);
+        if (path.basename(macOSDirectory) === 'MacOS' && path.basename(path.dirname(macOSDirectory)) === 'Contents') {
+            return path.dirname(path.dirname(macOSDirectory));
+        }
+        return macOSDirectory;
+    }
+    /**
+     * Lists the files under a directory that can hold compiled code: executables, libraries and extensionless binaries.
+     */
+    static async listBinaries(directory) {
+        const results = [];
+        for (const entry of await fs.promises.readdir(directory, { withFileTypes: true, recursive: true })) {
+            if (!entry.isFile()) {
+                continue;
+            }
+            const extension = path.extname(entry.name).toLowerCase();
+            // the macOS client is named Unity.Licensing.Client, so its extension reads as ".client"
+            const isClient = entry.name.startsWith('Unity.Licensing.') && !['.md', '.config', '.json', '.plist', '.xml', '.txt'].includes(extension);
+            if (isClient || ['', '.exe', '.dll', '.dylib', '.so'].includes(extension)) {
+                results.push(path.join(entry.parentPath, entry.name));
+            }
+        }
+        return results;
+    }
+    /**
+     * The folders the Unity Hub and the official Unity CLI download Unity.Licensing.Client to.
+     */
+    static externalModulesDirectories() {
+        switch (process.platform) {
+            case 'win32':
+                return [path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'UnityHub', 'external-modules')];
+            case 'darwin':
+                return [path.join(os.homedir(), 'Library', 'Application Support', 'UnityHub', 'external-modules')];
+            default: {
+                const configHome = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
+                return [
+                    path.join(configHome, 'UnityHub', 'external-modules'),
+                    path.join(configHome, 'unityhub', 'external-modules'),
+                ];
+            }
+        }
     }
     getUnityCommonDir() {
         const result = process.env['UNITY_COMMON_DIR'];
@@ -3863,6 +4153,11 @@ class LicensingClient {
         }
         throw new Error('Services config value is not a valid JSON string or base64 encoded JSON string.');
     }
+    /**
+     * Writes the floating license server's services-config.json where Unity's licensing reads it.
+     * @param configSource A path to the configuration file, raw JSON, or base64 encoded JSON.
+     * @returns The path the configuration was written to.
+     */
     async setupServicesConfig(configSource) {
         const servicesConfigPath = this.servicesConfigPath();
         if (fs.existsSync(configSource)) {
@@ -3989,27 +4284,8 @@ class LicensingClient {
     }
     async patchLicenseVersion() {
         if (!this.licenseVersion) {
-            // check if the UNITY_EDITOR_PATH is set. If it is, use it to determine the license version
-            const versionMatch = process.env.UNITY_EDITOR_PATH?.match(/(\d+)\.(\d+)\.(\d+)/);
-            if (versionMatch) {
-                switch (versionMatch[1]) {
-                    case '4': {
-                        this.licenseVersion = '4.x';
-                        break;
-                    }
-                    case '5': {
-                        this.licenseVersion = '5.x';
-                        break;
-                    }
-                    default: {
-                        this.licenseVersion = '6.x'; // default to 6.x for any other
-                        break;
-                    }
-                }
-            }
-            else {
-                this.licenseVersion = '6.x'; // default to 6.x if not set
-            }
+            // use the editor in UNITY_EDITOR_PATH to determine the license version, defaulting to 6.x
+            this.licenseVersion = GetLegacyLicenseVersion() ?? '6.x';
         }
         if (this.licenseVersion !== '6.x') {
             if (this.licenseVersion !== '5.x' && this.licenseVersion !== '4.x') {
@@ -4020,32 +4296,78 @@ class LicensingClient {
         if (!this.licenseClientPath) {
             this.licenseClientPath = await this.init();
         }
-        if (this.licenseVersion === '6.x') {
-            return; // no patching needed
+        if (this.licenseVersion === '6.x' || this.isLicenseClientPatched) {
+            return; // no patching needed, or already done for this instance
         }
-        const clientDirectory = path.dirname(this.licenseClientPath);
-        const patchedDirectory = path.join(os.tmpdir(), `UnityLicensingClient-${this.licenseVersion.replace('.', '_')}`);
-        if (await fs.promises.mkdir(patchedDirectory, { recursive: true }) === undefined) {
-            this.logger.debug('Unity Licensing Client was already patched, reusing');
+        const clientRoot = LicensingClient.clientRootDirectory(this.licenseClientPath);
+        // a private per-user folder rather than the shared temp folder: it holds a client that receives the Unity ID and the license it writes
+        const patchedDirectory = await LicensingClient.privateDirectory(`patched-client-${this.licenseVersion.replace('.', '_')}`);
+        const patchedClientPath = path.join(patchedDirectory, path.relative(clientRoot, this.licenseClientPath));
+        const sourceMarker = path.join(patchedDirectory, '.source-sha256');
+        const sourceHash = await (0, utilities_1.Sha256FileHex)(this.licenseClientPath);
+        const isCurrent = (await fs.promises.readFile(sourceMarker, 'utf-8').catch(() => '')).trim() === sourceHash;
+        if (isCurrent) {
+            this.logger.debug('Unity Licensing Client was already patched from the same client, reusing');
         }
         else {
-            let found = false;
-            for (const fileName of await fs.promises.readdir(clientDirectory)) {
-                if (fileName === 'Unity.Licensing.EntitlementResolver.dll') {
-                    await this.patchBinary(path.join(clientDirectory, fileName), path.join(patchedDirectory, fileName), Buffer.from('6.x', 'utf16le'), Buffer.from(this.licenseVersion, 'utf16le'));
-                    found = true;
+            await fs.promises.rm(patchedDirectory, { recursive: true, force: true });
+            await fs.promises.mkdir(patchedDirectory, { recursive: true, mode: 0o700 });
+            // copy the whole client, then patch whichever binary holds the "6.x" license version:
+            // older clients ship it in Unity.Licensing.EntitlementResolver.dll, the single-file client the Unity CLI downloads embeds it in the executable
+            await fs.promises.cp(clientRoot, patchedDirectory, { recursive: true, verbatimSymlinks: true });
+            const patchedFiles = [];
+            // Windows and Linux builds hold the value as a UTF-16 string; the macOS build only as the
+            // UTF-8 constant k_UnityLicenseVersionCompatibility, so that one is matched with its name
+            const constantName = Buffer.concat([Buffer.from('k_UnityLicenseVersionCompatibility'), Buffer.from([0x06])]);
+            const patterns = [
+                [Buffer.from('6.x', 'utf16le'), Buffer.from(this.licenseVersion, 'utf16le')],
+                [Buffer.concat([constantName, Buffer.from('6.x')]), Buffer.concat([constantName, Buffer.from(this.licenseVersion)])],
+            ];
+            const binaries = await LicensingClient.listBinaries(patchedDirectory);
+            // the UTF-8 constant is only patched when no UTF-16 value exists, which leaves the Windows and Linux patch as it was
+            for (const [searchValue, replaceValue] of patterns) {
+                for (const file of binaries) {
+                    try {
+                        await this.patchBinary(file, file, searchValue, replaceValue);
+                        patchedFiles.push(file);
+                    }
+                    catch (error) {
+                        if (!(error instanceof Error && error.message === 'Could not find the search value')) {
+                            throw error;
+                        }
+                    }
                 }
-                else {
-                    await fs.promises.symlink(path.join(clientDirectory, fileName), path.join(patchedDirectory, fileName));
+                if (patchedFiles.length > 0) {
+                    break;
                 }
             }
-            if (!found) {
-                throw new Error('Could not find Unity.Licensing.EntitlementResolver.dll in the unityhub installation');
+            if (patchedFiles.length === 0) {
+                const searched = (await LicensingClient.listBinaries(patchedDirectory)).map(file => path.relative(patchedDirectory, file));
+                await fs.promises.rm(patchedDirectory, { recursive: true, force: true });
+                throw new Error(`Could not find the 6.x license version in any Unity Licensing Client binary under ${clientRoot}. Searched:\n${searched.map(file => `  > ${file}`).join('\n')}`);
             }
+            this.logger.debug(`Patched the license version in:\n${patchedFiles.map(file => `  > ${file}`).join('\n')}`);
+            await fs.promises.chmod(patchedClientPath, 0o755);
+            if (process.platform === 'darwin') {
+                // patching invalidates the signature, and macOS kills binaries with a broken one
+                const isBundle = fs.existsSync(path.join(patchedDirectory, 'Contents', 'MacOS'));
+                const targets = isBundle ? [patchedDirectory] : patchedFiles;
+                for (const target of targets) {
+                    await new Promise((resolve, reject) => {
+                        const child = (0, child_process_1.spawn)('codesign', ['--force', '--deep', '--sign', '-', target], { stdio: 'ignore' });
+                        child.on('error', reject);
+                        child.on('close', (code) => code === 0 ? resolve() : reject(new Error(`codesign failed with exit code ${code}`)));
+                    });
+                }
+            }
+            // records which client the copy came from, so a newer client is patched again instead of reused
+            await fs.promises.writeFile(sourceMarker, sourceHash, { encoding: 'utf-8', mode: 0o600 });
         }
-        this.licenseClientPath = path.join(patchedDirectory, path.basename(this.licenseClientPath));
+        this.licenseClientPath = patchedClientPath;
+        this.isLicenseClientPatched = true;
         const unityCommonDir = this.getUnityCommonDir();
         const legacyLicenseFile = path.join(unityCommonDir, `Unity_v${this.licenseVersion}.ulf`);
+        this.legacyLicense ??= { linkPath: legacyLicenseFile, commonDirectory: unityCommonDir, patchedDirectory };
         await fs.promises.mkdir(unityCommonDir, { recursive: true });
         try {
             await fs.promises.symlink(path.join(patchedDirectory, 'Unity_lic.ulf'), legacyLicenseFile);
@@ -4068,24 +4390,42 @@ class LicensingClient {
         }
         let output = '';
         let exitCode = 0;
-        this.logger.startGroup(`\x1b[34m${this.licenseClientPath} ${args.join(' ')}\x1b[0m`);
+        let timedOut = false;
+        let killedBy = null;
+        // values that must never reach a log, even outside CI where ::add-mask:: does nothing
+        const sensitiveFlags = ['--username', '--password', '--serial', '--return-floating'];
+        const argSecrets = args.filter((_, i) => i > 0 && sensitiveFlags.includes(args[i - 1]));
+        const secrets = [...this.secrets, ...argSecrets];
+        const redact = (text) => (0, utilities_1.redactSensitiveLiterals)(text, secrets);
+        this.logger.startGroup(`\x1b[34m${this.licenseClientPath} ${redact(args.join(' '))}\x1b[0m`);
+        const logOffset = await this.getClientLogSize();
         await fs.promises.access(this.licenseClientPath, fs.constants.R_OK | fs.constants.X_OK);
         try {
             exitCode = await new Promise((resolve, reject) => {
                 fs.accessSync(this.licenseClientPath, fs.constants.R_OK | fs.constants.X_OK);
+                const startedAt = Date.now();
                 const child = (0, child_process_1.spawn)(this.licenseClientPath, args, {
-                    stdio: ['ignore', 'pipe', 'pipe']
+                    stdio: ['ignore', 'pipe', 'pipe'],
+                    ...(0, process_tracker_1.OwnedSpawnOptions)(),
                 });
+                // the background instance the client can start stays reachable through this record
+                (0, process_tracker_1.TrackOwnedProcess)(child, startedAt);
                 const sigintHandler = () => child.kill('SIGINT');
                 const sigtermHandler = () => child.kill('SIGTERM');
                 process.once('SIGINT', sigintHandler);
                 process.once('SIGTERM', sigtermHandler);
+                // a client that waits on something that never comes must not hold a CI job until it times out
+                const timer = setTimeout(() => {
+                    timedOut = true;
+                    child.kill('SIGKILL');
+                }, LICENSING_CLIENT_TIMEOUT_MS);
                 let hasCleanedUpListeners = false;
                 function removeListeners() {
                     if (hasCleanedUpListeners) {
                         return;
                     }
                     hasCleanedUpListeners = true;
+                    clearTimeout(timer);
                     process.removeListener('SIGINT', sigintHandler);
                     process.removeListener('SIGTERM', sigtermHandler);
                 }
@@ -4099,17 +4439,38 @@ class LicensingClient {
                     removeListeners();
                     reject(error);
                 });
-                child.on('close', (code) => {
+                // the client can start a background instance that inherits its stdout and stderr,
+                // so 'close' may never fire; settle on 'exit' and stop reading the pipes shortly after
+                let settled = false;
+                const settle = (code, signal) => {
+                    if (settled) {
+                        return;
+                    }
+                    settled = true;
                     removeListeners();
-                    resolve(code === null ? 0 : code);
+                    killedBy = signal;
+                    // a client killed by a signal did not finish its work, so it is a failure, not exit code 0
+                    resolve(timedOut ? -1 : code === null ? (signal ? -2 : 0) : code);
+                };
+                child.on('close', settle);
+                child.on('exit', (code, signal) => {
+                    setTimeout(() => {
+                        child.stdout.destroy();
+                        child.stderr.destroy();
+                        settle(code, signal);
+                    }, 1000);
                 });
             });
         }
         finally {
+            if (timedOut) {
+                this.logger.error(`Unity Licensing Client did not finish within ${LICENSING_CLIENT_TIMEOUT_MS / 60000} minutes. Its log: ${LicensingClient.ClientLogPath()}`);
+                await this.printClientLogProblems(logOffset, secrets);
+            }
+            // any client output can carry emails and tokens, so it gets the same sanitizing as the client log
+            const maskedLines = this.maskSerialInOutput(output).split(/\r?\n/).map(line => LicensingClient.sanitizeLogLine(line, secrets));
             if (!silent || exitCode !== 0) {
-                const maskedOutput = this.maskSerialInOutput(output);
-                const splitLines = maskedOutput.split(/\r?\n/);
-                for (const line of splitLines) {
+                for (const line of maskedLines) {
                     if (line === undefined || line.length === 0) {
                         continue;
                     }
@@ -4118,11 +4479,60 @@ class LicensingClient {
             }
             this.logger.endGroup();
             if (exitCode !== 0) {
-                const message = this.getExitCodeMessage(exitCode);
+                let message = timedOut ? 'Timed out' : killedBy ? `Killed by ${killedBy}` : this.getExitCodeMessage(exitCode);
+                // Unity ID throttles sign-ins when many jobs activate with one account at once; naming it lets the
+                // failure be marked for a rerun once those jobs finish
+                if (/maximum same user attempt retry count/i.test(output)) {
+                    message = 'Unity ID sign-in rate limit reached: too many sign-in attempts for this account';
+                }
+                // the client's own reason, such as a seat limit, lets the failure be classified; exit 17 alone does not say
+                const diagnostic = LicensingClientDiagnostic(maskedLines);
+                if (diagnostic) {
+                    message += `\n${diagnostic}`;
+                }
                 throw new Error(`License command failed with exit code ${exitCode}: ${message}`);
             }
         }
         return output;
+    }
+    /**
+     * Redacts the known secrets, email addresses and long token-like strings (JWTs, access and refresh tokens) from a client log line.
+     * The line is split on separator characters and each piece is checked on its own, which stays linear on any input.
+     */
+    static sanitizeLogLine(line, secrets) {
+        return (0, utilities_1.SanitizeLogText)(line, secrets);
+    }
+    /**
+     * Prints the last lines the client logged since `offset`, to show why a command hung.
+     * The log can hold account details and tokens, so every line is sanitized first.
+     */
+    async printClientLogProblems(offset, secrets, maxLines = 40) {
+        try {
+            const content = await fs.promises.readFile(LicensingClient.ClientLogPath());
+            const lines = content.subarray(offset).toString('utf-8').split(/\r?\n/)
+                .filter(line => line.trim().length > 0)
+                .slice(-maxLines)
+                .map(line => LicensingClient.sanitizeLogLine(line, secrets));
+            if (lines.length > 0) {
+                this.logger.info(`Last lines the Unity Licensing Client logged (redacted):\n${lines.join('\n')}`);
+            }
+        }
+        catch (error) {
+            this.logger.debug(`Could not read the Unity Licensing Client log: ${error}`);
+        }
+    }
+    /**
+     * Stops Unity.Licensing.Client instances that this job's unity-cli commands started, directly or through the
+     * official Unity CLI or an editor run. A command line activation can wait on such an instance indefinitely.
+     * Clients other jobs started are left alone, even on a shared self-hosted runner. Only done in CI.
+     */
+    static async StopBackgroundClients() {
+        if (process.env.CI !== 'true') {
+            return;
+        }
+        // matched on the executable's own name, so a process that only mentions it on its command line is left alone
+        const clients = (await (0, process_tracker_1.FindOwnedProcesses)()).filter(proc => (0, process_tracker_1.IsExecutableNamed)(proc, 'Unity.Licensing.Client'));
+        await Promise.all(clients.map(client => (0, utilities_1.KillProcess)(client).catch(() => undefined)));
     }
     maskSerialInOutput(output) {
         return output.replace(/([\w-]+-XXXX)/g, (_, serial) => {
@@ -4237,11 +4647,12 @@ class LicensingClient {
                 const output = await this.exec([`--acquire-floating`], true);
                 const tokenMatch = output.match(/with token:\s*"(?<token>[\w-]+)"/);
                 if (!tokenMatch || !tokenMatch.groups || !tokenMatch.groups['token']) {
-                    throw new Error(`Failed to acquire floating license lease: No token found in output.\n  ${output}`);
+                    throw new Error(`Failed to acquire floating license lease: No token found in output.\n  ${(0, utilities_1.SanitizeLogText)(output)}`);
                 }
                 const token = tokenMatch.groups['token'];
                 this.logger.CI_mask(token);
-                this.logger.info(output);
+                // the token is returned to the caller (and printed with --json); the log never shows it
+                this.logger.info((0, utilities_1.redactSensitiveLiterals)(output, [token]));
                 return token;
             }
             default: { // personal and professional license activation
@@ -4312,6 +4723,20 @@ class LicensingClient {
         }
         return licenses;
     }
+    /**
+     * The machine binding values the licensing client reports for this machine (Legacy.MachineBinding1, 2, ...).
+     * @returns The values, or an empty list when the client cannot report them.
+     */
+    async GetMachineBindings() {
+        try {
+            const context = await this.exec(['--showContext'], true);
+            return [...context.matchAll(/Legacy\.MachineBinding\d+[ \t]+(\S+)/g)].map(match => match[1]);
+        }
+        catch (error) {
+            this.logger.debug(`Failed to read the machine bindings: ${error}`);
+            return [];
+        }
+    }
     async activateLicense(licenseType, username, password, serial = undefined) {
         const args = [
             `--activate-ulf`,
@@ -4327,12 +4752,36 @@ class LicensingClient {
         if (licenseType === LicenseType.personal) {
             args.push(`--include-personal`);
         }
+        // keep redacting the account details in every later command's output, such as --showEntitlements
+        this.secrets.push(username, password, ...(serial ? [serial, serial.slice(0, -4) + 'XXXX'] : []));
         await this.exec(args);
         const activeLicenses = await this.GetActiveEntitlements();
         if (!activeLicenses.includes(licenseType)) {
             throw new Error(`Failed to activate license of type '${licenseType}'`);
         }
+        await this.linkLegacyLicenseFile();
         this.logger.info(`Successfully activated license of type '${licenseType}'`);
+    }
+    /**
+     * Points Unity_v4.x.ulf or Unity_v5.x.ulf at the license the client actually wrote. Clients that ignore
+     * UNITY_COMMON_DIR, such as the macOS one, write Unity_lic.ulf to the regular folder instead of the patched one.
+     */
+    async linkLegacyLicenseFile() {
+        if (!this.legacyLicense) {
+            return;
+        }
+        const { linkPath, commonDirectory, patchedDirectory } = this.legacyLicense;
+        const candidates = [path.join(patchedDirectory, 'Unity_lic.ulf'), path.join(commonDirectory, 'Unity_lic.ulf')];
+        const licensePath = candidates.find(candidate => fs.existsSync(candidate));
+        if (!licensePath) {
+            this.logger.warn(`No Unity_lic.ulf was written to ${candidates.join(' or ')}`);
+            return;
+        }
+        await fs.promises.rm(linkPath, { force: true });
+        await fs.promises.symlink(licensePath, linkPath);
+        // the license version decides whether a 4.x or 5.x editor accepts the file
+        const licenseVersion = (await fs.promises.readFile(licensePath, 'utf-8')).match(/<LicenseVersion Value="([^"]+)"/)?.[1];
+        this.logger.info(`Linked ${linkPath} to ${licensePath} (license version ${licenseVersion ?? 'unknown'})`);
     }
     async returnLicense(licenseType, token) {
         if (licenseType === LicenseType.floating) {
@@ -4359,6 +4808,343 @@ class LicensingClient {
     }
 }
 exports.LicensingClient = LicensingClient;
+/**
+ * Gets the license version a 4.x or 5.x editor in UNITY_EDITOR_PATH reads, or undefined for newer editors.
+ * @param editorPath The editor executable. Defaults to UNITY_EDITOR_PATH.
+ */
+function GetLegacyLicenseVersion(editorPath = process.env.UNITY_EDITOR_PATH) {
+    // anchored per path segment, so the match stays linear on any input
+    for (const segment of (editorPath ?? '').split(/[\\/ ]/)) {
+        const major = /^(\d{1,4})\.\d{1,4}\.\d/.exec(segment)?.[1];
+        if (major === undefined) {
+            continue;
+        }
+        switch (major) {
+            case '4':
+                return '4.x';
+            case '5':
+                return '5.x';
+            default:
+                return undefined;
+        }
+    }
+    return undefined;
+}
+/** How long one official CLI license command may run before it falls back. */
+const UNITY_CLI_LICENSE_TIMEOUT_MS = 3 * 60 * 1000;
+/**
+ * Activates a Unity license through the official Unity CLI first.
+ * Falls back to the Unity Licensing Client with the Unity ID email and password when the CLI fails,
+ * for example a personal license on a headless runner with no browser sign-in.
+ * 4.x and 5.x editors read their own license file, so they always use the Unity Licensing Client.
+ * @param options The activation options.
+ * @returns The floating license token, when one is known.
+ */
+async function ActivateLicense(options) {
+    const logger = logging_1.Logger.instance;
+    const legacyLicenseVersion = GetLegacyLicenseVersion();
+    if (legacyLicenseVersion) {
+        logger.info(`Unity ${legacyLicenseVersion} editors read their own license file, activating with the Unity Licensing Client...`);
+        await LicensingClient.StopBackgroundClients();
+        return await new LicensingClient(legacyLicenseVersion).Activate(options);
+    }
+    const licenseFile = options.licenseFile ?? process.env.UNITY_LICENSE;
+    if (licenseFile && licenseFile.trim().length > 0 &&
+        (options.licenseType === LicenseType.personal || options.licenseType === LicenseType.professional)) {
+        try {
+            if (await activateFromLicenseFile(licenseFile)) {
+                // lets a CI step tell whether it needs to store a fresh license
+                logger.CI_setOutput('license-source', 'license-file');
+                return undefined;
+            }
+        }
+        catch (error) {
+            logger.warn(`The license file could not be used, activating with the account instead.\n${error}`);
+        }
+    }
+    logger.CI_setOutput('license-source', 'account');
+    let cliError;
+    try {
+        const result = await activateWithUnityCli(options);
+        if (result.activated) {
+            await logLicenseBinding();
+            return result.token;
+        }
+        cliError = result.reason;
+    }
+    catch (error) {
+        cliError = error;
+    }
+    logger.warn(`Unity CLI license activation failed, falling back to the Unity Licensing Client.\n${cliError}`);
+    if (options.licenseType !== LicenseType.floating &&
+        !options.username && !process.env.UNITY_USERNAME_BASE64) {
+        throw new Error(`Unity CLI license activation failed, and no Unity ID email and password were given for the fallback.\n${cliError}`);
+    }
+    await LicensingClient.StopBackgroundClients();
+    const token = await new LicensingClient().Activate(options);
+    await logLicenseBinding();
+    return token;
+}
+/**
+ * Logs whether the license file now on disk names this machine's binding, which is what a cached copy is checked
+ * against on the next run. Only a yes or no is logged, never the binding or the file.
+ */
+async function logLicenseBinding() {
+    try {
+        const content = await fs.promises.readFile(GetLicenseFilePath(), 'utf-8');
+        const bindings = await new LicensingClient().GetMachineBindings();
+        if (bindings.length > 0) {
+            logging_1.Logger.instance.info(`The license file is bound to this machine's identity: ${bindings.some(binding => content.includes(binding)) ? 'yes' : 'no'}`);
+        }
+    }
+    catch (error) {
+        logging_1.Logger.instance.info(`Could not compare the license file with this machine's identity: ${error instanceof Error ? error.message : error}`);
+    }
+}
+/**
+ * Whether this is a GitHub-hosted macOS or Linux runner. Those report one machine identity to Unity across every job
+ * and repo, so returning a license there revokes it for all of them. Windows and self-hosted runners have their own.
+ */
+function IsSharedRunnerIdentity() {
+    return process.env.RUNNER_ENVIRONMENT === 'github-hosted' && (process.platform === 'darwin' || process.platform === 'linux');
+}
+/**
+ * Returns a Unity license through the official Unity CLI first, then the Unity Licensing Client.
+ * @param licenseType The type of license to return.
+ * @param token The floating license token from activation. A floating license with a token is returned by the Unity Licensing Client.
+ * @param when `auto` (the default) skips returning a personal license on a shared runner identity. Professional and
+ * floating licenses always return under `auto`: a professional seat that is never returned stays taken.
+ */
+async function ReturnLicense(licenseType, token = undefined, when = 'auto') {
+    try {
+        if (when === 'never') {
+            logging_1.Logger.instance.info('Skipping the license return (--when never).');
+            warnProfessionalSeat(licenseType, 'was not returned');
+        }
+        else if (when === 'auto' && licenseType === LicenseType.personal && IsSharedRunnerIdentity()) {
+            logging_1.Logger.instance.info('Skipping the license return: GitHub-hosted macOS and Linux runners share one machine identity, so a return would revoke the license for every job and repo on it. Use --when always to return anyway.');
+        }
+        else {
+            try {
+                await returnLicense(licenseType, token);
+            }
+            catch (error) {
+                warnProfessionalSeat(licenseType, 'could not be returned');
+                throw error;
+            }
+        }
+    }
+    finally {
+        // returning is the last licensing step of a job, so stop what the licensing calls left running in the background
+        await LicensingClient.StopBackgroundClients();
+        await stopUnityCliHelpers();
+    }
+}
+/** Warns that a professional seat stays taken until it is released by hand. */
+function warnProfessionalSeat(licenseType, outcome) {
+    if (licenseType === LicenseType.professional) {
+        logging_1.Logger.instance.warn(`The professional license ${outcome}, so its seat stays taken. Release it at id.unity.com > My Seats.`);
+    }
+}
+/**
+ * Stops background processes the official Unity CLI left running from its own folder, when this job's unity-cli
+ * commands started them. Only done in CI.
+ */
+async function stopUnityCliHelpers() {
+    const cliPath = process.env.UNITY_CLI_PATH;
+    if (process.env.CI !== 'true' || !cliPath) {
+        return;
+    }
+    const cliDirectory = path.dirname(cliPath);
+    const helpers = (await (0, process_tracker_1.FindOwnedProcesses)())
+        .filter(proc => (0, process_tracker_1.IsPathUnder)(proc.executablePath ?? proc.commandLine.split(' ')[0] ?? '', cliDirectory));
+    await Promise.all(helpers.map(helper => (0, utilities_1.KillProcess)(helper).catch(() => undefined)));
+}
+async function returnLicense(licenseType, token) {
+    const logger = logging_1.Logger.instance;
+    const legacyLicenseVersion = GetLegacyLicenseVersion();
+    if (legacyLicenseVersion || (licenseType === LicenseType.floating && token)) {
+        await LicensingClient.StopBackgroundClients();
+        await new LicensingClient(legacyLicenseVersion).Deactivate(licenseType, token);
+        return;
+    }
+    try {
+        const cli = await unity_cli_1.UnityCli.Get();
+        const { exitCode, envelope } = await cli.RunJson(['license', 'return', '--yes'], { timeoutMs: UNITY_CLI_LICENSE_TIMEOUT_MS });
+        if (exitCode === 0 && envelope?.success !== false && !(await isLicenseActive(cli))) {
+            logger.info(`Successfully returned license of type '${licenseType}'`);
+            return;
+        }
+        logger.warn(`unity license return exited with code ${exitCode}${formatEnvelopeErrors(envelope)}, falling back to the Unity Licensing Client...`);
+    }
+    catch (error) {
+        logger.warn(`Unity CLI license return failed, falling back to the Unity Licensing Client.\n${error}`);
+    }
+    if (licenseType === LicenseType.floating) {
+        throw new Error('The Unity CLI could not return the floating license. Pass the token from activation to return it with the Unity Licensing Client.');
+    }
+    await LicensingClient.StopBackgroundClients();
+    await new LicensingClient().Deactivate(licenseType);
+}
+/**
+ * Prints the license state from the official Unity CLI, then the Unity Licensing Client context.
+ */
+async function PrintLicenseContext() {
+    try {
+        const cli = await unity_cli_1.UnityCli.Get();
+        await cli.Run(['license', 'status'], { stream: true });
+    }
+    catch (error) {
+        logging_1.Logger.instance.warn(`Failed to read the Unity CLI license status: ${error}`);
+    }
+    await new LicensingClient(GetLegacyLicenseVersion()).Context();
+}
+/**
+ * Gets where Unity reads the machine's license file, Unity_lic.ulf.
+ */
+function GetLicenseFilePath() {
+    switch (process.platform) {
+        case 'win32':
+            return path.join(process.env.PROGRAMDATA || 'C:\\ProgramData', 'Unity', 'Unity_lic.ulf');
+        case 'darwin':
+            return path.join('/Library', 'Application Support', 'Unity', 'Unity_lic.ulf');
+        default:
+            return path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'unity3d', 'Unity', 'Unity_lic.ulf');
+    }
+}
+/**
+ * Activates from a cached license file: `unity license activate --file` first, then by placing the file where Unity reads it.
+ * The file's contents are never logged.
+ * @param licenseFile A path to the license file, its raw XML, or base64.
+ * @returns True when a license is active afterwards.
+ */
+async function activateFromLicenseFile(licenseFile) {
+    const logger = logging_1.Logger.instance;
+    const trimmed = licenseFile.trim();
+    let content;
+    if (!trimmed.startsWith('<') && fs.existsSync(trimmed)) {
+        content = await fs.promises.readFile(trimmed, 'utf-8');
+    }
+    else if (trimmed.startsWith('<')) {
+        content = trimmed;
+    }
+    else if (/\.ulf$/i.test(trimmed) || /^([A-Za-z]:[\\/]|[\\/~.])/.test(trimmed)) {
+        // base64 of a license starts with "PD" or "PE", so this is a path to a file that is not there
+        throw new Error(`The license file was not found: ${trimmed}`);
+    }
+    else {
+        content = Buffer.from(trimmed, 'base64').toString('utf-8');
+    }
+    if (!content.includes('<License') || !content.includes('</root>')) {
+        throw new Error('The license file is not a Unity license (Unity_lic.ulf).');
+    }
+    // a license file is bound to the machine it was issued to: it still activates offline on another machine, but the
+    // licensing servers resolve no entitlements for it, and the editor fails later. Runner images change that identity.
+    const bindings = await new LicensingClient().GetMachineBindings();
+    if (bindings.length > 0 && !bindings.some(binding => content.includes(binding))) {
+        logger.warn('The cached license file was issued to a different machine identity, likely before a runner image change. Activating with the account instead.');
+        return false;
+    }
+    logger.info('Activating from the cached license file...');
+    const tempDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'unity-license-'));
+    const tempFile = path.join(tempDirectory, 'Unity_lic.ulf');
+    try {
+        await fs.promises.writeFile(tempFile, content, { encoding: 'utf-8', mode: 0o600 });
+        try {
+            const cli = await unity_cli_1.UnityCli.Get();
+            const { exitCode, envelope } = await cli.RunJson(['license', 'activate', '--file', tempFile], { timeoutMs: UNITY_CLI_LICENSE_TIMEOUT_MS });
+            if (exitCode === 0 && envelope?.success !== false && await isLicenseActive(cli)) {
+                logger.info('Successfully activated from the cached license file with the Unity CLI');
+                return true;
+            }
+            logger.warn(`unity license activate --file exited with code ${exitCode}${formatEnvelopeErrors(envelope)}, placing the license file directly...`);
+        }
+        catch (error) {
+            logger.warn(`Unity CLI activation from the license file failed, placing the license file directly...\n${error}`);
+        }
+        const licensePath = GetLicenseFilePath();
+        await fs.promises.mkdir(path.dirname(licensePath), { recursive: true });
+        await fs.promises.copyFile(tempFile, licensePath);
+        const active = await new LicensingClient().GetActiveEntitlements();
+        if (active.length > 0) {
+            logger.info(`Successfully activated from the cached license file (${active.join(', ')})`);
+            return true;
+        }
+        return false;
+    }
+    finally {
+        await fs.promises.rm(tempDirectory, { recursive: true, force: true });
+    }
+}
+async function activateWithUnityCli(options) {
+    const args = ['license', 'activate'];
+    const redactLiterals = [];
+    switch (options.licenseType) {
+        case LicenseType.personal:
+            args.push('--personal', '--accept-eula');
+            break;
+        case LicenseType.professional:
+            if (!options.serial) {
+                return { activated: false, reason: 'A serial is required to activate a professional license with the Unity CLI.' };
+            }
+            args.push('--serial', options.serial.trim());
+            redactLiterals.push(options.serial.trim());
+            break;
+        case LicenseType.floating:
+            if (!options.servicesConfig) {
+                throw new Error('Services config path is required for floating license activation');
+            }
+            await new LicensingClient().setupServicesConfig(options.servicesConfig);
+            args.push('--floating');
+            break;
+    }
+    const cli = await unity_cli_1.UnityCli.Get();
+    logging_1.Logger.instance.info(`Activating a ${options.licenseType} license with the Unity CLI...`);
+    const { exitCode, envelope } = await cli.RunJson(args, { timeoutMs: UNITY_CLI_LICENSE_TIMEOUT_MS, redactLiterals });
+    if (exitCode !== 0 || envelope?.success === false) {
+        return { activated: false, reason: `unity license activate exited with code ${exitCode}${formatEnvelopeErrors(envelope)}` };
+    }
+    if (!(await isLicenseActive(cli))) {
+        return { activated: false, reason: 'unity license activate succeeded, but unity license status reports no active license' };
+    }
+    const token = findToken(envelope?.data);
+    if (token) {
+        logging_1.Logger.instance.CI_mask(token);
+    }
+    logging_1.Logger.instance.info(`Successfully activated license of type '${options.licenseType}' with the Unity CLI`);
+    return { activated: true, token };
+}
+/**
+ * Reads whether a license is active. Throws when the CLI gives no clear answer (a timeout or an unparseable result),
+ * so callers fall back instead of assuming the license is gone. LICENSE_NOT_ACTIVE exits 4 with active: false.
+ */
+async function isLicenseActive(cli) {
+    const { exitCode, envelope } = await cli.RunJson(['license', 'status'], { timeoutMs: UNITY_CLI_LICENSE_TIMEOUT_MS });
+    const active = envelope?.data?.active;
+    if ((exitCode === 0 || exitCode === 4) && typeof active === 'boolean') {
+        return active;
+    }
+    throw new Error(`unity license status exited with code ${exitCode} without a license state${formatEnvelopeErrors(envelope)}`);
+}
+function findToken(value) {
+    if (!value || typeof value !== 'object') {
+        return undefined;
+    }
+    for (const [key, item] of Object.entries(value)) {
+        if (typeof item === 'string' && /token/i.test(key) && item.length > 0) {
+            return item;
+        }
+        const nested = findToken(item);
+        if (nested) {
+            return nested;
+        }
+    }
+    return undefined;
+}
+function formatEnvelopeErrors(envelope) {
+    const errors = envelope?.errors ?? [];
+    return errors.length > 0 ? `\n${errors.map(e => `  > ${e.code}: ${e.message}`).join('\n')}` : '';
+}
 //# sourceMappingURL=license-client.js.map
 
 /***/ }),
@@ -4406,6 +5192,9 @@ class LocalCliLoggerProvider {
     setOutput(_name, _value) {
         // no-op for local terminal
     }
+    addPath(_directory) {
+        // no-op for local terminal
+    }
     appendStepSummary(_summary) {
         // no-op for local terminal
     }
@@ -4419,10 +5208,43 @@ exports.LocalCliLoggerProvider = LocalCliLoggerProvider;
 /***/ }),
 
 /***/ 4486:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 "use strict";
 
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.Logger = exports.LogLevel = void 0;
 exports.mergeLogEntriesPreferringSeverity = mergeLogEntriesPreferringSeverity;
@@ -4432,7 +5254,9 @@ exports.buildTestResultsTableMarkdown = buildTestResultsTableMarkdown;
 exports.buildUnitTestJobSummaryMarkdown = buildUnitTestJobSummaryMarkdown;
 exports.truncateStringToUtf8ByteLength = truncateStringToUtf8ByteLength;
 exports.stripSummaryNoiseFromLogMessage = stripSummaryNoiseFromLogMessage;
+const path = __importStar(__nccwpck_require__(1017));
 const utp_1 = __nccwpck_require__(6282);
+const utp_benign_1 = __nccwpck_require__(6239);
 const github_actions_ci_1 = __nccwpck_require__(9644);
 const logger_provider_1 = __nccwpck_require__(2416);
 /** Severity order for display: Error first, then Warning, then Info. Undefined treats as Warning. */
@@ -4815,18 +5639,31 @@ function formatDurationMsForSummary(ms) {
     return `${(ms / 1000).toFixed(1)}s`;
 }
 /** Unity/CI noise shown in logs; omit from workflow summary foldouts and counts. */
-const SUMMARY_NOISE_ACCESS_TOKEN = 'Access token is unavailable; failed to update';
+function buildSummaryNoisePatterns() {
+    return utp_benign_1.UTP_BENIGN_SEVERITY_REMAPS.map(({ fragment }) => {
+        const escaped = fragment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        // Multicast lines often include "(err: 10013)." — strip the whole clause.
+        if (fragment.includes('multicast group')) {
+            return new RegExp(`${escaped}(?:\\s*\\(err:\\s*\\d+\\))?\\.?`, 'gi');
+        }
+        return new RegExp(escaped, 'gi');
+    });
+}
+const SUMMARY_NOISE_PATTERNS = buildSummaryNoisePatterns();
 /**
  * Removes known noise phrases from a log message for summary display.
- * Exported for unit tests.
+ * Exported for unit tests. Fragments come from {@link UTP_BENIGN_SEVERITY_REMAPS}.
  */
 function stripSummaryNoiseFromLogMessage(message) {
     const flat = toSingleLineText(message);
     if (!flat)
         return '';
-    const pattern = SUMMARY_NOISE_ACCESS_TOKEN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const out = flat.replace(new RegExp(pattern, 'gi'), ' ').replace(/\s+/g, ' ').trim();
-    return out;
+    let out = flat;
+    for (const pattern of SUMMARY_NOISE_PATTERNS) {
+        pattern.lastIndex = 0;
+        out = out.replace(pattern, ' ');
+    }
+    return out.replace(/\s+/g, ' ').trim();
 }
 function filterNoiseFromSummaryLogEntries(entries) {
     const out = [];
@@ -5093,6 +5930,8 @@ class Logger {
         'username',
         'servicesConfig',
         'serviceaccountkey',
+        // licenseFile can hold the license XML itself
+        'licensefile',
     ];
     /**
      * Scrubs sensitive information from an object for safe logging.
@@ -5138,6 +5977,17 @@ class Logger {
     }
     CI_setOutput(name, value) {
         this._provider.setOutput(name, value);
+    }
+    /**
+     * Prepends a directory to the PATH for this process and, in CI environments that support it, later steps.
+     * @param directory The directory to add.
+     */
+    CI_addPath(directory) {
+        const entries = (process.env.PATH ?? '').split(path.delimiter);
+        if (!entries.includes(directory)) {
+            process.env.PATH = [directory, ...entries].filter(Boolean).join(path.delimiter);
+        }
+        this._provider.addPath(directory);
     }
     static formatDurationMs(ms) {
         if (ms === undefined || !Number.isFinite(ms)) {
@@ -5317,6 +6167,824 @@ exports.Logger = Logger;
 
 /***/ }),
 
+/***/ 6375:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.OwnedSpawnOptions = OwnedSpawnOptions;
+exports.ReadOwnedRoots = ReadOwnedRoots;
+exports.TrackOwnedProcess = TrackOwnedProcess;
+exports.ListProcesses = ListProcesses;
+exports.SelectOwnedProcesses = SelectOwnedProcesses;
+exports.ParseElapsedSeconds = ParseElapsedSeconds;
+exports.FindOwnedProcesses = FindOwnedProcesses;
+exports.IsExecutableNamed = IsExecutableNamed;
+exports.IsPathUnder = IsPathUnder;
+const fs = __importStar(__nccwpck_require__(7147));
+const path = __importStar(__nccwpck_require__(1017));
+const logging_1 = __nccwpck_require__(4486);
+const utilities_1 = __nccwpck_require__(9746);
+const logger = logging_1.Logger.instance;
+/** Options that make a spawned process lead its own process group on macOS and Linux. */
+function OwnedSpawnOptions() {
+    return { detached: process.platform !== 'win32' };
+}
+function stateFilePath() {
+    return path.join((0, utilities_1.GetTempDir)(), 'unity-cli-owned-processes.json');
+}
+/** The processes recorded by this job's earlier and current commands. */
+function ReadOwnedRoots() {
+    try {
+        const roots = JSON.parse(fs.readFileSync(stateFilePath(), 'utf-8'));
+        return Array.isArray(roots)
+            ? roots.filter((root) => Number.isInteger(root?.pid) && Number.isFinite(root?.startedAt))
+            : [];
+    }
+    catch {
+        return [];
+    }
+}
+/**
+ * Records a process this command started. Only done in CI, where cleanup runs.
+ * @param child The spawned process, started with {@link OwnedSpawnOptions}.
+ * @param startedAt When it was spawned, in milliseconds since the epoch.
+ */
+function TrackOwnedProcess(child, startedAt) {
+    if (process.env.CI !== 'true' || !child.pid) {
+        return;
+    }
+    try {
+        const roots = ReadOwnedRoots().filter(root => root.pid !== child.pid);
+        roots.push({ pid: child.pid, startedAt });
+        fs.writeFileSync(stateFilePath(), JSON.stringify(roots), { encoding: 'utf-8', mode: 0o600 });
+    }
+    catch (error) {
+        logger.debug(`Failed to record process ${child.pid}: ${error}`);
+    }
+}
+/** Lists running processes with their group, creation time and command line. */
+async function ListProcesses() {
+    const results = [];
+    try {
+        if (process.platform === 'win32') {
+            const output = await (0, utilities_1.Exec)('powershell', [
+                '-NoProfile',
+                '-Command',
+                'Get-CimInstance Win32_Process | ForEach-Object { $c = if ($_.CreationDate) { ([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds() } else { 0 }; "$($_.ProcessId)`t$($_.ParentProcessId)`t$c`t$($_.Name)`t$($_.ExecutablePath)`t$($_.CommandLine)" }'
+            ], { silent: true, showCommand: false });
+            for (const line of output.split(/\r?\n/)) {
+                const [pid, ppid, created, name, executable, ...commandLine] = line.split('\t');
+                if (pid && ppid && /^\d+$/.test(pid)) {
+                    results.push({
+                        pid: parseInt(pid, 10),
+                        ppid: parseInt(ppid, 10),
+                        createdAt: parseInt(created ?? '0', 10) || 0,
+                        name: name ?? '',
+                        executablePath: executable || undefined,
+                        commandLine: commandLine.join('\t'),
+                    });
+                }
+            }
+        }
+        else {
+            // etime is the elapsed time as [[dd-]hh:]mm:ss, which both macOS and Linux ps report
+            const output = await (0, utilities_1.Exec)('ps', ['-axo', 'pid=,ppid=,pgid=,etime=,args='], { silent: true, showCommand: false });
+            const now = Date.now();
+            for (const line of output.split('\n')) {
+                const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+([\d:-]+)\s+(.*)$/.exec(line);
+                if (match) {
+                    results.push({
+                        pid: parseInt(match[1], 10),
+                        ppid: parseInt(match[2], 10),
+                        pgid: parseInt(match[3], 10),
+                        createdAt: now - ParseElapsedSeconds(match[4]) * 1000,
+                        name: match[5],
+                        commandLine: match[5],
+                    });
+                }
+            }
+        }
+    }
+    catch (error) {
+        logger.debug(`Failed to list processes: ${error}`);
+    }
+    return results.filter(proc => proc.pid !== process.pid);
+}
+/**
+ * The running processes that belong to the given roots: on macOS and Linux every member of their process groups, on
+ * Windows the roots and their descendants created after the root started.
+ * @param roots The processes unity-cli started.
+ * @param processes A process list from {@link ListProcesses}.
+ */
+function SelectOwnedProcesses(roots, processes) {
+    if (roots.length === 0) {
+        return [];
+    }
+    // a dead process's id can be reused by another job, so a member must be no older than the root it belongs to;
+    // ps reports whole seconds, hence the slack
+    const earliest = Math.min(...roots.map(root => root.startedAt)) - 2000;
+    if (process.platform !== 'win32') {
+        const groups = new Map(roots.map(root => [root.pid, root.startedAt - 2000]));
+        return processes.filter(proc => proc.pgid !== undefined && groups.has(proc.pgid) &&
+            (proc.createdAt === undefined || proc.createdAt >= groups.get(proc.pgid)));
+    }
+    const owned = new Map();
+    let frontier = new Set(roots.map(root => root.pid));
+    for (const proc of processes) {
+        if (frontier.has(proc.pid) && (proc.createdAt ?? 0) >= earliest) {
+            owned.set(proc.pid, proc);
+        }
+    }
+    while (frontier.size > 0) {
+        const next = new Set();
+        for (const proc of processes) {
+            if (!owned.has(proc.pid) && frontier.has(proc.ppid) && (proc.createdAt ?? 0) >= earliest) {
+                owned.set(proc.pid, proc);
+                next.add(proc.pid);
+            }
+        }
+        frontier = next;
+    }
+    return [...owned.values()];
+}
+/**
+ * Converts a ps elapsed time, [[dd-]hh:]mm:ss, to seconds.
+ * @param elapsed The etime value.
+ */
+function ParseElapsedSeconds(elapsed) {
+    const [days, clock] = elapsed.includes('-') ? elapsed.split('-', 2) : ['0', elapsed];
+    const parts = clock.split(':').map(part => parseInt(part, 10) || 0);
+    while (parts.length < 3) {
+        parts.unshift(0);
+    }
+    return (parseInt(days, 10) || 0) * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2];
+}
+/** The running processes this job's unity-cli commands started, and their helpers. */
+async function FindOwnedProcesses() {
+    const roots = ReadOwnedRoots();
+    return roots.length === 0 ? [] : SelectOwnedProcesses(roots, await ListProcesses());
+}
+/**
+ * Whether a process's executable is the named one, e.g. Unity.Licensing.Client.
+ * @param proc The process.
+ * @param name The executable file name, without .exe.
+ */
+function IsExecutableNamed(proc, name) {
+    const target = name.toLowerCase();
+    const executable = (proc.executablePath ?? proc.commandLine.split(' ')[0] ?? proc.name).toLowerCase();
+    return path.basename(executable).replace(/\.exe$/, '') === target || proc.name.toLowerCase().replace(/\.exe$/, '') === target;
+}
+/**
+ * Whether a path lies inside a directory, compared on whole path segments.
+ * @param candidate The path to check.
+ * @param directory The directory.
+ */
+function IsPathUnder(candidate, directory) {
+    const normalize = (value) => {
+        const resolved = path.resolve(value);
+        return process.platform === 'win32' || process.platform === 'darwin' ? resolved.toLowerCase() : resolved;
+    };
+    const root = normalize(directory);
+    const target = normalize(candidate);
+    return target === root || target.startsWith(root.endsWith(path.sep) ? root : root + path.sep);
+}
+//# sourceMappingURL=process-tracker.js.map
+
+/***/ }),
+
+/***/ 7992:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.UnityCli = void 0;
+exports.FindAbsolutePath = FindAbsolutePath;
+const fs = __importStar(__nccwpck_require__(7147));
+const os = __importStar(__nccwpck_require__(2037));
+const path = __importStar(__nccwpck_require__(1017));
+const child_process_1 = __nccwpck_require__(2081);
+const logging_1 = __nccwpck_require__(4486);
+const utilities_1 = __nccwpck_require__(9746);
+const process_tracker_1 = __nccwpck_require__(6375);
+const semver_1 = __nccwpck_require__(1383);
+const CDN_BASE = 'https://public-cdn.cloud.unity3d.com/hub/prod/cli/';
+const TOOL_NAME = 'unity-cli';
+const EXE_NAME = process.platform === 'win32' ? 'unity.exe' : 'unity';
+const VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+/**
+ * A thin wrapper over Unity's official CLI (`unity`).
+ * @see https://docs.unity.com/en-us/cli
+ */
+class UnityCli {
+    executable;
+    version;
+    logger = logging_1.Logger.instance;
+    constructor(executable, version) {
+        this.executable = executable;
+        this.version = version;
+    }
+    /**
+     * Returns the official Unity CLI, installing it when it is missing or is not the requested version.
+     * @param version An exact version such as 1.0.0-beta.14, or `latest`. Defaults to UNITY_CLI_VERSION, then `latest`.
+     * Every install exports UNITY_CLI_VERSION, so later steps in the same job reuse the version the first one resolved.
+     */
+    static async Get(version = undefined) {
+        configureEnvironment();
+        const requested = normalizeVersion(version || process.env.UNITY_CLI_VERSION || 'latest');
+        // latest resolves the manifest first, so an outdated CLI is not reused
+        if (requested === 'latest') {
+            return await UnityCli.Install('latest');
+        }
+        const existing = await UnityCli.Find();
+        if (existing && existing.version === requested) {
+            logging_1.Logger.instance.debug(`Using Unity CLI ${existing.version} at ${existing.executable}`);
+            return exportCli(existing);
+        }
+        if (existing) {
+            logging_1.Logger.instance.info(`Found Unity CLI ${existing.version} at ${existing.executable}, but ${requested} was requested`);
+        }
+        return await UnityCli.Install(requested);
+    }
+    /**
+     * Finds an installed official Unity CLI from UNITY_CLI_PATH, the tool cache, the install script's default location, or the PATH.
+     * The PATH comes last, since other programs named unity live there, such as the Unity7 shell on Ubuntu desktops.
+     */
+    static async Find() {
+        const candidates = [];
+        if (process.env.UNITY_CLI_PATH) {
+            candidates.push(process.env.UNITY_CLI_PATH);
+        }
+        candidates.push(...findCachedExecutables());
+        candidates.push(...defaultInstallLocations());
+        for (const dir of (process.env.PATH ?? '').split(path.delimiter)) {
+            if (dir && dir.length > 0) {
+                candidates.push(path.join(dir, EXE_NAME));
+            }
+        }
+        for (const candidate of candidates) {
+            // only ever run a binary named unity(.exe), even when UNITY_CLI_PATH points elsewhere
+            if (path.basename(candidate).toLowerCase() !== EXE_NAME || !isExecutableFile(candidate)) {
+                continue;
+            }
+            try {
+                const version = await getCliVersion(candidate);
+                return new UnityCli(candidate, version);
+            }
+            catch (error) {
+                logging_1.Logger.instance.debug(`Skipping ${candidate}: ${error}`);
+            }
+        }
+        return undefined;
+    }
+    /**
+     * Downloads an exact official Unity CLI release from Unity's CDN, verifies its SHA-256 and caches it.
+     * @param version An exact version such as 1.0.0-beta.14, or `latest`.
+     */
+    static async Install(version = 'latest') {
+        configureEnvironment();
+        const requested = normalizeVersion(version);
+        let manifest;
+        try {
+            manifest = await fetchManifest(requested);
+        }
+        catch (error) {
+            // with no network, the newest CLI already in the tool cache still does for latest
+            const cachedCli = requested === 'latest' ? await findNewestCachedCli() : undefined;
+            if (!cachedCli) {
+                throw error;
+            }
+            logging_1.Logger.instance.warn(`Could not resolve the latest Unity CLI, using the cached ${cachedCli.version}.\n${error}`);
+            return exportCli(cachedCli);
+        }
+        const platformKey = `${process.platform}-${process.arch}`;
+        const binary = manifest.binaries[platformKey];
+        if (!binary) {
+            throw new Error(`Unity CLI ${manifest.version} has no binary for ${platformKey}. Available: ${Object.keys(manifest.binaries).join(', ')}`);
+        }
+        if (!/^[\w.-]+$/.test(binary.filename) || !/^[0-9a-f]{64}$/i.test(binary.sha256)) {
+            throw new Error(`Invalid binary entry for ${platformKey} in the Unity CLI ${manifest.version} manifest`);
+        }
+        const cached = getToolCachePath(manifest.version);
+        const cachedExecutable = path.join(cached, EXE_NAME);
+        if (isExecutableFile(cachedExecutable) && fs.existsSync(`${cached}.complete`)) {
+            const cachedVersion = await getCliVersion(cachedExecutable);
+            if (cachedVersion === manifest.version) {
+                logging_1.Logger.instance.info(`Using cached Unity CLI ${cachedVersion}`);
+                return exportCli(new UnityCli(cachedExecutable, cachedVersion));
+            }
+        }
+        logging_1.Logger.instance.ci(`Installing Unity CLI ${manifest.version}...`);
+        const downloadPath = path.join((0, utilities_1.GetTempDir)(), `${TOOL_NAME}-${Date.now()}`, binary.filename);
+        await (0, utilities_1.DownloadFile)(`${CDN_BASE}${manifest.version}/${binary.filename}`, downloadPath);
+        try {
+            const actualHash = await (0, utilities_1.Sha256FileHex)(downloadPath);
+            if (actualHash.toLowerCase() !== binary.sha256.toLowerCase()) {
+                throw new Error(`SHA-256 mismatch for ${binary.filename}: expected ${binary.sha256}, got ${actualHash}`);
+            }
+            await fs.promises.rm(cached, { recursive: true, force: true });
+            await fs.promises.rm(`${cached}.complete`, { force: true });
+            await fs.promises.mkdir(cached, { recursive: true });
+            await fs.promises.copyFile(downloadPath, cachedExecutable);
+            if (process.platform !== 'win32') {
+                await fs.promises.chmod(cachedExecutable, 0o755);
+            }
+            await fs.promises.writeFile(`${cached}.complete`, '');
+        }
+        finally {
+            await fs.promises.rm(path.dirname(downloadPath), { recursive: true, force: true });
+        }
+        const installedVersion = await getCliVersion(cachedExecutable);
+        if (requested !== 'latest' && installedVersion !== requested) {
+            throw new Error(`Failed to install Unity CLI ${requested}, found ${installedVersion}`);
+        }
+        logging_1.Logger.instance.info(`Installed Unity CLI ${installedVersion} to ${cachedExecutable}`);
+        return exportCli(new UnityCli(cachedExecutable, installedVersion));
+    }
+    /**
+     * Runs the CLI and returns its exit code and output without throwing on a non-zero exit code.
+     * @param args The arguments to pass to `unity`.
+     * @param options Run options.
+     */
+    async Run(args, options = {}) {
+        const redact = (text) => (0, utilities_1.redactSensitiveLiterals)(text, options.redactLiterals);
+        const commandStr = redact(`\x1b[34m${this.executable} ${args.join(' ')}\x1b[0m`);
+        if (options.stream) {
+            this.logger.startGroup(commandStr);
+        }
+        else {
+            this.logger.debug(commandStr);
+        }
+        try {
+            return await new Promise((resolve, reject) => {
+                let stdout = '';
+                let stderr = '';
+                let timedOut = false;
+                const startedAt = Date.now();
+                const child = (0, child_process_1.spawn)(this.executable, args, {
+                    shell: false,
+                    stdio: ['ignore', 'pipe', 'pipe'],
+                    env: process.env,
+                    ...(0, process_tracker_1.OwnedSpawnOptions)(),
+                });
+                // helpers the CLI leaves running, such as its licensing client, stay reachable through this record
+                (0, process_tracker_1.TrackOwnedProcess)(child, startedAt);
+                const timer = options.timeoutMs
+                    ? setTimeout(() => {
+                        timedOut = true;
+                        child.kill('SIGTERM');
+                    }, options.timeoutMs)
+                    : undefined;
+                const onSignal = () => child.kill('SIGTERM');
+                process.once('SIGINT', onSignal);
+                process.once('SIGTERM', onSignal);
+                // a chunk can end mid-line, so each stream keeps its unfinished line until the rest arrives
+                const pending = { stdout: '', stderr: '' };
+                const writeLine = (line) => {
+                    // the CLI prints a plugin hint to stderr on every run
+                    if (line.length > 0 && !line.includes('<claude-code-hint')) {
+                        process.stdout.write(`${redact(line)}\n`);
+                    }
+                };
+                const writeLines = (stream, chunk) => {
+                    if (!options.stream) {
+                        return;
+                    }
+                    const lines = (pending[stream] + chunk).split(/\r?\n/);
+                    pending[stream] = lines.pop() ?? '';
+                    lines.forEach(writeLine);
+                };
+                const flushLines = () => {
+                    if (!options.stream) {
+                        return;
+                    }
+                    writeLine(pending.stdout);
+                    writeLine(pending.stderr);
+                    pending.stdout = pending.stderr = '';
+                };
+                child.stdout.on('data', (data) => {
+                    const chunk = data.toString();
+                    stdout += chunk;
+                    writeLines('stdout', chunk);
+                });
+                child.stderr.on('data', (data) => {
+                    const chunk = data.toString();
+                    stderr += chunk;
+                    writeLines('stderr', chunk);
+                });
+                const cleanup = () => {
+                    if (timer) {
+                        clearTimeout(timer);
+                    }
+                    process.removeListener('SIGINT', onSignal);
+                    process.removeListener('SIGTERM', onSignal);
+                };
+                child.on('error', (error) => {
+                    cleanup();
+                    reject(error);
+                });
+                child.on('close', (code) => {
+                    cleanup();
+                    flushLines();
+                    const exitCode = timedOut ? 14 : (code ?? 1);
+                    this.logger.debug(`unity exited with code ${exitCode}`);
+                    resolve({ exitCode, stdout: redact(stdout), stderr: redact(stderr) });
+                });
+            });
+        }
+        finally {
+            if (options.stream) {
+                this.logger.endGroup();
+            }
+        }
+    }
+    /**
+     * Runs the CLI and throws when it exits with a non-zero exit code.
+     * @param args The arguments to pass to `unity`.
+     * @param options Run options. Output streams to the console unless `stream` is false.
+     */
+    async Exec(args, options = {}) {
+        const result = await this.Run(args, { stream: true, ...options });
+        if (result.exitCode !== 0) {
+            const tail = options.stream === false ? `\n${result.stdout}${stripHint(result.stderr)}` : '';
+            throw new Error(`unity ${(0, utilities_1.redactSensitiveLiterals)(args.join(' '), options.redactLiterals)} failed with exit code ${result.exitCode}${tail}`);
+        }
+        return result.stdout;
+    }
+    /**
+     * Runs the CLI with `--format json` and parses the result envelope from stdout.
+     * @param args The arguments to pass to `unity`.
+     * @param options Run options.
+     * @returns The exit code and the parsed envelope, if stdout held one.
+     */
+    async RunJson(args, options = {}) {
+        const result = await this.Run([...args, '--format', 'json'], { ...options, stream: false });
+        const envelope = parseEnvelope(result.stdout);
+        // JSON results can carry account details and tokens (license activate, status), so the debug copy is sanitized
+        this.logger.debug(`unity ${(0, utilities_1.redactSensitiveLiterals)(args.join(' '), options.redactLiterals)} [${result.exitCode}]:\n${(0, utilities_1.SanitizeLogText)(`${result.stdout}${stripHint(result.stderr)}`, options.redactLiterals)}`);
+        return { exitCode: result.exitCode, envelope, stdout: result.stdout, stderr: result.stderr };
+    }
+    /**
+     * Runs the CLI with `--format json` and returns `data`, throwing when the command fails.
+     * @param args The arguments to pass to `unity`.
+     * @param options Run options.
+     */
+    async ExecJson(args, options = {}) {
+        const { exitCode, envelope, stdout, stderr } = await this.RunJson(args, options);
+        if (exitCode !== 0 || !envelope || envelope.success === false) {
+            const errors = envelope?.errors?.map(e => `${e.code}: ${e.message}`).join('\n') || `${stdout}${stripHint(stderr)}`.trim();
+            throw new Error(`unity ${(0, utilities_1.redactSensitiveLiterals)(args.join(' '), options.redactLiterals)} failed with exit code ${exitCode}\n${errors}`);
+        }
+        return envelope.data;
+    }
+    /** Gets the directory the CLI installs editors to. */
+    async GetInstallPath() {
+        const data = await this.ExecJson(['install-path', '--get']);
+        const installPath = FindAbsolutePath(data);
+        if (!installPath) {
+            throw new Error(`Unable to read the editor install path from: ${JSON.stringify(data)}`);
+        }
+        return installPath;
+    }
+    /**
+     * Sets the directory the CLI installs editors to.
+     * @param installPath The directory to install editors to.
+     */
+    async SetInstallPath(installPath) {
+        await fs.promises.mkdir(installPath, { recursive: true });
+        await this.Exec(['install-path', '--set', installPath]);
+    }
+    /**
+     * Gets the path to the Unity.Licensing.Client the CLI manages, downloading it first if needed.
+     * @returns The licensing client executable, or undefined when the CLI does not report one.
+     */
+    async GetLicensingClientPath() {
+        // license status makes the CLI download the licensing client; license list exits 3 (not signed in) before it
+        // does on a runner with no Hub or Unity ID session, so it cannot be used here
+        const status = await this.RunJson(['license', 'status']);
+        if (status.exitCode !== 0) {
+            this.logger.debug(`unity license status exited with code ${status.exitCode}, looking for the licensing client anyway`);
+        }
+        const { envelope } = await this.RunJson(['doctor']);
+        const components = envelope?.data?.externalComponents;
+        const executableName = process.platform === 'win32' ? 'Unity.Licensing.Client.exe' : 'Unity.Licensing.Client';
+        const candidates = [];
+        collectStrings(components, candidates);
+        for (const candidate of candidates) {
+            if (!path.isAbsolute(candidate) || !candidate.toLowerCase().includes('licensing')) {
+                continue;
+            }
+            const resolved = resolveLicensingClient(candidate, executableName);
+            if (resolved) {
+                return resolved;
+            }
+        }
+        return undefined;
+    }
+}
+exports.UnityCli = UnityCli;
+/**
+ * Finds the first absolute path in a CLI result, preferring well-known keys.
+ * @param value A parsed CLI JSON value.
+ */
+function FindAbsolutePath(value) {
+    const pathKeys = ['path', 'editorPath', 'installPath', 'location', 'directory', 'value'];
+    if (typeof value === 'string') {
+        return path.isAbsolute(value) ? value : undefined;
+    }
+    if (Array.isArray(value)) {
+        for (const item of value) {
+            const found = FindAbsolutePath(item);
+            if (found) {
+                return found;
+            }
+        }
+        return undefined;
+    }
+    if (value && typeof value === 'object') {
+        const record = value;
+        for (const key of pathKeys) {
+            const found = FindAbsolutePath(record[key]);
+            if (found) {
+                return found;
+            }
+        }
+        for (const [key, item] of Object.entries(record)) {
+            if (key === 'errors' || key === 'warnings') {
+                continue;
+            }
+            const found = FindAbsolutePath(item);
+            if (found) {
+                return found;
+            }
+        }
+    }
+    return undefined;
+}
+function parseEnvelope(stdout) {
+    const trimmed = stdout.trim();
+    if (trimmed.length === 0) {
+        return undefined;
+    }
+    try {
+        return JSON.parse(trimmed);
+    }
+    catch {
+        // fall back to the last line that parses, in case anything else was printed first
+        const lines = trimmed.split(/\r?\n/).reverse();
+        for (const line of lines) {
+            try {
+                const parsed = JSON.parse(line);
+                if (parsed && typeof parsed === 'object' && 'success' in parsed) {
+                    return parsed;
+                }
+            }
+            catch {
+                // keep looking
+            }
+        }
+    }
+    return undefined;
+}
+function stripHint(text) {
+    return text.split(/\r?\n/).filter(line => !line.includes('<claude-code-hint')).join('\n');
+}
+function collectStrings(value, results) {
+    if (typeof value === 'string') {
+        results.push(value);
+    }
+    else if (Array.isArray(value)) {
+        value.forEach(item => collectStrings(item, results));
+    }
+    else if (value && typeof value === 'object') {
+        Object.values(value).forEach(item => collectStrings(item, results));
+    }
+}
+function resolveLicensingClient(candidate, executableName) {
+    if (!fs.existsSync(candidate)) {
+        return undefined;
+    }
+    if (fs.statSync(candidate).isFile()) {
+        return path.basename(candidate) === executableName ? candidate : undefined;
+    }
+    const queue = [candidate];
+    // the client sits a few folders down, e.g. licensingClient/<platform>/Unity.Licensing.Client
+    for (let depth = 0; depth < 4 && queue.length > 0; depth++) {
+        const next = [];
+        for (const dir of queue) {
+            const direct = path.join(dir, executableName);
+            if (isExecutableFile(direct)) {
+                return direct;
+            }
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                if (entry.isDirectory()) {
+                    next.push(path.join(dir, entry.name));
+                }
+            }
+        }
+        queue.splice(0, queue.length, ...next);
+    }
+    return undefined;
+}
+async function getCliVersion(cliPath) {
+    const cli = new UnityCli(cliPath, '');
+    const { exitCode, stdout, stderr } = await cli.Run(['--version'], { timeoutMs: 60_000 });
+    if (exitCode !== 0) {
+        throw new Error(`${cliPath} --version failed with exit code ${exitCode}: ${stripHint(stderr).trim()}`);
+    }
+    // the official CLI prints only its version; another program named unity prints more, such as "unity 7.7.0"
+    const lastLine = stdout.split(/\r?\n/).map(line => line.trim()).filter(line => line.length > 0).pop() ?? '';
+    const match = /^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/.exec(lastLine);
+    if (!match || !match[1]) {
+        throw new Error(`Unable to parse Unity CLI version from: ${stdout.trim()}`);
+    }
+    return match[1];
+}
+async function fetchManifest(version) {
+    const urls = version === 'latest'
+        ? [`${CDN_BASE}latest.json`, `${CDN_BASE}latest-beta.json`]
+        : [`${CDN_BASE}${version}/latest.json`];
+    let lastError;
+    for (const url of urls) {
+        try {
+            const manifest = JSON.parse(await (0, utilities_1.HttpsGetText)(url));
+            // the version becomes part of a cache path and a download URL
+            if (typeof manifest.version !== 'string' || !VERSION_PATTERN.test(manifest.version)) {
+                throw new Error(`Invalid version in ${url}: ${JSON.stringify(manifest.version)}`);
+            }
+            if (version !== 'latest' && manifest.version !== version) {
+                throw new Error(`Manifest mismatch: requested ${version} but ${url} reports ${manifest.version}`);
+            }
+            return manifest;
+        }
+        catch (error) {
+            lastError = error;
+            logging_1.Logger.instance.debug(`Failed to read ${url}: ${error}`);
+        }
+    }
+    throw new Error(`Failed to find Unity CLI ${version}: ${lastError}`);
+}
+function normalizeVersion(version) {
+    const trimmed = version.trim();
+    if (trimmed.toLowerCase() === 'latest') {
+        return 'latest';
+    }
+    const normalized = trimmed.replace(/^v/i, '');
+    if (!VERSION_PATTERN.test(normalized)) {
+        throw new Error(`Invalid Unity CLI version: ${version}. Use an exact version such as 1.0.0-beta.14, or latest.`);
+    }
+    return normalized;
+}
+function getToolCacheRoot() {
+    return process.env.RUNNER_TOOL_CACHE || path.join(os.homedir(), '.unity-cli', 'tools');
+}
+/** Same layout as @actions/tool-cache, so actions can find the CLI with tc.find('unity-cli', version). */
+function getToolCachePath(version) {
+    return path.join(getToolCacheRoot(), TOOL_NAME, version, os.arch());
+}
+function findCachedExecutables() {
+    const toolDir = path.join(getToolCacheRoot(), TOOL_NAME);
+    if (!fs.existsSync(toolDir)) {
+        return [];
+    }
+    // newest first by semver, so 1.0.0-beta.14 sorts ahead of 1.0.0-beta.9
+    return fs.readdirSync(toolDir)
+        .filter(version => (0, semver_1.valid)(version) !== null && fs.existsSync(path.join(toolDir, version, `${os.arch()}.complete`)))
+        .sort((a, b) => (0, semver_1.compare)(b, a))
+        .map(version => path.join(toolDir, version, os.arch(), EXE_NAME));
+}
+/** The newest complete CLI in the tool cache that still runs, if any. */
+async function findNewestCachedCli() {
+    for (const candidate of findCachedExecutables()) {
+        if (!isExecutableFile(candidate)) {
+            continue;
+        }
+        try {
+            return new UnityCli(candidate, await getCliVersion(candidate));
+        }
+        catch (error) {
+            logging_1.Logger.instance.debug(`Skipping ${candidate}: ${error}`);
+        }
+    }
+    return undefined;
+}
+function defaultInstallLocations() {
+    if (process.platform === 'win32') {
+        return [path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'Unity', 'bin', EXE_NAME)];
+    }
+    return [
+        path.join(os.homedir(), '.local', 'bin', EXE_NAME),
+        path.join(os.homedir(), '.unity', 'bin', EXE_NAME),
+    ];
+}
+function isExecutableFile(filePath) {
+    try {
+        if (!fs.statSync(filePath).isFile()) {
+            return false;
+        }
+        fs.accessSync(filePath, fs.constants.X_OK);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+/** Keeps the CLI from prompting or updating itself mid-job. */
+function configureEnvironment() {
+    const vars = {
+        UNITY_NON_INTERACTIVE: '1',
+        UNITY_NO_UPDATE_CHECK: '1',
+        UNITY_NO_CONSENT_PROMPT: '1',
+        UNITY_NO_BANNER: '1',
+        UNITY_NO_PAGER: '1',
+    };
+    for (const [name, value] of Object.entries(vars)) {
+        if (!process.env[name]) {
+            process.env[name] = value;
+            logging_1.Logger.instance.CI_setEnvironmentVariable(name, value);
+        }
+    }
+}
+function exportCli(cli) {
+    process.env.UNITY_CLI_PATH = cli.executable;
+    process.env.UNITY_CLI_VERSION = cli.version;
+    logging_1.Logger.instance.CI_setEnvironmentVariable('UNITY_CLI_PATH', cli.executable);
+    logging_1.Logger.instance.CI_setEnvironmentVariable('UNITY_CLI_VERSION', cli.version);
+    logging_1.Logger.instance.CI_addPath(path.dirname(cli.executable));
+    return cli;
+}
+//# sourceMappingURL=unity-cli.js.map
+
+/***/ }),
+
 /***/ 8944:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
@@ -5358,13 +7026,30 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.UnityEditor = void 0;
 const fs = __importStar(__nccwpck_require__(7147));
+const os = __importStar(__nccwpck_require__(2037));
 const path = __importStar(__nccwpck_require__(1017));
 const logging_1 = __nccwpck_require__(4486);
 const unity_version_1 = __nccwpck_require__(3331);
 const child_process_1 = __nccwpck_require__(2081);
 const utilities_1 = __nccwpck_require__(9746);
+const unity_cli_1 = __nccwpck_require__(7992);
+const failure_markers_1 = __nccwpck_require__(8545);
+const process_tracker_1 = __nccwpck_require__(6375);
 const unity_logging_1 = __nccwpck_require__(6753);
+/** Thrown when `unity run` refuses the editor arguments before it starts the editor. */
+class UnityRunRejectedError extends Error {
+}
+/** Thrown when `unity run` refuses to start because another editor still has the project open. */
+class UnityProjectOpenError extends Error {
+    pid;
+    constructor(message, pid) {
+        super(message);
+        this.pid = pid;
+    }
+}
 class UnityEditor {
+    /** Editor flags whose values are never logged. */
+    static SENSITIVE_FLAGS = ['-username', '-password', '-cloudOrganization', '-serial'];
     editorPath;
     editorRootPath;
     version;
@@ -5436,82 +7121,13 @@ class UnityEditor {
         }
     }
     /**
-     * Get the full path to a Unity project template based on the provided template name or regex pattern.
-     * @param template The name or regex pattern of the template to find.
-     * @returns The full path to the matching template file.
-     * @throws If no templates are found, or no matching template is found.
-     */
-    GetTemplatePath(template) {
-        const templates = this.GetAvailableTemplates();
-        if (templates.length === 0) {
-            this.logger.warn(`No Unity templates found for ${this.version.toString()}`);
-            return undefined;
-        }
-        // Build a regex to match the template name, an optional numeric version suffix, and required file extension
-        // Example input: com.unity.template.3d(-cross-platform)?.*
-        // Example match: com.unity.template.3d-cross-platform-1.2.3.tar.gz or com.unity.template.3d-1.2.3.tgz
-        let regex;
-        try {
-            regex = new RegExp(`^${template}(?:-\\d+\\.\\d+\\.\\d+)?(?:\\.tgz|\\.tar\\.gz)$`);
-        }
-        catch (e) {
-            throw new Error(`Invalid template regex: ${template}`);
-        }
-        // Filter files by regex
-        const matches = templates.filter(t => regex.test(path.basename(t)));
-        if (matches.length === 0) {
-            this.logger.warn(`No matching template path found for ${template}`);
-            return undefined;
-        }
-        // Pick the longest match (as in the shell script: sort by length descending)
-        matches.sort((a, b) => b.length - a.length);
-        const templatePath = matches[0];
-        if (!templatePath) {
-            this.logger.warn(`No matching template path found for ${template}`);
-            return undefined;
-        }
-        return path.normalize(templatePath);
-    }
-    /**
-     * Get a list of available Unity project templates.
-     * @returns An array of available template file names.
-     */
-    GetAvailableTemplates() {
-        if (this.version.isLessThan('2019.0.0')) {
-            this.logger.warn(`Unity version ${this.version.toString()} does not support project templates.`);
-            return [];
-        }
-        let templateDir;
-        let editorRoot = path.dirname(this.editorPath);
-        if (process.platform === 'darwin') {
-            templateDir = path.join(path.dirname(editorRoot), 'Resources', 'PackageManager', 'ProjectTemplates');
-        }
-        else {
-            templateDir = path.join(editorRoot, 'Data', 'Resources', 'PackageManager', 'ProjectTemplates');
-        }
-        this.logger.debug(`Looking for templates in: ${templateDir}`);
-        if (!fs.existsSync(templateDir) ||
-            !fs.statSync(templateDir).isDirectory()) {
-            return [];
-        }
-        const templates = [];
-        const entries = fs.readdirSync(templateDir, { withFileTypes: true });
-        for (const entry of entries) {
-            if (entry.isFile() && (entry.name.endsWith('.tgz') || entry.name.endsWith('.tar.gz'))) {
-                templates.push(path.join(templateDir, entry.name));
-            }
-        }
-        this.logger.debug(`Found ${templates.length} templates:\n${templates.map(t => `  - ${t}`).join('\n')}`);
-        return templates;
-    }
-    /**
      * Scrubs sensitive command-line arguments for safe logging.
      * Replaces values for sensitive flags like -username, -password, etc. with [REDACTED].
      * @param args The command-line arguments array.
      * @returns A new array with sensitive values redacted.
      */
     scrubSensitiveArgs(args) {
-        const sensitiveFlags = ['-username', '-password', '-cloudOrganization', '-serial'];
+        const sensitiveFlags = UnityEditor.SENSITIVE_FLAGS;
         const scrubbedArgs = [];
         for (let i = 0; i < args.length; i++) {
             const arg = args[i];
@@ -5532,17 +7148,85 @@ class UnityEditor {
      * @throws Will throw an error if the Unity Editor fails to start or exits with a non-zero code.
      */
     async Run(command) {
+        try {
+            await this.runEditor(command, true);
+        }
+        catch (error) {
+            if (error instanceof UnityProjectOpenError) {
+                // an earlier editor whose launcher went away can still hold the project, so wait for it and launch once more
+                this.logger.warn(`${error.message}\nWaiting for the editor (PID ${error.pid}) to exit before launching again...`);
+                await UnityEditor.WaitForProcessExit(error.pid, UnityEditor.PROJECT_OPEN_TIMEOUT_MS);
+                await this.runEditor(command, true);
+                return;
+            }
+            if (!(error instanceof UnityRunRejectedError)) {
+                throw error;
+            }
+            // unity run refused the arguments before it started the editor, so launching directly runs it once
+            this.logger.warn(`${error.message}\nLaunching the editor directly instead.`);
+            await this.runEditor(command, false);
+        }
+    }
+    /** How long to wait for another editor to release the project before launching again. */
+    static PROJECT_OPEN_TIMEOUT_MS = 10 * 60 * 1000;
+    /**
+     * Waits for a process to exit.
+     * @param pid The process id.
+     * @param timeoutMs The longest to wait; past it, the wait ends without an error.
+     */
+    static async WaitForProcessExit(pid, timeoutMs) {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+            try {
+                process.kill(pid, 0);
+            }
+            catch (error) {
+                // EPERM means the process exists but belongs to another user
+                if (error?.code !== 'EPERM') {
+                    return;
+                }
+            }
+            await (0, utilities_1.Delay)(1000);
+        }
+        logging_1.Logger.instance.warn(`Process ${pid} was still running after ${timeoutMs / 1000} seconds`);
+    }
+    async runEditor(command, allowUnityRun) {
         let isCancelled = false;
         let exitCode = undefined;
         let procInfo = null;
         let logTail = null;
         let unityProcess;
+        let unityRunOutput = undefined;
+        let editorLogPath = undefined;
+        const editorRootPath = this.editorRootPath;
+        let runStartedAt = 0;
+        let runPaths = [];
+        // the helpers the editor starts (shader compiler, bee_backend, licensing client) outlive it as orphans, so the
+        // sweep looks for this run's own process group (macOS, Linux) or descendants (Windows), never the whole machine:
+        // on a shared self-hosted runner another job's editor may run from the same install
         async function tryKillEditorProcesses() {
             try {
-                if (procInfo) {
-                    await (0, utilities_1.KillProcess)(procInfo);
-                    await (0, utilities_1.KillChildProcesses)(procInfo);
+                if (!procInfo) {
+                    return;
                 }
+                const root = { pid: procInfo.pid, startedAt: runStartedAt };
+                const processes = await (0, process_tracker_1.ListProcesses)();
+                const owned = new Map((0, process_tracker_1.SelectOwnedProcesses)([root], processes).map(proc => [proc.pid, proc]));
+                if (process.platform === 'win32') {
+                    // a helper whose parent already exited can no longer be traced to the run, so on Windows an
+                    // editor-folder process started during this run that names this run's project or log counts too
+                    for (const proc of processes) {
+                        if ((proc.createdAt ?? 0) >= runStartedAt - 2000 &&
+                            proc.executablePath && (0, process_tracker_1.IsPathUnder)(proc.executablePath, editorRootPath) &&
+                            runPaths.some(runPath => proc.commandLine.toLowerCase().includes(runPath.toLowerCase()))) {
+                            owned.set(proc.pid, proc);
+                        }
+                    }
+                }
+                // the licensing client is left alone: it may still be saving the license it just updated, and killing it
+                // then loses the license for the next run; return-license stops it at the end of the job instead
+                const leftovers = [...owned.values()].filter(proc => !(0, process_tracker_1.IsExecutableNamed)(proc, 'Unity.Licensing.Client'));
+                await Promise.all(leftovers.map(proc => (0, utilities_1.KillProcess)(proc).catch(() => undefined)));
             }
             catch (error) {
                 logging_1.Logger.instance.error(`Failed to kill Unity process: ${error}`);
@@ -5590,7 +7274,11 @@ class UnityEditor {
                 }
             }
             const logPath = (0, utilities_1.GetArgumentValueAsString)('-logFile', command.args);
-            logTail = (0, unity_logging_1.TailLogFile)(logPath, command.projectPath);
+            editorLogPath = logPath;
+            // values of sensitive flags are masked in CI and redacted from everything printed from the Editor log
+            const sensitiveValues = command.args.filter((_, i) => i > 0 && UnityEditor.SENSITIVE_FLAGS.includes(command.args[i - 1]));
+            sensitiveValues.forEach(value => this.logger.maskCredential(value));
+            logTail = (0, unity_logging_1.TailLogFile)(logPath, command.projectPath, sensitiveValues);
             // Scrub sensitive arguments before logging
             const scrubbedArgs = this.scrubSensitiveArgs(command.args);
             const commandStr = `\x1b[34m${this.editorPath} ${scrubbedArgs.join(' ')}\x1b[0m`;
@@ -5603,14 +7291,31 @@ class UnityEditor {
                 : undefined;
             const baseEditorEnv = {
                 ...process.env,
-                UNITY_THISISABUILDMACHINE: '1',
                 DISABLE_EMBEDDED_BUILD_PIPELINE_PLUGIN_LOGGING: '1',
                 ...(linuxEnvOverrides ?? {})
             };
-            if (process.platform === 'linux' &&
+            const unityCli = allowUnityRun ? await this.getUnityCliForRun(command) : undefined;
+            runPaths = [logPath, ...(command.projectPath ? [command.projectPath] : [])];
+            runStartedAt = Date.now();
+            if (unityCli) {
+                const runArgs = UnityEditor.GetUnityRunArgs(this.editorPath, command.projectPath, logPath, command.args);
+                this.logger.debug(`Launching through the Unity CLI: ${unityCli.executable} ${this.scrubSensitiveArgs(runArgs).join(' ')}`);
+                unityRunOutput = '';
+                const child = (0, child_process_1.spawn)(unityCli.executable, runArgs, {
+                    stdio: ['ignore', 'pipe', 'pipe'],
+                    ...(0, process_tracker_1.OwnedSpawnOptions)(),
+                    env: baseEditorEnv
+                });
+                const collect = (data) => { unityRunOutput += data.toString(); };
+                child.stdout.on('data', collect);
+                child.stderr.on('data', collect);
+                unityProcess = child;
+            }
+            else if (process.platform === 'linux' &&
                 !command.args.includes('-nographics')) {
                 unityProcess = (0, child_process_1.spawn)('xvfb-run', [this.editorPath, ...command.args], {
                     stdio: ['ignore', 'ignore', 'ignore'],
+                    ...(0, process_tracker_1.OwnedSpawnOptions)(),
                     env: {
                         ...baseEditorEnv,
                         DISPLAY: baseEditorEnv.DISPLAY || ':99'
@@ -5622,12 +7327,14 @@ class UnityEditor {
                 this.version.architecture === 'X86_64') { // Force the Unity Editor to run under Rosetta 2 on Apple Silicon Macs if the editor is x86_64
                 unityProcess = (0, child_process_1.spawn)('arch', ['-x86_64', this.editorPath, ...command.args], {
                     stdio: ['ignore', 'ignore', 'ignore'],
+                    ...(0, process_tracker_1.OwnedSpawnOptions)(),
                     env: baseEditorEnv
                 });
             }
             else {
                 unityProcess = (0, child_process_1.spawn)(this.editorPath, command.args, {
                     stdio: ['ignore', 'ignore', 'ignore'],
+                    ...(0, process_tracker_1.OwnedSpawnOptions)(),
                     env: baseEditorEnv
                 });
             }
@@ -5637,11 +7344,29 @@ class UnityEditor {
             process.once('SIGINT', onCancel);
             process.once('SIGTERM', onCancel);
             procInfo = { pid: unityProcess.pid, ppid: process.pid, name: this.editorPath };
+            // the licensing client the editor starts is left running after the run; recording the editor lets
+            // return-license find and stop it at the end of the job
+            (0, process_tracker_1.TrackOwnedProcess)(unityProcess, runStartedAt);
             this.logger.debug(`Unity process started with pid: ${procInfo.pid}`);
             exitCode = await new Promise((resolve, reject) => {
-                unityProcess.on('close', (code) => {
+                // the editor can start a licensing client that outlives it and inherits unity run's piped
+                // stdout and stderr, so 'close' may never fire; settle on 'exit' and stop reading the pipes shortly after
+                let settled = false;
+                const settle = (code) => {
+                    if (settled) {
+                        return;
+                    }
+                    settled = true;
                     logTail?.stopLogTail();
                     resolve(code === null ? 1 : code);
+                };
+                unityProcess.on('close', settle);
+                unityProcess.on('exit', (code) => {
+                    setTimeout(() => {
+                        unityProcess.stdout?.destroy();
+                        unityProcess.stderr?.destroy();
+                        settle(code);
+                    }, 1000);
                 });
                 unityProcess.on('error', (error) => {
                     this.logger.error(`Unity process error: ${error}`);
@@ -5665,14 +7390,130 @@ class UnityEditor {
             this.logger.endGroup();
             if (!isCancelled) {
                 await tryKillEditorProcesses();
+                if (exitCode !== undefined && exitCode !== 0 && unityRunOutput) {
+                    // unity run can echo arguments back, so values of sensitive flags are redacted the same way as the logged command
+                    const sensitiveValues = command.args.filter((_, i) => i > 0 && UnityEditor.SENSITIVE_FLAGS.includes(command.args[i - 1]));
+                    const output = (0, utilities_1.redactSensitiveLiterals)(unityRunOutput, sensitiveValues)
+                        .split(/\r?\n/).filter(line => line.length > 0 && !line.includes('<claude-code-hint')).join('\n');
+                    if (output.includes('conflicts with a reserved Unity flag')) {
+                        throw new UnityRunRejectedError(`unity run rejected the editor arguments:\n${output}`);
+                    }
+                    const projectOpen = /already open in a running Editor \(PID (\d+)\)/.exec(output);
+                    if (projectOpen) {
+                        throw new UnityProjectOpenError(`unity run did not start the editor:\n${output}`, parseInt(projectOpen[1], 10));
+                    }
+                    if (output.length > 0) {
+                        this.logger.info(`unity run output:\n${output}`);
+                    }
+                }
+                if (exitCode !== undefined && exitCode !== 0) {
+                    await this.printFailureRecap(logTail, editorLogPath);
+                }
                 if (exitCode === undefined) {
                     throw Error('Failed to start Unity!');
                 }
                 else if (exitCode !== 0) {
-                    throw Error(`Unity failed with exit code ${exitCode}`);
+                    // a run that stopped because no license seat was free names it, so the failure is marked retryable
+                    const licenseLine = (0, failure_markers_1.FindLicenseExhaustedLine)(logTail?.errorLines ?? []);
+                    throw Error(`Unity failed with exit code ${exitCode}${licenseLine ? `: ${licenseLine}` : ''}`);
                 }
             }
+            else {
+                // a cancelled run did not finish, so it must not end the command with exit code 0
+                throw Error('The Unity run was cancelled');
+            }
         }
+    }
+    /**
+     * After a failed run, lists the error lines from the Editor log outside the collapsed log group, so the cause sits
+     * next to "Unity failed with exit code N". Stack frames are left out and the list is capped; with no error line,
+     * the log's last lines are printed instead. Annotations are not affected.
+     */
+    async printFailureRecap(logTail, logPath) {
+        const maxLines = 100;
+        const errorLines = logTail?.errorLines ?? [];
+        if (errorLines.length > 0) {
+            const total = logTail.errorLineCount();
+            const shown = errorLines.slice(0, maxLines);
+            const more = total - shown.length;
+            this.logger.info(`Unity reported ${total} error line${total === 1 ? '' : 's'}:\n${shown.map(line => `  ${line}`).join('\n')}` +
+                (more > 0 ? `\n  ... ${more} more in ${logPath ?? 'the Editor log'}` : ''));
+            return;
+        }
+        if (!logPath) {
+            return;
+        }
+        try {
+            const lines = (await fs.promises.readFile(logPath, 'utf-8')).split(/\r?\n/).filter(line => line.trim().length > 0);
+            const tail = lines.slice(-20);
+            if (tail.length > 0) {
+                this.logger.info(`No error lines found; the last ${tail.length} lines of ${logPath}:\n${tail.map(line => `  ${line}`).join('\n')}`);
+            }
+        }
+        catch (error) {
+            this.logger.debug(`Could not read ${logPath}: ${error}`);
+        }
+    }
+    /**
+     * Decides whether a run goes through the official CLI's `unity run`.
+     * It needs a project and a -quit argument, and is skipped for editors and hosts it is not verified with:
+     * editors older than 2019.1, Linux runs that need xvfb, and x86_64 editors under Rosetta.
+     * Set UNITY_CLI_DIRECT_LAUNCH=true to always launch the editor directly.
+     */
+    async getUnityCliForRun(command) {
+        const directLaunch = process.env.UNITY_CLI_DIRECT_LAUNCH?.trim().toLowerCase();
+        // unity run always quits the editor, so commands that manage their own shutdown launch directly.
+        // Android builds start a Gradle daemon that inherits the editor's output, and unity run waits on that
+        // output until the daemon dies, so it never returns; those launch directly too
+        const buildTarget = command.args.indexOf('-buildTarget');
+        const isAndroidBuild = buildTarget >= 0 && command.args[buildTarget + 1]?.toLowerCase() === 'android';
+        if (!command.projectPath ||
+            !command.args.includes('-quit') ||
+            isAndroidBuild ||
+            directLaunch === 'true' || directLaunch === '1' ||
+            this.version.isLessThan('2019.1.0') ||
+            (process.platform === 'linux' && !command.args.includes('-nographics')) ||
+            (process.platform === 'darwin' && process.arch === 'arm64' && this.version.architecture === 'X86_64')) {
+            return undefined;
+        }
+        try {
+            return await unity_cli_1.UnityCli.Find();
+        }
+        catch (error) {
+            this.logger.debug(`Launching the editor directly, the Unity CLI was not found: ${error}`);
+            return undefined;
+        }
+    }
+    /**
+     * Builds the `unity run` arguments for an editor command.
+     * `unity run` adds -batchmode, -quit, -projectPath and -logFile itself and rejects them after `--`, so those are not forwarded.
+     * @param editorPath The editor executable.
+     * @param projectPath The Unity project.
+     * @param logPath The editor log file, which unity-cli tails itself.
+     * @param args The editor arguments.
+     */
+    static GetUnityRunArgs(editorPath, projectPath, logPath, args) {
+        const forwarded = [];
+        for (let i = 0; i < args.length; i++) {
+            const arg = args[i];
+            if (arg === '-projectPath' || arg === '-logFile') {
+                i++;
+                continue;
+            }
+            if (arg === '-batchmode' || arg === '-quit') {
+                continue;
+            }
+            forwarded.push(arg);
+        }
+        return [
+            'run', projectPath,
+            // on macOS unity run wants the .app bundle, not the executable inside it
+            '--editor-path', editorPath.replace(/(\.app)[\\/]Contents[\\/]MacOS[\\/][^\\/]+$/, '$1'),
+            '--log-file', logPath,
+            '--no-tail',
+            '--',
+            ...forwarded
+        ];
     }
     /**
      * Get or create the Logs directory within the Unity project or current working directory.
@@ -5703,33 +7544,66 @@ class UnityEditor {
         const timestamp = new Date().toISOString().replace(/[-:]/g, ``).replace(/\..+/, ``);
         return path.join(logsDir, `${prefix ? prefix + '-' : ''}Unity-${timestamp}.log`);
     }
+    /**
+     * Resolves a writable Pulse/XDG runtime directory. CI runners often lack systemd-logind's `/run/user/$UID`
+     * (Pulse then fails with "Failed to create secure directory (.../pulse)").
+     */
+    async resolveLinuxXdgRuntimeDir() {
+        const fromEnv = process.env.XDG_RUNTIME_DIR?.trim();
+        if (fromEnv && fromEnv.length > 0) {
+            try {
+                await fs.promises.mkdir(fromEnv, { recursive: true, mode: 0o700 });
+            }
+            catch (error) {
+                this.logger.debug(`Could not mkdir XDG_RUNTIME_DIR (${fromEnv}): ${error}`);
+            }
+            try {
+                await fs.promises.access(fromEnv, fs.constants.W_OK);
+                return fromEnv;
+            }
+            catch {
+                this.logger.debug(`XDG_RUNTIME_DIR from environment is not usable (${fromEnv}); falling back like unset.`);
+            }
+        }
+        const uid = typeof process.getuid === 'function' ? process.getuid() : 1000;
+        const systemdUser = `/run/user/${uid}`;
+        try {
+            await fs.promises.access(systemdUser, fs.constants.W_OK);
+            return systemdUser;
+        }
+        catch {
+            this.logger.debug(`Using tmp XDG_RUNTIME_DIR (not using ${systemdUser}: missing or not writable).`);
+        }
+        const fallback = path.join(os.tmpdir(), `unity-cli-xdg-runtime-${uid}`);
+        await fs.promises.mkdir(fallback, { recursive: true, mode: 0o700 });
+        return fallback;
+    }
     async prepareLinuxAudioEnvironment() {
         if (process.platform !== 'linux') {
             return {};
         }
+        const runtimeDir = await this.resolveLinuxXdgRuntimeDir();
         const envOverrides = {
             SDL_AUDIODRIVER: process.env.SDL_AUDIODRIVER || 'dummy',
             AUDIODRIVER: process.env.AUDIODRIVER || 'dummy',
-            AUDIODEV: process.env.AUDIODEV || 'null',
-            ALSA_CARD: process.env.ALSA_CARD || 'Loopback',
-            PULSE_SINK: process.env.PULSE_SINK || 'unity_dummy'
+            AUDIODEV: process.env.AUDIODEV?.trim() || 'null',
+            PULSE_SINK: process.env.PULSE_SINK || 'unity_dummy',
+            XDG_RUNTIME_DIR: runtimeDir,
         };
-        const defaultRuntimeDir = `/run/user/${typeof process.getuid === 'function' ? process.getuid() : 1000}`;
-        const runtimeDir = process.env.XDG_RUNTIME_DIR || defaultRuntimeDir;
-        envOverrides.XDG_RUNTIME_DIR = runtimeDir;
-        try {
-            await fs.promises.mkdir(runtimeDir, { recursive: true, mode: 0o700 });
+        const alsaCard = process.env.ALSA_CARD?.trim();
+        if (alsaCard && alsaCard.length > 0) {
+            envOverrides.ALSA_CARD = alsaCard;
         }
-        catch (error) {
-            this.logger.debug(`Failed to ensure XDG_RUNTIME_DIR (${runtimeDir}): ${error}`);
-        }
-        await this.tryExec('bash', ['-c', 'pulseaudio --check 2>/dev/null || pulseaudio --start --exit-idle-time=-1 || true']);
-        await this.tryExec('bash', ['-c', 'command -v pactl >/dev/null 2>&1 && { pactl list short sinks 2>/dev/null | grep -q unity_dummy || pactl load-module module-null-sink sink_name=unity_dummy sink_properties=device.description=UnityCI >/tmp/unity-null-sink.id; } || true']);
+        await this.tryExec('bash', ['-c', 'pulseaudio --check 2>/dev/null || pulseaudio --start --exit-idle-time=-1 || true'], envOverrides);
+        await this.tryExec('bash', [
+            '-c',
+            'command -v pactl >/dev/null 2>&1 && { pactl list short sinks 2>/dev/null | grep -q unity_dummy || pactl load-module module-null-sink sink_name=unity_dummy sink_properties=device.description=UnityCI >/tmp/unity-null-sink.id; } || true',
+        ], envOverrides);
         return envOverrides;
     }
-    async tryExec(command, args) {
+    async tryExec(command, args, env) {
         try {
-            await (0, utilities_1.Exec)(command, args, { silent: true, showCommand: false });
+            await (0, utilities_1.Exec)(command, args, { silent: true, showCommand: false, env });
         }
         catch (error) {
             this.logger.debug(`Skipped helper command "${command} ${args.join(' ')}": ${error}`);
@@ -5772,43 +7646,13 @@ class UnityEditor {
                 throw new Error(`Unsupported platform: ${process.platform}`);
         }
     }
-    /**
-     * Uninstall the Unity Editor.
-     */
-    async Uninstall() {
-        switch (process.platform) {
-            case 'darwin':
-            case 'linux':
-                await (0, utilities_1.Exec)('sudo', [
-                    'rm', '-rf', this.editorRootPath
-                ], { silent: true, showCommand: true });
-                break;
-            case 'win32':
-                const editorDir = path.dirname(this.editorPath);
-                const uninstallPath = path.join(editorDir, 'Uninstall.exe');
-                await fs.promises.access(uninstallPath, fs.constants.R_OK | fs.constants.X_OK);
-                await (0, utilities_1.Exec)('powershell', [
-                    '-NoProfile',
-                    '-Command',
-                    `Start-Process -FilePath "${uninstallPath}" -ArgumentList "/S" -Wait`
-                ], { silent: true, showCommand: true });
-                // delete the editor root directory if it still exists
-                await (0, utilities_1.DeleteDirectory)(editorDir);
-                if (this.version.isLegacy()) {
-                    // delete the MonoDevelop that is a sibling of the Unity editor directory
-                    const monoDevelopDir = path.join(path.dirname(editorDir), 'MonoDevelop');
-                    await (0, utilities_1.DeleteDirectory)(monoDevelopDir);
-                }
-                break;
-        }
-    }
 }
 exports.UnityEditor = UnityEditor;
 //# sourceMappingURL=unity-editor.js.map
 
 /***/ }),
 
-/***/ 1723:
+/***/ 9874:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 "use strict";
@@ -5847,777 +7691,707 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.UnityHub = void 0;
+exports.UnityInstaller = void 0;
+exports.DefaultSecurityAlertPolicy = DefaultSecurityAlertPolicy;
+exports.resolveEditorExecutable = resolveEditorExecutable;
+exports.moveMacInstalledItem = moveMacInstalledItem;
+exports.getExecutableArchitectures = getExecutableArchitectures;
 const fs = __importStar(__nccwpck_require__(7147));
 const os = __importStar(__nccwpck_require__(2037));
 const path = __importStar(__nccwpck_require__(1017));
-const yaml = __importStar(__nccwpck_require__(4083));
-const asar = __importStar(__nccwpck_require__(1850));
+const crypto_1 = __nccwpck_require__(6113);
 const child_process_1 = __nccwpck_require__(2081);
 const logging_1 = __nccwpck_require__(4486);
 const unity_editor_1 = __nccwpck_require__(8944);
+const unity_security_1 = __nccwpck_require__(2954);
 const unity_version_1 = __nccwpck_require__(3331);
-const semver_1 = __nccwpck_require__(1383);
+const unity_cli_1 = __nccwpck_require__(7992);
+const process_tracker_1 = __nccwpck_require__(6375);
 const utilities_1 = __nccwpck_require__(9746);
 const unity_releases_api_1 = __nccwpck_require__(7278);
-/** First Unity Hub line with native Windows ARM64 installers on the public CDN. */
-const MIN_NATIVE_WINDOWS_ARM64_HUB_VERSION = (0, semver_1.coerce)('3.17.0');
-class UnityHub {
-    /** The path to the Unity Hub executable. */
-    executable;
-    /** The root directory of the Unity Hub installation. */
-    rootDirectory;
-    /** The file extension for the Unity editor executable. */
-    editorFileExtension;
-    logger = logging_1.Logger.instance;
-    constructor() {
-        switch (process.platform) {
-            case 'win32': {
-                const hubPath = process.env.UNITY_HUB_PATH ?? undefined;
-                if (hubPath !== undefined && hubPath.length > 0) {
-                    this.executable = hubPath;
-                }
-                else {
-                    const pf64 = path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Unity Hub', 'Unity Hub.exe');
-                    const pfx86 = path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Unity Hub', 'Unity Hub.exe');
-                    // Windows ARM64 images install Hub under WOW64; x64 prefers 64-bit path when present.
-                    if (process.arch === 'arm64') {
-                        this.executable = pfx86;
-                    }
-                    else {
-                        this.executable = fs.existsSync(pf64) ? pf64 : fs.existsSync(pfx86) ? pfx86 : pf64;
-                    }
-                }
-                this.rootDirectory = path.join(this.executable, '../');
-                this.editorFileExtension = '\\Editor\\Unity.exe';
-                break;
-            }
-            case 'darwin':
-                this.executable = process.env.UNITY_HUB_PATH || '/Applications/Unity Hub.app/Contents/MacOS/Unity Hub';
-                this.rootDirectory = path.join(this.executable, '../../../');
-                this.editorFileExtension = '/Unity.app/Contents/MacOS/Unity';
-                break;
-            case 'linux':
-                this.executable = process.env.UNITY_HUB_PATH || '/opt/unityhub/unityhub';
-                this.rootDirectory = path.join(this.executable, '../');
-                this.editorFileExtension = '/Editor/Unity';
-                break;
-            default:
-                throw new Error(`Unsupported platform: ${process.platform}`);
-        }
-    }
-    /**
-     * Executes the Unity Hub command with the specified arguments.
-     * @param args Arguments to pass to the Unity Hub executable.
-     * @param silent If true, suppresses output logging.
-     * @returns The output from the command.
-     */
-    async Exec(args, options = { silent: this.logger.logLevel > logging_1.LogLevel.CI, showCommand: this.logger.logLevel <= logging_1.LogLevel.CI }) {
-        let output = '';
-        let exitCode = 0;
-        const filteredArgs = args.filter(arg => arg !== '--headless' && arg !== '--');
-        const executable = process.platform === 'linux' ? 'unity-hub' : this.executable;
-        const execArgs = process.platform === 'linux' ? ['--headless', ...filteredArgs] : ['--', '--headless', ...filteredArgs];
-        if (options.showCommand) {
-            this.logger.startGroup(`\x1b[34m${executable} ${execArgs.join(' ')}\x1b[0m`);
-        }
-        if (this.executable.includes(path.sep)) {
-            fs.accessSync(this.executable, fs.constants.R_OK | fs.constants.X_OK);
-        }
-        const ignoredLines = [
-            'This error originated either by throwing inside of an async function without a catch block',
-            'Unexpected error attempting to determine if executable file exists',
-            'dri3 extension not supported',
-            'Failed to connect to the bus:',
-            'Error: No modules found to install.',
-            'Checking for beta autoupdate feature for deb/rpm distributions',
-            'Found package-type: deb',
-            'XPC error for connection com.apple.backupd.sandbox.xpc: Connection invalid',
-            'Failed to execute the command due the following, please see \'-- --headless help\' for assistance.',
-            'Unable to move the cache: Access is denied.',
-            'Entities without keys will be embedded directly on the parent entity. If this is intentional, create a `keys` config for `UnityReleaseLabel` that always returns null.',
-            'https://bit.ly/2XbVrpR#15',
-            'Interaction is not allowed with the Security Server." (-25308)',
-            'Network service crashed, restarting service.',
-            'Invalid key: The GraphQL query at the field at',
-            'You have to request `id` or `_id` fields for all selection sets or create a custom `keys` config for `UnityReleaseLabel`.',
-        ];
-        try {
-            exitCode = await new Promise((resolve, reject) => {
-                let isSettled = false; // Has the promise been settled (resolved or rejected)?
-                let isHubTaskCompleteSuccess = false; // Has the Unity Hub tasks completed successfully?
-                let isHubTaskCompleteFailed = false; // Has the Unity Hub tasks completed with failure?
-                let lineBuffer = ''; // Buffer for incomplete lines
-                const tasksCompleteMessages = [
-                    'All Tasks Completed Successfully.',
-                    'Completed with errors.'
-                ];
-                const child = (0, child_process_1.spawn)(executable, execArgs, {
-                    stdio: ['ignore', 'pipe', 'pipe']
-                });
-                const sigintHandler = () => child.kill('SIGINT');
-                const sigtermHandler = () => child.kill('SIGTERM');
-                process.once('SIGINT', sigintHandler);
-                process.once('SIGTERM', sigtermHandler);
-                let hasCleanedUpListeners = false;
-                function removeListeners() {
-                    if (hasCleanedUpListeners) {
-                        return;
-                    }
-                    hasCleanedUpListeners = true;
-                    process.removeListener('SIGINT', sigintHandler);
-                    process.removeListener('SIGTERM', sigtermHandler);
-                }
-                function processOutput(data) {
-                    try {
-                        const chunk = data.toString();
-                        const fullChunk = lineBuffer + chunk;
-                        const lines = fullChunk.split(/\r?\n/) // split by newline
-                            .filter(line => line.length > 0); // filter out empty lines
-                        if (!chunk.endsWith('\n')) {
-                            lineBuffer = lines.pop() || '';
-                        }
-                        else {
-                            lineBuffer = '';
-                        }
-                        if (lines.some(line => tasksCompleteMessages.includes(line))) {
-                            isHubTaskCompleteSuccess = lines.includes('All Tasks Completed Successfully.');
-                            isHubTaskCompleteFailed = lines.includes('Completed with errors.');
-                            if (child?.pid) {
-                                try {
-                                    child.kill('SIGTERM');
-                                    setTimeout(() => {
-                                        try {
-                                            if (child?.pid && !child.killed) {
-                                                child.kill('SIGKILL');
-                                            }
-                                        }
-                                        catch {
-                                            // Ignore, process may have already exited
-                                        }
-                                    }, 1000);
-                                }
-                                catch {
-                                    // Ignore, process may have already exited
-                                }
-                                finally {
-                                    if (isHubTaskCompleteSuccess) {
-                                        settle(0);
-                                    }
-                                    else if (isHubTaskCompleteFailed) {
-                                        settle(1);
-                                    }
-                                    else {
-                                        settle(null);
-                                    }
-                                }
-                            }
-                        }
-                        for (const line of lines) {
-                            output += `${line}\n`;
-                            if (!options.silent && !ignoredLines.some(ignored => line.includes(ignored))) {
-                                process.stdout.write(`${line}\n`);
-                            }
-                        }
-                    }
-                    catch (error) {
-                        if (error.code !== 'EPIPE') {
-                            throw error;
-                        }
-                    }
-                }
-                function flushOutput() {
-                    try {
-                        if (lineBuffer.length > 0) {
-                            const lines = lineBuffer.split(/\r?\n/) // split by newline
-                                .filter(line => line.length > 0); // filter out empty lines
-                            lineBuffer = '';
-                            const outputLines = lines.filter(line => !ignoredLines.some(ignored => line.includes(ignored)));
-                            if (outputLines.some(line => tasksCompleteMessages.includes(line))) {
-                                isHubTaskCompleteSuccess = outputLines.includes('All Tasks Completed Successfully.');
-                                isHubTaskCompleteFailed = outputLines.includes('Completed with errors.');
-                            }
-                            for (const line of outputLines) {
-                                output += `${line}\n`;
-                                if (!options.silent) {
-                                    process.stdout.write(`${line}\n`);
-                                }
-                            }
-                        }
-                    }
-                    catch (error) {
-                        if (error.code !== 'EPIPE') {
-                            logging_1.Logger.instance.error(`Failed to process buffered output: ${error}`);
-                        }
-                    }
-                }
-                function settle(code) {
-                    if (isSettled) {
-                        return;
-                    }
-                    isSettled = true;
-                    removeListeners();
-                    flushOutput();
-                    resolve(code === null ? 0 : code);
-                }
-                child.stdout.on('data', processOutput);
-                child.stderr.on('data', processOutput);
-                child.on('error', (error) => {
-                    isSettled = true;
-                    removeListeners();
-                    flushOutput();
-                    reject(error);
-                });
-                child.on('close', settle);
-            });
-        }
-        finally {
-            this.logger.endGroup();
-            const match = output.match(/Assertion (?<assert>.+) failed/g);
-            const retryConditions = [
-                'async hook stack has become corrupted',
-                'failed to download'
-            ];
-            if (match ||
-                retryConditions.some(s => output.includes(s))) {
-                this.logger.warn(`Install failed, retrying...`);
-                return await this.Exec(args);
-            }
-            if (exitCode > 0) {
-                const error = output.match(/Error(?: given)?:\s*(.+)/);
-                const errorMessage = error && error[1] ? error[1] : 'Unknown Error';
-                switch (errorMessage) {
-                    case 'No modules found to install.':
-                        break;
-                    default:
-                        this.logger.debug(output);
-                        throw new Error(`Failed to execute Unity Hub (exit code: ${exitCode}) ${errorMessage}`);
-                }
-            }
-            output = output.split('\n')
-                .filter(line => line.trim().length > 0)
-                .filter(line => !ignoredLines.some(ignored => line.includes(ignored)))
-                .join('\n');
-        }
-        return output;
-    }
-    /**
-     * Prints the installed Unity Hub version.
-     * @returns The installed Unity Hub version.
-     */
-    async Version() {
-        const version = await this.getInstalledHubVersion();
-        return version.version;
-    }
-    /**
-     * Installs or updates the Unity Hub.
-     * If the Unity Hub is already installed, it will be updated to the latest version.
-     * @param autoUpdate If true, automatically updates the Unity Hub if it is already installed. Default is true.
-     * @returns The path to the Unity Hub executable.
-     */
-    async Install(autoUpdate = true, version) {
-        if (autoUpdate && version) {
-            throw new Error('Cannot use autoUpdate with version.');
-        }
-        let isInstalled = false;
-        let installedVersion = undefined;
-        try {
-            await fs.promises.access(this.executable, fs.constants.X_OK);
-            installedVersion = await this.getInstalledHubVersion();
-            isInstalled = true;
-        }
-        catch {
-            await this.installHub(version);
-        }
-        if (isInstalled && autoUpdate) {
-            if (!installedVersion) {
-                installedVersion = await this.getInstalledHubVersion();
-            }
-            this.logger.ci(`Installed Unity Hub version: ${installedVersion.version}`);
-            let versionToInstall = null;
-            if (!version) {
-                try {
-                    versionToInstall = await this.getLatestHubVersion();
-                    if (versionToInstall) {
-                        this.logger.ci(`Latest Unity Hub version: ${versionToInstall.version}`);
-                    }
-                }
-                catch (error) {
-                    this.logger.warn(`Failed to get latest Unity Hub version: ${error}`);
-                }
-            }
-            else {
-                versionToInstall = (0, semver_1.coerce)(version);
-            }
-            if (versionToInstall === null ||
-                !versionToInstall ||
-                !(0, semver_1.valid)(versionToInstall)) {
-                if (version || process.platform !== 'linux') {
-                    throw new Error(`Invalid Unity Hub version to install: ${versionToInstall}`);
-                }
-            }
-            const mustInstall = Boolean(version) ||
-                (process.platform === 'linux' && !version) ||
-                (versionToInstall !== null && (0, semver_1.compare)(installedVersion, versionToInstall) < 0);
-            if (mustInstall) {
-                this.logger.info(`Updating Unity Hub from ${installedVersion.version} to ${versionToInstall?.version ?? 'latest'}...`);
-                if (process.platform === 'darwin') {
-                    await (0, utilities_1.Exec)('sudo', ['rm', '-rf', this.rootDirectory], { silent: true, showCommand: true });
-                    await this.installHub(version);
-                }
-                else if (process.platform === 'win32') {
-                    const uninstaller = path.join(this.rootDirectory, 'Uninstall Unity Hub.exe');
-                    await (0, utilities_1.Exec)('powershell', [
-                        '-NoProfile',
-                        '-Command',
-                        `Start-Process -FilePath '${uninstaller}' -ArgumentList '/S' -Verb RunAs -Wait`
-                    ], { silent: true, showCommand: true });
-                    await (0, utilities_1.DeleteDirectory)(this.rootDirectory);
-                    await this.installHub(version);
-                }
-                else if (process.platform === 'linux') {
-                    await (0, utilities_1.Exec)('sudo', ['sh', '-c', `#!/bin/bash
+/** Exit codes the official CLI documents as retryable: network, install locked and timeout. */
+const RETRYABLE_EXIT_CODES = [7, 9, 14];
+/**
+ * Packages the Unity Linux Editor needs that Ubuntu runners do not ship.
+ * Some of them are only in jammy, so its archive is added as a source.
+ */
+const LINUX_EDITOR_DEPENDENCIES_SCRIPT = `#!/bin/sh
 set -e
-wget -qO - https://hub.unity3d.com/linux/keys/public | gpg --dearmor | sudo tee /usr/share/keyrings/Unity_Technologies_ApS.gpg >/dev/null
-sudo sh -c 'echo "deb [signed-by=/usr/share/keyrings/Unity_Technologies_ApS.gpg] https://hub.unity3d.com/linux/repos/deb stable main" > /etc/apt/sources.list.d/unityhub.list'
-sudo apt-get update --allow-releaseinfo-change
-sudo apt-get install -y --no-install-recommends --only-upgrade unityhub${version ? '=' + version : ''}`]);
-                    this.logger.info(`Unity Hub updated successfully.`);
-                }
-                else {
-                    throw new Error(`Unsupported platform: ${process.platform}`);
-                }
+# an Ubuntu jammy source only works on Ubuntu; a Debian or other apt host would break its own apt-get update
+if grep -qs '^ID=ubuntu$' /etc/os-release; then
+  if [ ! -f /etc/apt/sources.list.d/jammy.list ]; then
+    echo "deb https://archive.ubuntu.com/ubuntu jammy main universe" > /etc/apt/sources.list.d/jammy.list
+  fi
+  # jammy only supplies packages the host release lacks; it never replaces the host's own packages
+  printf 'Package: *\\nPin: release n=jammy\\nPin-Priority: 100\\n' > /etc/apt/preferences.d/unity-cli-jammy
+fi
+export DEBIAN_FRONTEND=noninteractive
+# a stalled mirror must not hold the job: apt retries slow requests, and each step has a hard limit
+APT_OPTS="-o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=3 -o DPkg::Lock::Timeout=120"
+timeout 300 apt-get $APT_OPTS update
+# without pulseaudio, FMOD logs audio device errors on 2019 and 2020 editors; it pulls in about 38 MB,
+# which the runners' Azure mirror has taken over 10 minutes to serve
+timeout 1200 apt-get $APT_OPTS install -y --no-install-recommends xvfb libgtk2.0-0 libglu1-mesa libgconf-2-4 libncurses5 pulseaudio
+`;
+/** ffmpeg is only for video capture and import, so it is opt-in with UNITY_CLI_LINUX_FFMPEG=true. */
+const LINUX_FFMPEG_SCRIPT = `timeout 300 apt-get $APT_OPTS install -y --no-install-recommends ffmpeg || echo "Skipped ffmpeg: the install did not finish"
+`;
+/**
+ * SHA-256 of the fixed installers unity-cli downloads, recorded from the files Unity and Ubuntu serve today.
+ * A download that does not match is deleted instead of installed.
+ */
+const PINNED_DOWNLOAD_SHA256 = {
+    'https://beta.unity3d.com/download/UnitySetup-4.7.2.exe': '30e462dfe9c2ef176e4d1c78742ab777099ae5cfab3b46502af6c426b7e4e8a7',
+    'https://beta.unity3d.com/download/unity-4.7.2.dmg': '2fcaa916624b2eecc1686a943d5b7806fb5bdaf01df7b4a544103f114b85f40b',
+    'https://archive.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.0.0_1.0.2g-1ubuntu4.20_amd64.deb': '8003f9866297dd0fe77cc771470a06803d1d1b860350ad91dd212e38c36a20d2',
+    'https://archive.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.0g-2ubuntu4_amd64.deb': '82e424d50e144320319414a1964d3a980abde4bc39fc7d8c2885819328cb5cb4',
+};
+/** Unity 5.x target support installer names, keyed by module id. */
+/** The PlaybackEngines folder each archive module installs into, where it differs from `<name>Support`. */
+const ARCHIVE_PLAYBACK_ENGINE_FOLDERS = {
+    'Android': 'AndroidPlayer',
+    'Linux': 'LinuxStandaloneSupport',
+    'Mac': 'MacStandaloneSupport',
+    'Windows': 'WindowsStandaloneSupport',
+};
+const ARCHIVE_MODULE_NAMES = {
+    'android': 'Android',
+    'ios': 'iOS',
+    'appletv': 'AppleTV',
+    'webgl': 'WebGL',
+    'linux': 'Linux',
+    'linux-il2cpp': 'Linux',
+    'mac': 'Mac',
+    'mac-il2cpp': 'Mac',
+    'windows': 'Windows',
+    'windows-il2cpp': 'Windows',
+    'universal-windows-platform': 'Metro',
+    'facebook-games': 'Facebook-Games',
+    'samsungtv': 'Samsung-TV',
+    'tizen': 'Tizen',
+};
+/** The policy when none is given: `allow` with UNITY_ALLOW_SECURITY_ALERT=1 or true, otherwise `enforce`. */
+function DefaultSecurityAlertPolicy() {
+    return (0, unity_security_1.IsSecurityAlertAllowedByEnv)() ? 'allow' : 'enforce';
+}
+/**
+ * Finds or installs Unity Editors.
+ * - 2017.4 and newer install through the official Unity CLI (`unity install`).
+ * - 5.x installs from Unity's download archive, because the official CLI reads one-digit majors as Unity 6 shorthand.
+ * - 4.x installs from Unity's legacy installers.
+ */
+class UnityInstaller {
+    logger = logging_1.Logger.instance;
+    cli;
+    /** The 5.x release being installed from the archive, and its installers' published integrity values. */
+    archiveVersion;
+    archiveIntegrity;
+    /**
+     * @param cli The official Unity CLI to use. Installed on demand when omitted.
+     */
+    constructor(cli = undefined) {
+        this.cli = cli;
+    }
+    /**
+     * Gets the official Unity CLI, installing it when needed.
+     */
+    async GetCli() {
+        if (!this.cli) {
+            this.cli = await unity_cli_1.UnityCli.Get();
+        }
+        return this.cli;
+    }
+    /**
+     * Sets the directory editors are installed to.
+     * @param installPath The directory to install editors to.
+     */
+    async SetInstallPath(installPath) {
+        const cli = await this.GetCli();
+        await cli.SetInstallPath(path.resolve(installPath));
+    }
+    /**
+     * Gets the directory editors are installed to.
+     */
+    async GetInstallPath() {
+        const cli = await this.GetCli();
+        return await cli.GetInstallPath();
+    }
+    /**
+     * Finds the requested Unity Editor, installing it and any missing modules when needed.
+     * @param unityVersion The Unity version to find or install. Partial versions such as 2021.3.x resolve to the newest matching release.
+     * @param modules The module ids to install alongside the editor.
+     * @param channels The release channels to accept when resolving a partial version: f, p, b, a or x. Default is ['f'].
+     */
+    async GetEditor(unityVersion, modules = [], channels = ['f'], options = {}) {
+        this.logger.ci(`Getting release info for Unity ${unityVersion.toString()}...`);
+        const resolvedVersion = await this.resolveVersion(unityVersion, channels);
+        let editorPath;
+        const policy = options.securityAlert ?? DefaultSecurityAlertPolicy();
+        // the Releases API does not list 4.x and 5.x, so their fixed alert is reported before anything is found or downloaded
+        if (resolvedVersion.isLessThan('2017.0.0')) {
+            await this.CheckSecurityAlert(resolvedVersion, policy, options.rerunCommand);
+        }
+        if (resolvedVersion.isLegacy()) {
+            editorPath = await this.installLegacyEditor(resolvedVersion);
+        }
+        else if (resolvedVersion.isLessThan('2017.0.0')) {
+            editorPath = await this.installArchiveEditor(resolvedVersion, modules);
+        }
+        else {
+            editorPath = await this.installCliEditor(resolvedVersion, modules, policy, options.rerunCommand);
+        }
+        await fs.promises.access(editorPath, fs.constants.X_OK);
+        await this.patchBeeBackend(editorPath);
+        return new unity_editor_1.UnityEditor(path.normalize(editorPath), resolvedVersion);
+    }
+    /**
+     * Resolves a partial or changeset-less version to an exact release with its changeset.
+     * 4.x versions are returned as they are, since no release service lists them.
+     * @param unityVersion The requested version.
+     * @param channels The release channels to accept.
+     */
+    async resolveVersion(unityVersion, channels = ['f']) {
+        if (unityVersion.isLegacy() || (unityVersion.isFullyQualified() && unityVersion.changeset)) {
+            return unityVersion;
+        }
+        try {
+            const release = await UnityInstaller.GetEditorReleaseInfo(unityVersion, channels);
+            return new unity_version_1.UnityVersion(release.version, release.shortRevision, unityVersion.architecture);
+        }
+        catch (error) {
+            // fail closed for partial versions: never install "6000.6" and hope it picks a release
+            if (!unityVersion.isFullyQualified()) {
+                const message = error instanceof Error ? error.message : String(error);
+                throw new Error(`Failed to resolve Unity ${unityVersion.toString()} for channel(s) [${channels.join(', ')}]: ${message}`);
             }
-            else {
-                this.logger.info(`Unity Hub is already installed and up to date.`);
+            this.logger.warn(`Failed to get Unity release info for ${unityVersion.toString()}! falling back to the release notes page...\n${error}`);
+            try {
+                return await UnityInstaller.fallbackVersionLookup(unityVersion);
+            }
+            catch (fallbackError) {
+                this.logger.warn(`Failed to lookup changeset for Unity ${unityVersion.toString()}!\n${fallbackError}`);
+                return unityVersion;
             }
         }
-        await fs.promises.access(this.executable, fs.constants.X_OK);
-        return this.executable;
     }
-    async installHub(version) {
-        this.logger.ci(`Installing Unity Hub${version ? ' ' + version : ''}...`);
-        if (!version) {
+    async installCliEditor(unityVersion, modules, policy, rerunCommand) {
+        const cli = await this.GetCli();
+        const info = await this.getEditorInfo(cli, unityVersion);
+        // before anything is found, registered or downloaded
+        await this.checkSecurityAlert(unityVersion, info.warnings, policy === 'allow', rerunCommand);
+        let editorPath = await this.findCliEditor(cli, unityVersion);
+        const requestedModules = modules.length > 0 ? this.filterModules(info.modules, unityVersion, modules) : [];
+        if (!editorPath) {
+            if (process.platform === 'linux') {
+                await this.installLinuxDependencies(unityVersion);
+            }
+            this.logger.ci(`Installing Unity ${unityVersion.toString()}...`);
+            const args = ['install', unityVersion.version];
+            if (unityVersion.changeset) {
+                args.push('--changeset', unityVersion.changeset);
+            }
+            args.push('--architecture', unityVersion.architecture.toLowerCase());
+            if (requestedModules.length > 0) {
+                for (const module of requestedModules) {
+                    this.logger.ci(`  > with module: ${module}`);
+                }
+                args.push('--module', ...requestedModules, '--child-modules');
+            }
+            args.push('--accept-eula', '--yes');
+            await this.execWithRetry(cli, args);
+            editorPath = await this.findCliEditor(cli, unityVersion);
+            if (!editorPath) {
+                throw new Error(`Unity ${unityVersion.toString()} was installed, but its editor could not be found`);
+            }
+        }
+        else if (requestedModules.length > 0) {
+            this.logger.ci(`Installing modules for Unity ${unityVersion.toString()}: ${requestedModules.join(', ')}`);
+            await this.execWithRetry(cli, [
+                'install-modules',
+                '--editor-version', unityVersion.version,
+                '--architecture', unityVersion.architecture.toLowerCase(),
+                '--module', ...requestedModules,
+                '--child-modules',
+                '--accept-eula',
+                '--yes'
+            ]);
+        }
+        if (unityVersion.isGreaterThanOrEqualTo('6000.0.0')) {
+            // so the editor opens without the terms dialog
+            const result = await cli.Run(['terms', 'accept', unityVersion.version, '--architecture', unityVersion.architecture.toLowerCase(), '--yes']);
+            if (result.exitCode !== 0) {
+                this.logger.debug(`unity terms accept exited with code ${result.exitCode}:\n${result.stdout}${result.stderr}`);
+            }
+        }
+        return editorPath;
+    }
+    async execWithRetry(cli, args) {
+        let result = await cli.Run(args, { stream: true });
+        if (RETRYABLE_EXIT_CODES.includes(result.exitCode)) {
+            this.logger.warn(`unity ${args[0]} failed with exit code ${result.exitCode}, retrying...`);
+            result = await cli.Run(args[0] === 'install' ? [...args, '--resume'] : args, { stream: true });
+        }
+        // install-modules fails when every requested module is already installed
+        if (result.exitCode !== 0 && args[0] === 'install-modules' && `${result.stdout}${result.stderr}`.includes('No modules found to install')) {
+            this.logger.info('The requested modules are already installed.');
+            return;
+        }
+        if (result.exitCode !== 0) {
+            throw new Error(`unity ${args.join(' ')} failed with exit code ${result.exitCode}`);
+        }
+    }
+    /**
+     * Reads a release's modules and warnings with `unity editors info`.
+     * @returns The module ids, undefined when they could not be read, and the warnings the CLI returned.
+     */
+    async getEditorInfo(cli, unityVersion) {
+        const { exitCode, envelope } = await cli.RunJson(['editors', 'info', unityVersion.version]);
+        const warnings = Array.isArray(envelope?.warnings) ? envelope.warnings : [];
+        return { modules: exitCode === 0 ? envelope?.data?.modules?.map(module => module.id) : undefined, warnings };
+    }
+    /**
+     * Stops on a Unity Security Alert unless it is allowed. The official CLI's own security warning is printed as it
+     * is when it has one; otherwise the Unity Releases API label is. Other CLI warnings are logged as warnings.
+     * @param unityVersion The exact release.
+     * @param cliWarnings The warnings from `unity editors info`.
+     * @param allow Whether the alert was allowed with --allow-security-alert or UNITY_ALLOW_SECURITY_ALERT.
+     */
+    /**
+     * Checks an exact release for a Unity Security Alert, the same way every command that installs or selects an editor
+     * does: a warning with the opt-in, otherwise an error that stops the command.
+     * @param unityVersion The exact release.
+     * @param policy `allow` or `enforce`. Defaults to `allow` with UNITY_ALLOW_SECURITY_ALERT, otherwise `enforce`.
+     * @param rerunCommand The command to re-run with --allow-security-alert, shown when the alert stops it.
+     */
+    async CheckSecurityAlert(unityVersion, policy = DefaultSecurityAlertPolicy(), rerunCommand = undefined) {
+        if (unityVersion.isLessThan('2017.0.0')) {
+            const alert = (0, unity_security_1.GetLegacySecurityAlert)(unityVersion);
+            if (alert) {
+                (0, unity_security_1.ReportUnitySecurityAlert)(alert, policy === 'allow', rerunCommand);
+            }
+            return;
+        }
+        const info = await this.getEditorInfo(await this.GetCli(), unityVersion);
+        await this.checkSecurityAlert(unityVersion, info.warnings, policy === 'allow', rerunCommand);
+    }
+    async checkSecurityAlert(unityVersion, cliWarnings, allow, rerunCommand) {
+        const cliSecurityWarnings = cliWarnings.filter(unity_security_1.IsSecurityCliWarning).map(unity_security_1.FormatCliWarning).filter(text => text.length > 0);
+        this.reportCliWarnings(cliWarnings.filter(warning => !(0, unity_security_1.IsSecurityCliWarning)(warning)));
+        const alert = await (0, unity_security_1.GetUnitySecurityAlert)(unityVersion);
+        if (cliSecurityWarnings.length > 0) {
+            // the official CLI's own text in place of the label's, with the patched release from the Releases API
+            const summary = [...cliSecurityWarnings, ...(alert?.patched ? [alert.patched] : [])].join(' | ');
+            (0, unity_security_1.ReportUnitySecurityAlert)({ version: unityVersion.version, summary, details: [] }, allow, rerunCommand);
+        }
+        else if (alert) {
+            (0, unity_security_1.ReportUnitySecurityAlert)(alert, allow, rerunCommand);
+        }
+    }
+    reportCliWarnings(warnings) {
+        for (const warning of warnings) {
+            const text = (0, unity_security_1.FormatCliWarning)(warning);
+            // an annotation escapes line breaks, so CLI text cannot start a workflow command of its own
+            if (text.length > 0) {
+                this.logger.annotate(logging_1.LogLevel.WARN, text);
+            }
+        }
+    }
+    /**
+     * Drops modules the release does not offer, since `unity install` fails on an unknown module id.
+     */
+    filterModules(available, unityVersion, modules) {
+        if (!available || available.length === 0) {
+            this.logger.debug(`Could not read the module list for Unity ${unityVersion.version}, requesting modules as given`);
+            return [...modules];
+        }
+        const supported = [];
+        for (const module of modules) {
+            if (available.includes(module)) {
+                supported.push(module);
+            }
+            else {
+                this.logger.warn(`Unity ${unityVersion.version} has no ${module} module on ${process.platform}, skipping it`);
+            }
+        }
+        return supported;
+    }
+    /**
+     * Looks up an installed editor with `unity editors path`, registering one that sits in the install path but that the CLI does not know about yet.
+     */
+    async findCliEditor(cli, unityVersion) {
+        const { exitCode, envelope } = await cli.RunJson(['editors', 'path', unityVersion.version]);
+        // editors path takes no architecture, so the binary is checked to not return another architecture's install
+        const matchesArchitecture = (editorPath) => {
+            const architectures = getExecutableArchitectures(editorPath);
+            const matches = !architectures || architectures.includes(unityVersion.architecture);
+            if (!matches) {
+                this.logger.debug(`Skipping ${editorPath}: built for ${architectures.join(', ')}, not ${unityVersion.architecture}`);
+            }
+            return matches;
+        };
+        if (exitCode === 0 && envelope?.success !== false) {
+            const editorPath = resolveEditorExecutable((0, unity_cli_1.FindAbsolutePath)(envelope?.data));
+            if (editorPath && matchesArchitecture(editorPath)) {
+                this.logger.debug(`Found installed editor: "${editorPath}"`);
+                return editorPath;
+            }
+        }
+        let installPath;
+        try {
+            installPath = await cli.GetInstallPath();
+        }
+        catch (error) {
+            this.logger.debug(`${error}`);
+            return undefined;
+        }
+        // the architecture-specific folder first; the plain one only when its binary is the requested architecture
+        const candidates = [
+            path.join(installPath, `${unityVersion.version}-${unityVersion.architecture.toLowerCase()}`),
+            path.join(installPath, unityVersion.version),
+        ];
+        for (const candidate of candidates) {
+            const editorPath = resolveEditorExecutable(candidate);
+            if (editorPath && matchesArchitecture(editorPath)) {
+                this.logger.info(`Registering existing Unity ${unityVersion.version} at ${editorPath}`);
+                const result = await cli.Run(['editors', 'add', editorPath]);
+                if (result.exitCode !== 0) {
+                    this.logger.warn(`unity editors add exited with code ${result.exitCode}`);
+                }
+                return editorPath;
+            }
+        }
+        return undefined;
+    }
+    async getLegacyInstallPath() {
+        try {
+            return await this.GetInstallPath();
+        }
+        catch (error) {
+            this.logger.debug(`Falling back to the default editor install path: ${error}`);
             switch (process.platform) {
                 case 'win32':
+                    return path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Unity', 'Hub', 'Editor');
                 case 'darwin':
-                    version = 'prod';
-                    break;
+                    return '/Applications/Unity/Hub/Editor';
+                default:
+                    return path.join(os.homedir(), 'Unity', 'Hub', 'Editor');
             }
         }
+    }
+    /**
+     * Installs Unity 5.x from the download archive.
+     */
+    async installArchiveEditor(unityVersion, modules) {
+        if (!unityVersion.changeset) {
+            throw new Error(`Unity ${unityVersion.toString()} needs a changeset to install from the download archive`);
+        }
+        UnityInstaller.assertArchiveVersion(unityVersion);
+        this.archiveVersion = unityVersion;
+        this.archiveIntegrity = undefined;
+        const installPath = await this.getLegacyInstallPath();
+        const installDir = path.join(installPath, unityVersion.version);
+        const baseUrl = `https://download.unity3d.com/download_unity/${unityVersion.changeset}`;
+        const moduleNames = this.getArchiveModuleNames(unityVersion, modules);
         switch (process.platform) {
             case 'win32': {
-                if (process.arch === 'arm64' && version !== 'prod') {
-                    const pinned = (0, semver_1.coerce)(version);
-                    if (!pinned || !(0, semver_1.valid)(pinned)) {
-                        throw new Error(`Invalid Unity Hub version: ${String(version)}`);
-                    }
-                    if ((0, semver_1.compare)(pinned, MIN_NATIVE_WINDOWS_ARM64_HUB_VERSION) < 0) {
-                        throw new Error(`Unity Hub ${pinned.version} does not ship a native Windows ARM64 installer ` +
-                            `(minimum ${MIN_NATIVE_WINDOWS_ARM64_HUB_VERSION.version}). ` +
-                            'Install without --hub-version to use the latest Hub, or use Windows x64 for older Hub versions.');
-                    }
+                let editorPath = resolveEditorExecutable(installDir);
+                if (!editorPath) {
+                    this.logger.ci(`Installing Unity ${unityVersion.toString()}...`);
+                    await this.runWindowsInstaller(`${baseUrl}/Windows64EditorInstaller/UnitySetup64-${unityVersion.version}.exe`, installDir);
+                    editorPath = resolveEditorExecutable(installDir);
                 }
-                const winArch = process.arch === 'arm64' ? 'arm64' : 'x64';
-                const setupFileName = `UnityHubSetup-${winArch}.exe`;
-                const url = `https://public-cdn.cloud.unity3d.com/hub/${version}/${setupFileName}`;
-                const downloadPath = path.join((0, utilities_1.GetTempDir)(), setupFileName);
-                await (0, utilities_1.DownloadFile)(url, downloadPath);
-                this.logger.info(`Running Unity Hub installer...`);
-                try {
-                    await (0, utilities_1.Exec)('powershell', [
-                        '-NoProfile',
-                        '-Command',
-                        `Start-Process -FilePath '${downloadPath}' -ArgumentList '/S' -Verb RunAs -Wait`
-                    ], { silent: true, showCommand: true });
+                if (!editorPath) {
+                    throw new Error(`Failed to install Unity ${unityVersion.toString()} to ${installDir}`);
                 }
-                finally {
-                    if (fs.statSync(downloadPath).isFile()) {
-                        await fs.promises.unlink(downloadPath);
+                for (const moduleName of moduleNames) {
+                    const engineFolder = ARCHIVE_PLAYBACK_ENGINE_FOLDERS[moduleName] ?? `${moduleName}Support`;
+                    // Windows paths are case-insensitive, so the folder name's case does not matter here
+                    if (fs.existsSync(path.join(installDir, 'Editor', 'Data', 'PlaybackEngines', engineFolder))) {
+                        continue;
                     }
+                    this.logger.ci(`  > with module: ${moduleName}`);
+                    await this.runWindowsInstaller(`${baseUrl}/TargetSupportInstaller/UnitySetup-${moduleName}-Support-for-Editor-${unityVersion.version}.exe`, installDir);
                 }
+                return editorPath;
+            }
+            case 'darwin': {
+                let editorPath = resolveEditorExecutable(installDir);
+                const modulePackages = moduleNames.map(name => `${baseUrl}/MacEditorTargetInstaller/UnitySetup-${name}-Support-for-Editor-${unityVersion.version}.pkg`);
+                if (editorPath) {
+                    if (modulePackages.length > 0) {
+                        // the target support packages install into /Applications/Unity/PlaybackEngines, so they are moved into this editor afterwards
+                        this.logger.ci(`Installing modules for Unity ${unityVersion.toString()}: ${moduleNames.join(', ')}`);
+                        await this.installMacPackages(modulePackages);
+                        await this.moveMacPlaybackEngines(installDir);
+                    }
+                    return editorPath;
+                }
+                this.logger.ci(`Installing Unity ${unityVersion.toString()}...`);
+                await this.installMacPackages([`${baseUrl}/MacEditorInstaller/Unity-${unityVersion.version}.pkg`, ...modulePackages]);
+                await this.moveMacApplicationsUnity(installDir);
+                editorPath = resolveEditorExecutable(installDir);
+                if (!editorPath) {
+                    throw new Error(`Failed to install Unity ${unityVersion.toString()} to ${installDir}`);
+                }
+                return editorPath;
+            }
+            default:
+                throw new Error(`Unity ${unityVersion.toString()} is not supported on ${process.platform}`);
+        }
+    }
+    /**
+     * Gets the checksum a download must match before it is installed: a pinned SHA-256 for the fixed installers,
+     * or the Unity Releases API integrity value for 5.x archive installers. Fails closed when neither is known.
+     * @param url The download URL.
+     */
+    async getDownloadOptions(url) {
+        const pinned = PINNED_DOWNLOAD_SHA256[url];
+        if (pinned) {
+            return { sha256: pinned };
+        }
+        const archive = url.match(/^https:\/\/download\.unity3d\.com\/download_unity\/([0-9a-f]{12})\//);
+        if (archive && this.archiveVersion) {
+            if (!this.archiveIntegrity) {
+                this.archiveIntegrity = await UnityInstaller.getReleaseIntegrity(this.archiveVersion);
+            }
+            const integrity = this.archiveIntegrity.get(url);
+            if (integrity) {
+                return { integrity };
+            }
+        }
+        throw new Error(`No checksum is known for ${url}, so it is not installed`);
+    }
+    /**
+     * Maps each installer URL of a release (editor and modules) to the integrity value the Unity Releases API publishes for it.
+     * @param unityVersion The exact release.
+     */
+    static async getReleaseIntegrity(unityVersion) {
+        const integrity = new Map();
+        const releasesClient = new unity_releases_api_1.UnityReleasesClient();
+        const { data, error } = await releasesClient.api.Release.getUnityReleases({
+            url: '/unity/editor/release/v1/releases',
+            query: { version: unityVersion.version, limit: 5 },
+        });
+        if (error) {
+            throw new Error(`Failed to read the checksums for Unity ${unityVersion.version}: ${JSON.stringify(error)}`);
+        }
+        const collect = (entries) => {
+            if (!Array.isArray(entries)) {
+                return;
+            }
+            for (const entry of entries) {
+                if (entry.url && entry.integrity) {
+                    integrity.set(entry.url, entry.integrity);
+                }
+                collect(entry.modules);
+            }
+        };
+        for (const release of data?.results ?? []) {
+            if (release.version === unityVersion.version) {
+                collect(release.downloads);
+            }
+        }
+        return integrity;
+    }
+    getArchiveModuleNames(unityVersion, modules) {
+        const hostModule = process.platform === 'win32' ? 'Windows' : process.platform === 'darwin' ? 'Mac' : 'Linux';
+        const names = [];
+        for (const module of modules) {
+            const name = ARCHIVE_MODULE_NAMES[module];
+            if (!name) {
+                this.logger.warn(`Unity ${unityVersion.version} has no ${module} module in the download archive, skipping it`);
+            }
+            else if (name !== hostModule && !names.includes(name)) {
+                names.push(name);
+            }
+        }
+        return names;
+    }
+    /**
+     * Runs a Unity NSIS installer silently. NSIS needs `/D=` last and unquoted, so the command line is passed verbatim, without a shell.
+     */
+    async runWindowsInstaller(url, installDir) {
+        if (/["\r\n]/.test(installDir)) {
+            throw new Error(`Invalid install directory: ${installDir}`);
+        }
+        const installerPath = tempInstallerPath('.exe');
+        await (0, utilities_1.DownloadFile)(url, installerPath, await this.getDownloadOptions(url));
+        this.logger.info(`Running ${path.basename(url)}...`);
+        try {
+            const exitCode = await new Promise((resolve, reject) => {
+                const child = (0, child_process_1.spawn)(installerPath, ['/S', `/D=${installDir}`], {
+                    shell: false,
+                    stdio: 'ignore',
+                    windowsVerbatimArguments: true,
+                });
+                child.on('error', reject);
+                child.on('close', (code) => resolve(code ?? 1));
+            });
+            if (exitCode !== 0) {
+                throw new Error(`${path.basename(url)} failed with exit code ${exitCode}`);
+            }
+        }
+        finally {
+            await fs.promises.rm(installerPath, { force: true });
+        }
+    }
+    async installMacPackages(urls) {
+        for (const url of urls) {
+            const pkgPath = tempInstallerPath('.pkg');
+            await (0, utilities_1.DownloadFile)(url, pkgPath, await this.getDownloadOptions(url));
+            try {
+                await (0, utilities_1.Exec)('sudo', ['installer', '-pkg', pkgPath, '-target', '/'], { silent: true, showCommand: true });
+            }
+            finally {
+                await fs.promises.rm(pkgPath, { force: true });
+            }
+        }
+    }
+    /**
+     * Moves target support that macOS packages installed to /Applications/Unity/PlaybackEngines into an existing versioned editor.
+     */
+    async moveMacPlaybackEngines(targetPath) {
+        const sourcePath = path.join('/Applications', 'Unity', 'PlaybackEngines');
+        if (!fs.existsSync(sourcePath)) {
+            throw new Error(`The module packages did not install anything into ${sourcePath}`);
+        }
+        const destinationPath = path.join(targetPath, 'PlaybackEngines');
+        await fs.promises.mkdir(destinationPath, { recursive: true });
+        // the parent too, since removing PlaybackEngines afterwards needs write permission on it
+        await claimMacInstalledItem(path.dirname(sourcePath), false);
+        await claimMacInstalledItem(sourcePath, true);
+        for (const item of await fs.promises.readdir(sourcePath)) {
+            await moveMacInstalledItem(path.join(sourcePath, item), path.join(destinationPath, item));
+        }
+        await fs.promises.rm(sourcePath, { recursive: true, force: true });
+    }
+    /**
+     * Moves an editor that a macOS package installed to /Applications/Unity into its versioned folder.
+     */
+    async moveMacApplicationsUnity(targetPath) {
+        const unityAppPath = path.join('/Applications', 'Unity');
+        if (!fs.existsSync(path.join(unityAppPath, 'Unity.app'))) {
+            throw new Error('Failed to find /Applications/Unity/Unity.app after installation.');
+        }
+        this.logger.debug(`Moving ${unityAppPath} to ${targetPath}...`);
+        await fs.promises.mkdir(targetPath, { recursive: true });
+        // the folder itself, so its entries can be moved out; the Hub folder inside it is left as it is
+        await claimMacInstalledItem(unityAppPath, false);
+        for (const item of await fs.promises.readdir(unityAppPath)) {
+            // the editor install path itself lives in /Applications/Unity/Hub
+            if (item === 'Hub') {
+                continue;
+            }
+            const source = path.join(unityAppPath, item);
+            await claimMacInstalledItem(source, true);
+            await moveMacInstalledItem(source, path.join(targetPath, item));
+        }
+        await fs.promises.chmod(targetPath, 0o755);
+    }
+    /**
+     * Rejects versions and changesets that are not plain Unity release identifiers before they become URLs and paths.
+     */
+    static assertArchiveVersion(unityVersion) {
+        if (!/^\d{1,2}\.\d{1,2}\.\d{1,2}(?:[abcfpx]\d{1,3})?$/.test(unityVersion.version)) {
+            throw new Error(`Invalid Unity version: ${unityVersion.version}`);
+        }
+        if (unityVersion.changeset && !/^[0-9a-f]{12}$/i.test(unityVersion.changeset)) {
+            throw new Error(`Invalid Unity changeset: ${unityVersion.changeset}`);
+        }
+    }
+    /**
+     * Installs Unity 4.x from Unity's legacy installers.
+     */
+    async installLegacyEditor(unityVersion) {
+        UnityInstaller.assertArchiveVersion(unityVersion);
+        const installPath = await this.getLegacyInstallPath();
+        const installDir = path.join(installPath, `Unity ${unityVersion.version}`);
+        let editorPath = resolveEditorExecutable(installDir);
+        if (editorPath) {
+            return editorPath;
+        }
+        this.logger.ci(`Installing Unity ${unityVersion.toString()}...`);
+        switch (process.platform) {
+            case 'win32': {
+                await this.runWindowsInstaller(`https://beta.unity3d.com/download/UnitySetup-${unityVersion.version}.exe`, installDir);
                 break;
             }
             case 'darwin': {
-                const baseUrl = `https://public-cdn.cloud.unity3d.com/hub/${version}`;
-                const url = `${baseUrl}/UnityHubSetup-${process.arch}.dmg`;
-                const downloadPath = path.join((0, utilities_1.GetTempDir)(), `UnityHubSetup-${process.arch}.dmg`);
-                await (0, utilities_1.DownloadFile)(url, downloadPath);
-                await fs.promises.chmod(downloadPath, 0o777);
+                const url = `https://beta.unity3d.com/download/unity-${unityVersion.version}.dmg`;
+                const installerPath = tempInstallerPath('.dmg');
+                await (0, utilities_1.DownloadFile)(url, installerPath, await this.getDownloadOptions(url));
                 let mountPoint = '';
-                this.logger.debug(`Mounting DMG...`);
                 try {
-                    const output = await (0, utilities_1.Exec)('hdiutil', ['attach', downloadPath, '-nobrowse'], { silent: true, showCommand: true });
-                    // can be "/Volumes/Unity Hub 3.13.1-arm64" or "/Volumes/Unity Hub 3.13.1"
-                    const mountPointMatch = output.match(/\/Volumes\/Unity Hub.*$/m);
+                    const output = await (0, utilities_1.Exec)('hdiutil', ['attach', installerPath, '-nobrowse'], { silent: true, showCommand: true });
+                    const mountPointMatch = output.match(/\/Volumes\/Unity Installer.*$/m);
                     if (!mountPointMatch || mountPointMatch.length === 0) {
                         throw new Error(`Failed to find mount point in hdiutil output: ${output}`);
                     }
                     mountPoint = mountPointMatch[0];
-                    this.logger.debug(`Mounted Unity Hub at ${mountPoint}`);
-                    const appPath = path.join(mountPoint, 'Unity Hub.app');
-                    this.logger.debug(`Copying ${appPath} to /Applications...`);
-                    await fs.promises.access(appPath, fs.constants.R_OK | fs.constants.X_OK);
-                    if (fs.existsSync('/Applications/Unity Hub.app')) {
-                        await (0, utilities_1.Exec)('sudo', ['rm', '-rf', '/Applications/Unity Hub.app'], { silent: true, showCommand: true });
-                    }
-                    await (0, utilities_1.Exec)('sudo', ['cp', '-R', appPath, '/Applications/Unity Hub.app'], { silent: true, showCommand: true });
-                    await (0, utilities_1.Exec)('sudo', ['chmod', '777', '/Applications/Unity Hub.app/Contents/MacOS/Unity Hub'], { silent: true, showCommand: true });
-                    await (0, utilities_1.Exec)('sudo', ['mkdir', '-p', '/Library/Application Support/Unity'], { silent: true, showCommand: true });
-                    await (0, utilities_1.Exec)('sudo', ['chmod', '777', '/Library/Application Support/Unity'], { silent: true, showCommand: true });
+                    const pkgPath = path.join(mountPoint, 'Unity.pkg');
+                    await fs.promises.access(pkgPath, fs.constants.R_OK);
+                    await (0, utilities_1.Exec)('sudo', ['installer', '-pkg', pkgPath, '-target', '/', '-verboseR'], { silent: true, showCommand: true });
+                    await this.moveMacApplicationsUnity(installDir);
                 }
                 finally {
                     try {
-                        if (mountPoint && mountPoint.length > 0) {
+                        if (mountPoint.length > 0) {
                             await (0, utilities_1.Exec)('hdiutil', ['detach', mountPoint, '-quiet'], { silent: true, showCommand: true });
                         }
                     }
                     finally {
-                        if (fs.statSync(downloadPath).isFile()) {
-                            await fs.promises.unlink(downloadPath);
-                        }
+                        await fs.promises.rm(installerPath, { force: true });
                     }
                 }
-                break;
-            }
-            case 'linux': {
-                await (0, utilities_1.Exec)('sudo', ['sh', '-c', `#!/bin/bash
-set -e
-dbus-uuidgen >/etc/machine-id && mkdir -p /var/lib/dbus/ && ln -sf /etc/machine-id /var/lib/dbus/machine-id
-wget -qO - https://hub.unity3d.com/linux/keys/public | gpg --dearmor | tee /usr/share/keyrings/Unity_Technologies_ApS.gpg >/dev/null
-echo "deb [signed-by=/usr/share/keyrings/Unity_Technologies_ApS.gpg] https://hub.unity3d.com/linux/repos/deb stable main" > /etc/apt/sources.list.d/unityhub.list
-echo "deb https://archive.ubuntu.com/ubuntu jammy main universe" | tee /etc/apt/sources.list.d/jammy.list
-apt-get update
-apt-get install -y --no-install-recommends \\
-  unityhub${version ? '=' + version : ''} \\
-  xvfb \\
-  ffmpeg \\
-  libgtk2.0-0 \\
-  libglu1-mesa \\
-  libgconf-2-4 \\
-  libncurses5 \\
-  pulseaudio
-apt-get clean
-sed -i 's/^\\(.*DISPLAY=:.*XAUTHORITY=.*\\)\\( "\\$@" \\)2>&1$/\\1\\2/' /usr/bin/xvfb-run
-printf '#!/bin/bash\nxvfb-run --auto-servernum /opt/unityhub/unityhub "$@" 2>/dev/null' | tee /usr/bin/unity-hub >/dev/null
-chmod 777 /usr/bin/unity-hub
-which unityhub || { echo "Unity Hub installation failed"; exit 1; }
-hubPath=$(which unityhub)
-
-if [ -z "$hubPath" ]; then
-    echo "Failed to install Unity Hub"
-    exit 1
-fi
-
-chmod -R 777 "$hubPath"`]);
                 break;
             }
             default:
-                throw new Error(`Unsupported platform: ${process.platform}`);
+                throw new Error(`Unity ${unityVersion.toString()} is not supported on ${process.platform}`);
         }
-        await fs.promises.access(this.executable, fs.constants.X_OK);
-        const installedVersion = await this.getInstalledHubVersion();
-        this.logger.info(`Unity Hub ${installedVersion} installed successfully.`);
-    }
-    async getInstalledHubVersion() {
-        let asarPath = undefined;
-        switch (process.platform) {
-            case 'darwin': {
-                asarPath = path.join(this.rootDirectory, 'Contents', 'Resources', 'app.asar');
-                break;
-            }
-            default: {
-                asarPath = path.join(this.rootDirectory, 'resources', 'app.asar');
-                break;
-            }
-        }
-        try {
-            await fs.promises.access(asarPath, fs.constants.R_OK);
-        }
-        catch {
-            throw new Error('Unity Hub is not installed.');
-        }
-        asar.uncacheAll();
-        const fileBuffer = asar.extractFile(asarPath, 'package.json').toString('utf-8');
-        let packageJson;
-        try {
-            packageJson = JSON.parse(fileBuffer);
-        }
-        catch (error) {
-            throw new Error(`Failed to parse Unity Hub package.json: ${error}\n${fileBuffer}`);
-        }
-        const version = (0, semver_1.coerce)(packageJson.version);
-        if (!version || !(0, semver_1.valid)(version)) {
-            throw new Error(`Failed to parse Unity Hub version: ${packageJson.version}`);
-        }
-        return version;
-    }
-    async getLatestHubVersion() {
-        let url = undefined;
-        switch (process.platform) {
-            case 'win32':
-                url = 'https://public-cdn.cloud.unity3d.com/hub/prod/latest.yml';
-                break;
-            case 'darwin':
-                url = 'https://public-cdn.cloud.unity3d.com/hub/prod/latest-mac.yml';
-                break;
-            case 'linux':
-                return null;
-            default:
-                throw new Error(`Unsupported platform: ${process.platform}`);
-        }
-        const data = await (0, utilities_1.HttpsGetText)(url);
-        const parsed = yaml.parse(data);
-        const version = (0, semver_1.coerce)(parsed.version);
-        if (!version || !(0, semver_1.valid)(version)) {
-            throw new Error(`Failed to parse latest Unity Hub version: ${parsed.version}`);
-        }
-        return version;
-    }
-    /**
-     * Returns the path where the Unity editors will be installed.
-     * @returns The editor install path.
-     */
-    async GetInstallPath() {
-        const result = (await this.Exec(['install-path', '--get'])).trim();
-        if (!result || result.length === 0) {
-            throw new Error('Failed to get Unity Hub install path.');
-        }
-        return result;
-    }
-    /**
-     * Sets the path where Unity editors will be installed.
-     * @param installPath The install path to set when installing Unity editors.
-     */
-    async SetInstallPath(installPath) {
-        await fs.promises.mkdir(installPath, { recursive: true });
-        await this.Exec(['install-path', '--set', installPath]);
-    }
-    /**
-     * Locate and associate an installed editor from a stipulated path.
-     * @param editorPath The path to the Unity Editor installation.
-     */
-    async AddEditor(editorPath) {
-        await fs.promises.access(editorPath, fs.constants.R_OK | fs.constants.X_OK);
-        await this.Exec(['editors', '--add', editorPath]);
-    }
-    /**
-     * Attempts to find or install the specified Unity Editor version with the requested modules.
-     * @param unityVersion The Unity version to find or install.
-     * @param modules The modules to install alongside the editor.
-     * @param channels The channels to consider when searching for the editor. Can be 'f' (final), 'p' (patch), 'b' (beta), 'a' (alpha), or 'x' (experimental). Default is ['f'].
-     * @returns The path to the Unity Editor executable.
-     */
-    async GetEditor(unityVersion, modules = [], channels = ['f']) {
-        const retryErrorMessages = [
-            'Editor already installed in this location',
-            'failed to download. Error given: Request timeout'
-        ];
-        this.logger.ci(`Getting release info for Unity ${unityVersion.toString()}...`);
-        let resolvedVersion = unityVersion;
-        if (!resolvedVersion.isLegacy()) {
-            try {
-                if (!resolvedVersion.isFullyQualified()) {
-                    const releases = await this.ListAvailableReleases();
-                    logging_1.Logger.instance.debug(`Found ${releases.length} available Unity releases, searching channels: ${channels.join(', ')}`);
-                    resolvedVersion = resolvedVersion.findMatch(releases, channels);
-                }
-                if (!resolvedVersion?.changeset) {
-                    const unityReleaseInfo = await this.GetEditorReleaseInfo(resolvedVersion);
-                    resolvedVersion = new unity_version_1.UnityVersion(unityReleaseInfo.version, unityReleaseInfo.shortRevision, resolvedVersion.architecture);
-                }
-            }
-            catch (error) {
-                this.logger.warn(`Failed to get Unity release info for ${resolvedVersion.toString()}! falling back to legacy search...\n${error}`);
-                try {
-                    resolvedVersion = await this.fallbackVersionLookup(resolvedVersion);
-                }
-                catch (fallbackError) {
-                    this.logger.warn(`Failed to lookup changeset for Unity ${resolvedVersion.toString()}!\n${fallbackError}`);
-                }
-            }
-        }
-        const allowPartialMatches = !resolvedVersion.isFullyQualified();
-        let editorPath = await this.checkInstalledEditors(resolvedVersion, false, undefined, allowPartialMatches);
-        unityVersion = resolvedVersion;
-        let installDir = undefined;
+        editorPath = resolveEditorExecutable(installDir);
         if (!editorPath) {
-            try {
-                installDir = await this.installUnity(unityVersion, modules);
-            }
-            catch (error) {
-                const errMessage = error instanceof Error ? error.message : String(error);
-                if (retryErrorMessages.some((msg) => errMessage.includes(msg))) {
-                    if (editorPath) {
-                        await (0, utilities_1.DeleteDirectory)(editorPath);
-                    }
-                    if (installDir) {
-                        await (0, utilities_1.DeleteDirectory)(installDir);
-                    }
-                    installDir = await this.installUnity(unityVersion, modules);
-                }
-                else {
-                    throw error;
-                }
-            }
-            editorPath = await this.checkInstalledEditors(unityVersion, true, installDir);
+            throw new Error(`Failed to install Unity ${unityVersion.toString()} to ${installDir}`);
         }
-        if (!editorPath) {
-            throw new Error(`Failed to find or install Unity Editor: ${unityVersion.toString()}`);
-        }
-        await fs.promises.access(editorPath, fs.constants.X_OK);
-        await this.patchBeeBackend(editorPath);
-        if (unityVersion.isLegacy() || modules.length === 0) {
-            return new unity_editor_1.UnityEditor(path.normalize(editorPath), unityVersion);
-        }
-        try {
-            this.logger.info(`Validating installed modules for Unity ${unityVersion.toString()}...`);
-            const [installedModules, additionalModules] = await this.checkEditorModules(editorPath, unityVersion, modules);
-            if (installedModules && installedModules.length > 0) {
-                this.logger.info(`Installed Modules:`);
-                for (const module of installedModules) {
-                    this.logger.info(`  > ${module}`);
-                }
-            }
-            if (additionalModules && additionalModules.length > 0) {
-                this.logger.info(`Additional Modules:`);
-                for (const module of additionalModules) {
-                    this.logger.info(`  > ${module}`);
-                }
-            }
-        }
-        catch (error) {
-            const errMessage = error instanceof Error ? error.message : String(error);
-            if (errMessage.includes(`No modules found`)) {
-                await (0, utilities_1.DeleteDirectory)(editorPath);
-                await this.GetEditor(unityVersion, modules);
-            }
-            else {
-                throw error;
-            }
-        }
-        return new unity_editor_1.UnityEditor(path.normalize(editorPath), unityVersion);
-    }
-    /**
-     * Lists the installed Unity Editors.
-     * @returns A list of installed Unity Editor versions and their paths.
-     */
-    async ListInstalledEditors() {
-        const output = await this.Exec(['editors', '-i']);
-        const paths = output.split('\n')
-            .filter(line => /installed at/.test(line))
-            .map(line => line.trim());
-        const editors = [];
-        const pattern = /(?<version>\d+\.\d+\.\d+[abcfpx]?\d*)\s*(?:\((?<arch>Apple silicon|Intel)\))?\s*,? installed at (?<editorPath>.*)/;
-        const matches = paths.map(path => path.match(pattern)).filter(match => match && match.groups);
-        if (paths.length !== matches.length) {
-            throw new Error(`Failed to parse all installed Unity Editors!\n > paths: ${JSON.stringify(paths)}\n  > matches: ${JSON.stringify(matches)}`);
-        }
-        for (const match of matches) {
-            if (match && match.groups && match.groups.version && match.groups.editorPath) {
-                const version = new unity_version_1.UnityVersion(match.groups.version, null, match.groups.arch === 'Apple silicon' ? 'ARM64' : match.groups.arch === 'Intel' ? 'X86_64' : undefined);
-                editors.push(new unity_editor_1.UnityEditor(path.normalize(match.groups.editorPath), version));
-            }
-        }
-        // Sort editors descending by UnityVersion so callers receive newest matches first
-        editors.sort((a, b) => {
-            if (!a.version && !b.version) {
-                return 0;
-            }
-            if (!a.version) {
-                return 1;
-            }
-            if (!b.version) {
-                return -1;
-            }
-            return unity_version_1.UnityVersion.compare(b.version, a.version);
-        });
-        return editors;
-    }
-    /**
-     * Lists the available Unity releases.
-     * @returns A list of available Unity release versions.
-     */
-    async ListAvailableReleases() {
-        const output = await this.Exec(['editors', '--releases']);
-        // filter out version lines only 2021.3.45f2 (may include installed path following version)
-        return output.split('\n')
-            .map(line => line.trim())
-            .map(line => {
-            const match = line.match(/^(\d{1,4}\.\d+\.\d+[abcfpx]?\d*)/);
-            return match ? match[1] : undefined;
-        })
-            .filter((line) => !!line && /^\d{1,4}\.\d+\.\d+[abcfpx]?\d*/.test(line))
-            .map(line => new unity_version_1.UnityVersion(line))
-            .sort((a, b) => unity_version_1.UnityVersion.compare(b, a)); // Sort descending by version
-    }
-    async checkInstalledEditors(unityVersion, failOnEmpty, installDir = undefined, allowPartialMatches = true) {
-        let editorPath = undefined;
-        if (!installDir) {
-            const editors = await this.ListInstalledEditors();
-            if (editors && editors.length > 0) {
-                // Prefer exact version match first
-                const exactEditor = editors.find(e => e.version && e.version.version === unityVersion.version);
-                if (exactEditor) {
-                    editorPath = exactEditor.editorPath;
-                }
-                else if (allowPartialMatches) {
-                    // Fallback: semver satisfies
-                    const versionEditors = editors.filter(e => e.version && unityVersion.satisfies(e.version));
-                    if (versionEditors.length === 0) {
-                        return undefined;
-                    }
-                    // ListInstalledEditors already returns editors sorted descending by version.
-                    for (const editor of versionEditors) {
-                        if (!editor.version || !editor.editorPath) {
-                            continue;
-                        }
-                        // If no architecture requested or editor has no arch info, accept it
-                        if (!unityVersion.architecture || !editor.version.architecture) {
-                            editorPath = editor.editorPath;
-                            break;
-                        }
-                        // Exact architecture match
-                        if (unityVersion.architecture === editor.version.architecture) {
-                            editorPath = editor.editorPath;
-                            break;
-                        }
-                        // Fallback: check for architecture suffix in path (e.g., -arm64)
-                        if (unityVersion.architecture && editor.editorPath.toLowerCase().includes(`-${unityVersion.architecture.toLowerCase()}`)) {
-                            editorPath = editor.editorPath;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        else {
-            if (process.platform == 'win32') {
-                editorPath = path.join(installDir, 'Unity.exe');
-            }
-            else {
-                editorPath = installDir;
-            }
-        }
-        if (!editorPath) {
-            if (failOnEmpty) {
-                throw new Error(`Failed to find installed Unity Editor: ${unityVersion.toString()}`);
-            }
-            else {
-                return undefined;
-            }
-        }
-        if (process.platform === 'darwin') {
-            editorPath = path.join(editorPath, '/Contents/MacOS/Unity');
-        }
-        try {
-            await fs.promises.access(editorPath, fs.constants.R_OK | fs.constants.X_OK);
-        }
-        catch (error) {
-            throw new Error(`Failed to find installed Unity Editor: ${unityVersion.toString()}\n  > ${error}`);
-        }
-        this.logger.debug(`Found installed editor: "${editorPath}"`);
         return editorPath;
+    }
+    /**
+     * Installs the system packages the Linux editor needs, and the older libssl that 2019.1 to 2021.x link against.
+     */
+    async installLinuxDependencies(unityVersion) {
+        if (process.env.UNITY_CLI_LINUX_DEPENDENCIES_INSTALLED !== 'true') {
+            try {
+                // streamed, so a slow mirror shows where it stalls
+                // sudo drops the caller's environment, so the opt-in is read here rather than in the script
+                const ffmpeg = process.env.UNITY_CLI_LINUX_FFMPEG === 'true' ? LINUX_FFMPEG_SCRIPT : '';
+                await (0, utilities_1.Exec)('sudo', ['sh', '-c', `${LINUX_EDITOR_DEPENDENCIES_SCRIPT}${ffmpeg}apt-get clean\n`], { silent: false, showCommand: true });
+                process.env.UNITY_CLI_LINUX_DEPENDENCIES_INSTALLED = 'true';
+                this.logger.CI_setEnvironmentVariable('UNITY_CLI_LINUX_DEPENDENCIES_INSTALLED', 'true');
+            }
+            catch (error) {
+                this.logger.warn(`Failed to install Linux editor dependencies: ${error}`);
+            }
+        }
+        const arch = process.arch === 'x64' ? 'amd64' : process.arch;
+        let debName;
+        if (['2019.1', '2019.2'].some(v => unityVersion.version.startsWith(v))) {
+            debName = `libssl1.0.0_1.0.2g-1ubuntu4.20_${arch}.deb`;
+        }
+        else if (['2019.3', '2019.4'].some(v => unityVersion.version.startsWith(v)) ||
+            unityVersion.version.startsWith('2020.') ||
+            unityVersion.version.startsWith('2021.')) {
+            debName = `libssl1.1_1.1.0g-2ubuntu4_${arch}.deb`;
+        }
+        if (debName) {
+            const downloadPath = tempInstallerPath('.deb');
+            const url = `https://archive.ubuntu.com/ubuntu/pool/main/o/openssl/${debName}`;
+            await (0, utilities_1.DownloadFile)(url, downloadPath, await this.getDownloadOptions(url));
+            try {
+                await (0, utilities_1.Exec)('sudo', ['dpkg', '-i', downloadPath]);
+            }
+            finally {
+                await fs.promises.rm(downloadPath, { force: true });
+            }
+        }
     }
     /**
      * Patches the Bee Backend for Unity Linux Editor.
@@ -6629,10 +8403,29 @@ chmod -R 777 "$hubPath"`]);
             const dataPath = path.join(path.dirname(editorPath), 'Data');
             const beeBackend = path.join(dataPath, 'bee_backend');
             const dotBeeBackend = path.join(dataPath, '.bee_backend');
-            if (fs.existsSync(beeBackend) && !fs.existsSync(dotBeeBackend)) {
-                this.logger.ci(`Patching Unity Linux Editor for Bee Backend...`);
-                await fs.promises.rename(beeBackend, dotBeeBackend);
-                const wrapperSource = `#!/bin/bash
+            // linking fails with EEXIST once patched and ENOENT without a bee_backend, so nothing is checked before it is used
+            try {
+                await fs.promises.link(beeBackend, dotBeeBackend);
+            }
+            catch (error) {
+                const code = error.code;
+                if (code === 'ENOENT') {
+                    return;
+                }
+                if (code !== 'EEXIST') {
+                    throw error;
+                }
+                // patched before; only a run that stopped before the wrapper landed leaves .bee_backend without bee_backend
+                try {
+                    await fs.promises.access(beeBackend);
+                    return;
+                }
+                catch {
+                    this.logger.ci('Restoring the Bee Backend wrapper an earlier run did not finish...');
+                }
+            }
+            this.logger.ci(`Patching Unity Linux Editor for Bee Backend...`);
+            const wrapperSource = `#!/bin/bash
 # https://discussions.unity.com/t/linux-editor-stuck-on-loading-because-of-bee-backend-w-workaround/854480
 set -e
 args=("$@")
@@ -6645,17 +8438,21 @@ for ((i = 0; i < "\${#args[@]}"; ++i)); do
     esac
 done
 "$(dirname "$0")/.$(basename "$0")" "\${args[@]}"`;
-                await fs.promises.writeFile(beeBackend, wrapperSource, { encoding: 'utf-8', mode: 0o755 });
-            }
+            // written under a temporary name and renamed over bee_backend, so a stop at any point leaves either the
+            // original (still linked as .bee_backend) or the whole wrapper, never neither
+            const tempWrapper = path.join(dataPath, `.bee_backend.${(0, crypto_1.randomUUID)()}.tmp`);
+            await fs.promises.writeFile(tempWrapper, wrapperSource, { encoding: 'utf-8', mode: 0o755, flag: 'wx' });
+            await fs.promises.rename(tempWrapper, beeBackend);
         }
     }
     /**
      * Gets the specified Unity release info from the Unity Releases API.
      * Supports querying by exact version or by prefix (e.g., "2020", "2020.1", "2021.x", "2021.3.x").
      * @param unityVersion The Unity version to get the release info for.
+     * @param channels Letter channels to accept (`f`, `p`, `b`, `a`, `x`). Default stable-only.
      * @returns The Unity release info.
      */
-    async GetEditorReleaseInfo(unityVersion) {
+    static async GetEditorReleaseInfo(unityVersion, channels = ['f']) {
         // Prefer querying the releases API with the exact fully-qualified Unity version (e.g., 2022.3.10f1).
         // If we don't have a fully-qualified version, use the most specific prefix available:
         //  - "YYYY.M" when provided (e.g., 6000.1)
@@ -6675,6 +8472,7 @@ done
             }
         }
         const releasesClient = new unity_releases_api_1.UnityReleasesClient();
+        const channelSet = new Set(channels.map(c => c.toLowerCase()));
         function getPlatform() {
             switch (process.platform) {
                 case 'darwin':
@@ -6687,6 +8485,10 @@ done
                     throw new Error(`Unsupported platform: ${process.platform}`);
             }
         }
+        function releaseChannelLetter(releaseVersion) {
+            const m = /^(\d{1,4})\.(\d+)\.(\d+)([abcfpx])(\d+)$/.exec(releaseVersion);
+            return m?.[4];
+        }
         const request = {
             url: '/unity/editor/release/v1/releases',
             query: {
@@ -6697,7 +8499,7 @@ done
                 order: 'RELEASE_DATE_DESC',
             }
         };
-        this.logger.debug(`Get Unity Release: ${JSON.stringify(request, null, 2)}`);
+        logging_1.Logger.instance.debug(`Get Unity Release: ${JSON.stringify(request, null, 2)}`);
         async function getRelease() {
             const { data, error } = await releasesClient.api.Release.getUnityReleases(request);
             if (error) {
@@ -6706,30 +8508,36 @@ done
             if (!data || !data.results || data.results.length === 0) {
                 throw new Error(`No Unity releases found for version: ${version}`);
             }
-            // Filter to stable 'f' releases only unless the user explicitly asked for a pre-release
-            const isExplicitPrerelease = /[abcpx]$/.test(unityVersion.version) || /[abcpx]/.test(unityVersion.version);
             const releases = (data.results || [])
                 .filter((release) => {
                 const v = release.version;
                 if (v == null || v === '') {
                     return false;
                 }
-                return isExplicitPrerelease || v.includes('f');
+                // Exact FQ request: accept that row regardless of channel filter.
+                if (fullUnityVersionPattern.test(unityVersion.version) && v === unityVersion.version) {
+                    return true;
+                }
+                const letter = releaseChannelLetter(v);
+                return letter != null && channelSet.has(letter);
             })
                 .map(release => ({
                 unityRelease: release,
                 unityVersion: new unity_version_1.UnityVersion(release.version, release.shortRevision, unityVersion.architecture)
             }));
             if (releases.length === 0) {
-                throw new Error(`No suitable Unity releases (stable) found for version: ${version}`);
+                const channelList = [...channelSet].join(',');
+                throw new Error(`No suitable Unity releases (channels: ${channelList}) found for version: ${version}` +
+                    (channelSet.has('f') && channelSet.size === 1
+                        ? `. No stable (f) release for ${version}; use --channel b/a or a fully-qualified version.`
+                        : ''));
             }
             releases.sort((a, b) => unity_version_1.UnityVersion.compare(b.unityVersion, a.unityVersion));
             logging_1.Logger.instance.debug(`Found ${releases.length} matching Unity releases for version: ${version}`);
             releases.forEach(release => {
                 logging_1.Logger.instance.debug(` - ${release.unityRelease.version} (${release.unityRelease.shortRevision}) - ${release.unityRelease.recommended}`);
             });
-            const latest = releases[0].unityRelease;
-            return latest;
+            return releases[0].unityRelease;
         }
         try {
             return await getRelease();
@@ -6742,216 +8550,19 @@ done
             throw new Error(`Failed to get Unity releases: ${error}`);
         }
     }
-    async fallbackVersionLookup(unityVersion) {
-        if (!unityVersion.isFullyQualified()) {
-            throw new Error(`Cannot lookup changeset for non-fully-qualified Unity version: ${unityVersion.toString()}`);
-        }
+    static async fallbackVersionLookup(unityVersion) {
         const url = `https://unity.com/releases/editor/whats-new/${unityVersion.version}`;
-        this.logger.debug(`Fetching release page: "${url}"`);
-        let response;
-        try {
-            response = await fetch(url);
-        }
-        catch (error) {
-            this.logger.warn(`Failed to fetch changeset for Unity ${unityVersion.toString()}: ${error}`);
-            return unityVersion;
-        }
+        logging_1.Logger.instance.debug(`Fetching release page: "${url}"`);
+        const response = await fetch(url);
         const responseText = await response.text();
-        if (!response.ok) {
-            this.logger.info(responseText);
-        }
         if (!response.ok) {
             throw new Error(`Failed to fetch changeset for Unity ${unityVersion.toString()} [${response.status}] "${url}"`);
         }
-        this.logger.debug(`Release page content: \n${responseText}`);
         const match = responseText.match(/unityhub:\/\/(?<version>\d+\.\d+\.\d+[abcfpx]?\d*)\/(?<changeset>[a-zA-Z0-9]+)/);
         if (match && match.groups && match.groups.version && match.groups.changeset) {
             return new unity_version_1.UnityVersion(match.groups.version, match.groups.changeset, unityVersion.architecture);
         }
-        this.logger.error(`Failed to find changeset for Unity ${unityVersion.toString()}`);
-        return unityVersion;
-    }
-    async checkEditorModules(editorPath, unityVersion, modules) {
-        let args = ['install-modules', '--version', unityVersion.version];
-        if (unityVersion.architecture) {
-            args.push('-a', unityVersion.architecture.toLowerCase());
-        }
-        for (const module of modules) {
-            args.push('-m', module);
-        }
-        const editorRootPath = unity_editor_1.UnityEditor.GetEditorRootPath(editorPath);
-        const modulesPath = path.join(editorRootPath, 'modules.json');
-        this.logger.debug(`Editor Modules Manifest:\n  > "${modulesPath}"`);
-        const output = await this.Exec([...args, '--cm'], { showCommand: true, silent: false });
-        const moduleMatches = output.matchAll(/Omitting module (?<module>.+) because it's already installed/g);
-        if (moduleMatches) {
-            const omittedModules = [...moduleMatches].map(match => match.groups?.module);
-            for (const module of omittedModules) {
-                if (module && !modules.includes(module)) {
-                    modules.push(module);
-                }
-            }
-        }
-        const installedModules = [...modules];
-        const additionalModules = [];
-        const additionalModulesJson = await this.getModulesContent(modulesPath);
-        if (additionalModulesJson.length > 0) {
-            for (const module of additionalModulesJson) {
-                if (module.category === "Platforms" && module.visible === true) {
-                    if (!installedModules.includes(module.id)) {
-                        additionalModules.push(module.id);
-                    }
-                }
-            }
-        }
-        return [installedModules, additionalModules];
-    }
-    async getModulesContent(modulesPath) {
-        const modulesContent = await (0, utilities_1.ReadFileContents)(modulesPath);
-        return JSON.parse(modulesContent);
-    }
-    async installUnity(unityVersion, modules) {
-        if (unityVersion.isLegacy()) {
-            return await this.installUnity4x(unityVersion);
-        }
-        if (process.platform === 'linux') {
-            const arch = process.arch === 'x64' ? 'amd64' : process.arch === 'arm64' ? 'arm64' : process.arch;
-            // install older versions of libssl for older Unity versions
-            if (['2019.1', '2019.2'].some(v => unityVersion.version.startsWith(v))) {
-                const url = `https://archive.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.0.0_1.0.2g-1ubuntu4.20_${arch}.deb`;
-                const downloadPath = path.join((0, utilities_1.GetTempDir)(), `libssl1.0.0_1.0.2g-1ubuntu4.20_${arch}.deb`);
-                await (0, utilities_1.DownloadFile)(url, downloadPath);
-                try {
-                    await (0, utilities_1.Exec)('sudo', ['dpkg', '-i', downloadPath]);
-                }
-                finally {
-                    fs.promises.unlink(downloadPath);
-                }
-            }
-            else if (['2019.3', '2019.4'].some(v => unityVersion.version.startsWith(v)) ||
-                unityVersion.version.startsWith('2020.') ||
-                unityVersion.version.startsWith('2021.')) {
-                const url = `https://archive.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.0g-2ubuntu4_${arch}.deb`;
-                const downloadPath = path.join((0, utilities_1.GetTempDir)(), `libssl1.1_1.1.0g-2ubuntu4_${arch}.deb`);
-                await (0, utilities_1.DownloadFile)(url, downloadPath);
-                try {
-                    await (0, utilities_1.Exec)('sudo', ['dpkg', '-i', downloadPath]);
-                }
-                finally {
-                    fs.promises.unlink(downloadPath);
-                }
-            }
-        }
-        this.logger.ci(`Installing Unity ${unityVersion.toString()}...`);
-        const args = ['install', '--version', unityVersion.version];
-        if (unityVersion.changeset) {
-            args.push('--changeset', unityVersion.changeset);
-        }
-        if (unityVersion.architecture) {
-            args.push('-a', unityVersion.architecture.toLowerCase());
-        }
-        if (modules.length > 0) {
-            for (const module of modules) {
-                this.logger.ci(`  > with module: ${module}`);
-                args.push('-m', module);
-            }
-            args.push('--cm');
-        }
-        const output = await this.Exec(args, { showCommand: true, silent: false });
-        if (output.includes(`Error while installing an editor or a module from changeset`) ||
-            output.includes(`failed to download.`)) {
-            throw new Error(`Failed to install Unity ${unityVersion.toString()}`);
-        }
-    }
-    async installUnity4x(unityVersion) {
-        this.logger.ci(`Installing Unity ${unityVersion.toString()}...`);
-        const hubInstallDir = await this.GetInstallPath();
-        switch (process.platform) {
-            case 'win32': {
-                const installDir = path.join(hubInstallDir, `Unity ${unityVersion.version}`);
-                const installPath = path.join(installDir, 'Unity.exe');
-                if (!fs.existsSync(installPath)) {
-                    const url = `https://beta.unity3d.com/download/UnitySetup-${unityVersion.version}.exe`;
-                    const installerPath = path.join((0, utilities_1.GetTempDir)(), `UnitySetup-${unityVersion.version}.exe`);
-                    await (0, utilities_1.DownloadFile)(url, installerPath);
-                    this.logger.info(`Running Unity ${unityVersion.toString()} installer...`);
-                    try {
-                        await (0, utilities_1.Exec)('powershell', [
-                            '-Command',
-                            `Start-Process -FilePath \"${installerPath}\" -ArgumentList \"/S /D=${installDir}\" -Wait`
-                        ], { silent: true, showCommand: true });
-                    }
-                    catch (error) {
-                        this.logger.error(`Failed to install Unity ${unityVersion.toString()}: ${error}`);
-                    }
-                    finally {
-                        fs.promises.unlink(installerPath);
-                    }
-                }
-                await fs.promises.access(installDir, fs.constants.R_OK | fs.constants.X_OK);
-                return installDir;
-            }
-            case 'darwin': {
-                const installDir = path.join(hubInstallDir, `Unity ${unityVersion.version}`, 'Unity.app');
-                if (!fs.existsSync(installDir)) {
-                    const url = `https://beta.unity3d.com/download/unity-${unityVersion.version}.dmg`;
-                    const installerPath = path.join((0, utilities_1.GetTempDir)(), `UnitySetup-${unityVersion.version}.dmg`);
-                    await (0, utilities_1.DownloadFile)(url, installerPath);
-                    this.logger.info(`Running Unity ${unityVersion.toString()} installer...`);
-                    let mountPoint = '';
-                    try {
-                        const output = await (0, utilities_1.Exec)('hdiutil', ['attach', installerPath, '-nobrowse'], { silent: true, showCommand: true });
-                        const mountPointMatch = output.match(/\/Volumes\/Unity Installer.*$/m);
-                        if (!mountPointMatch || mountPointMatch.length === 0) {
-                            throw new Error(`Failed to find mount point in hdiutil output: ${output}`);
-                        }
-                        mountPoint = mountPointMatch[0];
-                        this.logger.debug(`Mounted Unity Installer at ${mountPoint}`);
-                        const pkgPath = path.join(mountPoint, 'Unity.pkg');
-                        await fs.promises.access(pkgPath, fs.constants.R_OK);
-                        this.logger.debug(`Found .pkg installer: ${pkgPath}`);
-                        await (0, utilities_1.Exec)('sudo', ['installer', '-pkg', pkgPath, '-target', '/', '-verboseR'], { silent: true, showCommand: true });
-                        const unityAppPath = path.join('/Applications', 'Unity');
-                        const targetPath = path.join(hubInstallDir, `Unity ${unityVersion.version}`);
-                        if (fs.existsSync(unityAppPath)) {
-                            this.logger.debug(`Moving ${unityAppPath} to ${targetPath}...`);
-                            await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
-                            const items = await fs.promises.readdir(unityAppPath);
-                            for (const item of items) {
-                                if (item !== 'Hub') {
-                                    const src = path.join(unityAppPath, item);
-                                    const dest = path.join(targetPath, item);
-                                    this.logger.debug(`  > Moving ${src} to ${dest}`);
-                                    await fs.promises.cp(src, dest, { recursive: true });
-                                    await fs.promises.rm(src, { recursive: true, force: true });
-                                }
-                            }
-                            await fs.promises.chmod(targetPath, 0o777);
-                        }
-                        else {
-                            throw new Error(`Failed to find Unity.app after installation.`);
-                        }
-                    }
-                    catch (error) {
-                        this.logger.error(`Failed to mount Unity ${unityVersion.toString()} installer: ${error}`);
-                    }
-                    finally {
-                        try {
-                            if (mountPoint && mountPoint.length > 0) {
-                                await (0, utilities_1.Exec)('hdiutil', ['detach', mountPoint, '-quiet'], { silent: true, showCommand: true });
-                            }
-                        }
-                        finally {
-                            await fs.promises.unlink(installerPath);
-                        }
-                    }
-                }
-                await fs.promises.access(installDir, fs.constants.R_OK | fs.constants.X_OK);
-                return installDir;
-            }
-            default:
-                throw new Error(`Unity ${unityVersion.toString()} is not supported on ${process.platform}`);
-        }
+        throw new Error(`Failed to find changeset for Unity ${unityVersion.toString()} in "${url}"`);
     }
     /**
      * Get the mapping of Unity platform targets to their corresponding module identifiers for the current OS.
@@ -6959,18 +8570,16 @@ done
      */
     static GetPlatformTargetModuleMap() {
         const osType = os.type();
-        let moduleMap;
         switch (osType) {
             case 'Linux':
-                moduleMap = {
+                return {
                     "StandaloneLinux64": "linux-il2cpp",
                     "Android": "android",
                     "WebGL": "webgl",
                     "iOS": "ios",
                 };
-                break;
             case 'Darwin':
-                moduleMap = {
+                return {
                     "StandaloneOSX": "mac-il2cpp",
                     "iOS": "ios",
                     "Android": "android",
@@ -6979,9 +8588,8 @@ done
                     "WebGL": "webgl",
                     "VisionOS": "visionos"
                 };
-                break;
             case 'Windows_NT':
-                moduleMap = {
+                return {
                     "StandaloneWindows64": "windows-il2cpp",
                     "WSAPlayer": "universal-windows-platform",
                     "Android": "android",
@@ -6991,55 +8599,149 @@ done
                     "Lumin": "lumin",
                     "WebGL": "webgl",
                 };
-                break;
             default:
                 throw Error(`${osType} not supported`);
         }
-        return moduleMap;
-    }
-    /**
-     * Returns the path to the Unity Hub log file.
-     * @see https://docs.unity.com/en-us/licensing-server/troubleshooting-client#logs
-     * @returns The Unity Hub log file path.
-     */
-    static LogPath() {
-        switch (process.platform) {
-            case 'win32':
-                // %APPDATA%\UnityHub\logs\info-log.json
-                return path.join(process.env.APPDATA || '', 'UnityHub', 'logs', 'info-log.json');
-            case 'darwin':
-                // ~/Library/Application Support/UnityHub/logs/info-log.json
-                return path.join(process.env.HOME || '', 'Library', 'Application Support', 'UnityHub', 'logs', 'info-log.json');
-            case 'linux':
-                // ~/.config/UnityHub/logs/info-log.json
-                return path.join(process.env.HOME || '', '.config', 'UnityHub', 'logs', 'info-log.json');
-            default:
-                throw new Error(`Unsupported platform: ${process.platform}`);
-        }
-    }
-    /**
-     * Returns the path to the Unity Package Manager log file.
-     * @see https://docs.unity3d.com/Manual/LogFiles.html
-     * @returns The Unity Package Manager log file path.
-     */
-    static PackageManagerLogsPath() {
-        switch (process.platform) {
-            case 'win32':
-                // C:\Users\username\AppData\Local\Unity\Editor\upm.log
-                return path.join(process.env.LOCALAPPDATA || '', 'Unity', 'Editor', 'upm.log');
-            case 'darwin':
-                // ~/Library/Logs/Unity/upm.log
-                return path.join(process.env.HOME || '', 'Library', 'Logs', 'Unity', 'upm.log');
-            case 'linux':
-                // ~/.config/unity3d/upm.log
-                return path.join(process.env.HOME || '', '.config', 'unity3d', 'upm.log');
-            default:
-                throw new Error(`Unsupported platform: ${process.platform}`);
-        }
     }
 }
-exports.UnityHub = UnityHub;
-//# sourceMappingURL=unity-hub.js.map
+exports.UnityInstaller = UnityInstaller;
+/**
+ * Resolves an install directory, Editor folder, app bundle or executable to the editor executable.
+ * @param location A path the editor may be under.
+ * @returns The editor executable, or undefined when none is found.
+ */
+function resolveEditorExecutable(location) {
+    if (!location || !fs.existsSync(location)) {
+        return undefined;
+    }
+    if (fs.statSync(location).isFile()) {
+        return location;
+    }
+    let candidates;
+    switch (process.platform) {
+        case 'darwin':
+            candidates = [
+                path.join(location, 'Unity.app', 'Contents', 'MacOS', 'Unity'),
+                path.join(location, 'Contents', 'MacOS', 'Unity'),
+            ];
+            break;
+        case 'win32':
+            candidates = [
+                path.join(location, 'Editor', 'Unity.exe'),
+                path.join(location, 'Unity.exe'),
+            ];
+            break;
+        default:
+            candidates = [
+                path.join(location, 'Editor', 'Unity'),
+                path.join(location, 'Unity'),
+            ];
+            break;
+    }
+    return candidates.find(candidate => fs.existsSync(candidate) && fs.statSync(candidate).isFile());
+}
+/**
+ * A fresh temp path for a downloaded installer. The name is random rather than taken from the URL,
+ * so nothing from the requested version reaches the installer command line.
+ * @param extension The installer's file extension, e.g. .pkg.
+ */
+function tempInstallerPath(extension) {
+    return path.join((0, utilities_1.GetTempDir)(), `unity-installer-${(0, crypto_1.randomUUID)()}${extension}`);
+}
+/**
+ * Gives the runner's user something a macOS package installed under /Applications/Unity. The installer runs as root,
+ * so its files are root-owned and cannot be moved or removed otherwise, such as PlaybackEngines/AndroidPlayer.
+ * @param source A path under /Applications/Unity, never one from a caller, since it runs as root.
+ * @param recursive Whether to claim everything below it too.
+ */
+async function claimMacInstalledItem(source, recursive) {
+    if (!(0, process_tracker_1.IsPathUnder)(source, path.join('/Applications', 'Unity'))) {
+        throw new Error(`Refusing to take ownership of ${source}`);
+    }
+    const { uid, gid } = os.userInfo();
+    // -h changes a symlink itself, so a broken one does not fail the walk
+    await (0, utilities_1.Exec)('sudo', ['chown', ...(recursive ? ['-R'] : []), '-h', `${uid}:${gid}`, source], { silent: true, showCommand: true });
+    await (0, utilities_1.Exec)('sudo', ['chmod', ...(recursive ? ['-R'] : []), 'u+w', source], { silent: true, showCommand: true });
+}
+/**
+ * Moves something a macOS package installed. Older editors ship symlinks whose targets are gone, such as 5.6's
+ * MonoDevelop.app, which fs.cp fails on, so links are moved or recreated as they are.
+ */
+async function moveMacInstalledItem(source, destination) {
+    await fs.promises.rm(destination, { recursive: true, force: true });
+    try {
+        await fs.promises.rename(source, destination);
+    }
+    catch (error) {
+        // the install path can be on another volume than /Applications
+        if (error.code !== 'EXDEV') {
+            throw error;
+        }
+        await copyKeepingSymlinks(source, destination);
+        await fs.promises.rm(source, { recursive: true, force: true });
+    }
+}
+async function copyKeepingSymlinks(source, destination) {
+    const stat = await fs.promises.lstat(source);
+    if (stat.isSymbolicLink()) {
+        await fs.promises.symlink(await fs.promises.readlink(source), destination);
+    }
+    else if (stat.isDirectory()) {
+        await fs.promises.mkdir(destination, { mode: stat.mode & 0o7777 });
+        for (const entry of await fs.promises.readdir(source)) {
+            await copyKeepingSymlinks(path.join(source, entry), path.join(destination, entry));
+        }
+    }
+    else {
+        await fs.promises.copyFile(source, destination);
+        await fs.promises.chmod(destination, stat.mode & 0o7777);
+    }
+}
+/**
+ * Reads the CPU architectures of a macOS editor binary from its Mach-O header.
+ * @param executablePath The editor executable.
+ * @returns The architectures, or undefined off macOS or when the header is not recognized, in which case callers accept the editor.
+ */
+function getExecutableArchitectures(executablePath) {
+    if (process.platform !== 'darwin') {
+        return undefined;
+    }
+    const cpuTypes = { 0x01000007: 'X86_64', 0x0100000c: 'ARM64' };
+    let header;
+    try {
+        const fd = fs.openSync(executablePath, 'r');
+        try {
+            header = Buffer.alloc(4096);
+            fs.readSync(fd, header, 0, header.length, 0);
+        }
+        finally {
+            fs.closeSync(fd);
+        }
+    }
+    catch {
+        return undefined;
+    }
+    const magic = header.readUInt32BE(0);
+    if (magic === 0xcafebabe) {
+        // fat binary: big-endian count, then 20 bytes per architecture with the CPU type first
+        const count = header.readUInt32BE(4);
+        const architectures = [];
+        for (let i = 0; i < count && 8 + i * 20 + 4 <= header.length; i++) {
+            const architecture = cpuTypes[header.readUInt32BE(8 + i * 20)];
+            if (architecture && !architectures.includes(architecture)) {
+                architectures.push(architecture);
+            }
+        }
+        return architectures.length > 0 ? architectures : undefined;
+    }
+    if (magic === 0xcffaedfe) {
+        // thin 64-bit binary, little-endian
+        const architecture = cpuTypes[header.readUInt32LE(4)];
+        return architecture ? [architecture] : undefined;
+    }
+    return undefined;
+}
+//# sourceMappingURL=unity-installer.js.map
 
 /***/ }),
 
@@ -7083,6 +8785,8 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.ActionTableRenderer = void 0;
+exports.isStackFrameLine = isStackFrameLine;
+exports.isErrorRecapLine = isErrorRecapLine;
 exports.sanitizeTelemetryJson = sanitizeTelemetryJson;
 exports.formatUtpUnrecognizedTopLevelPropertiesMessage = formatUtpUnrecognizedTopLevelPropertiesMessage;
 exports.describeUtpForUtpLogLevel = describeUtpForUtpLogLevel;
@@ -7096,6 +8800,38 @@ const path = __importStar(__nccwpck_require__(1017));
 const logging_1 = __nccwpck_require__(4486);
 const utilities_1 = __nccwpck_require__(9746);
 const utp_1 = __nccwpck_require__(6282);
+const utp_benign_1 = __nccwpck_require__(6239);
+/** Upper bound on error lines kept in memory for the failure recap. */
+const MAX_RECAP_STORED_LINES = 1000;
+/**
+ * True for a stack frame line, which the failure recap leaves out: managed `  at ...` frames,
+ * Unity's `Class:Method (args)` frames, `(Filename: ... Line: N)` trailers and native `#N 0x...` frames.
+ * @param line A log line.
+ */
+function isStackFrameLine(line) {
+    const trimmed = line.trim();
+    return /^at\s/.test(trimmed) ||
+        (trimmed.startsWith('(Filename: ') && / Line: -?\d+\)$/.test(trimmed)) ||
+        /^#\d+\s/.test(trimmed) ||
+        /^0x[0-9a-f]+\s/i.test(trimmed) ||
+        // Class:Method (args) [(at file:line)]: an anchored prefix plus a closing parenthesis keeps this linear
+        (/^[\w.`<>[\]+]+:[\w.`<>[\]+]+ ?\(/.test(trimmed) && trimmed.endsWith(')'));
+}
+/**
+ * True for a log line the failure recap lists: an error marker, an exception, a failure or a fatal batch mode message.
+ * @param line A log line.
+ */
+function isErrorRecapLine(line) {
+    if (/\b0 errors?\b/i.test(line)) {
+        return false;
+    }
+    return /\berror\b/i.test(line) ||
+        /Exception\b/.test(line) ||
+        /\bfatal\b/i.test(line) ||
+        /\bFailed to\b/i.test(line) ||
+        /^Aborting batchmode/.test(line) ||
+        /No valid Unity Editor license found/.test(line);
+}
 // Detects workflow command markers to avoid emitting duplicate annotations
 const annotationCommandPrefixRegex = /\n::[a-z]+::/i;
 // Matches ANSI escape sequences (CSI and single-character)
@@ -7979,30 +9715,12 @@ async function writeUtpTelemetryLog(filePath, entries, logger) {
     }
 }
 /**
- * Editor log messages whose severity has been changed.
- * Useful for making certain error messages that are not critical less noisy.
- * Key is a substring of the log message, value is the remapped LogLevel.
- */
-const remappedEditorLogs = {
-    'OpenCL device, baking cannot use GPU lightmapper.': logging_1.LogLevel.INFO,
-    'Failed to find a suitable OpenCL device, baking cannot use GPU lightmapper.': logging_1.LogLevel.INFO,
-    '~StackAllocator(ALLOC_TEMP_MAIN) m_LastAlloc not NULL. Did you forget to call FreeAllStackAllocations()?': logging_1.LogLevel.INFO,
-};
-function getRemappedEditorLogLevel(message) {
-    for (const [fragment, level] of Object.entries(remappedEditorLogs)) {
-        if (message.includes(fragment)) {
-            return level;
-        }
-    }
-    return undefined;
-}
-/**
  * Tails a log file using fs.watch and ReadStream for efficient reading.
  * @param logPath The path to the log file to tail.
  * @param projectPath The path to the project (used for log annotation).
  * @returns An object containing the tail promise and signalEnd function.
  */
-function TailLogFile(logPath, projectPath) {
+function TailLogFile(logPath, projectPath, redactLiterals = []) {
     let logEnded = false;
     let lastSize = 0;
     const logPollingInterval = 250;
@@ -8020,6 +9738,18 @@ function TailLogFile(logPath, projectPath) {
     const actionTableRenderer = new ActionTableRenderer((0, utilities_1.isStdoutTTY)());
     const utpLogPath = buildUtpLogPath(logPath);
     let telemetryFlushed = false;
+    const errorLines = [];
+    const seenErrorLines = new Set();
+    const recordErrorLine = (line) => {
+        const trimmed = line.trim();
+        if (trimmed.length === 0 || seenErrorLines.has(trimmed) || isStackFrameLine(trimmed)) {
+            return;
+        }
+        seenErrorLines.add(trimmed);
+        if (errorLines.length < MAX_RECAP_STORED_LINES) {
+            errorLines.push(trimmed);
+        }
+    };
     const buildIssueKey = (file, lineNo, message) => {
         const normalized = normalizeAnnotationPath(file, projectPath);
         const canonicalFile = (normalized.absoluteFile ?? normalizePathSlashes(file ?? '')).toLowerCase();
@@ -8054,7 +9784,8 @@ function TailLogFile(logPath, projectPath) {
         }
     };
     const processLogLine = (rawLine) => {
-        const line = rawLine.trim();
+        // the Editor log echoes its command line, so values like -password are redacted before anything is printed or parsed
+        const line = (0, utilities_1.redactSensitiveLiterals)(rawLine, redactLiterals).trim();
         if (!line) {
             return;
         }
@@ -8097,13 +9828,9 @@ function TailLogFile(logPath, projectPath) {
                         }
                     }
                 }
-                if (utp.message && 'severity' in utp &&
-                    (utp.severity === utp_1.Severity.Error || utp.severity === utp_1.Severity.Exception || utp.severity === utp_1.Severity.Assert)) {
-                    let messageLevel = logging_1.LogLevel.ERROR;
-                    const remappedLevel = getRemappedEditorLogLevel(utp.message);
-                    if (remappedLevel !== undefined) {
-                        messageLevel = remappedLevel;
-                    }
+                if (utp.message && 'severity' in utp && (0, utp_1.isElevatedUtpSeverity)(utp.severity)) {
+                    // the message only; its stack trace stays out of the failure recap
+                    recordErrorLine(utp.message.split(/\r?\n/)[0] ?? '');
                     const normalizedPath = normalizeAnnotationPath(utp.file, projectPath);
                     const stacktrace = sanitizeStackTrace(utp.stackTrace);
                     const message = stacktrace == undefined ? utp.message : `${utp.message}\n${stacktrace}`;
@@ -8121,19 +9848,16 @@ function TailLogFile(logPath, projectPath) {
                             }
                         }
                         else {
-                            switch (messageLevel) {
-                                case logging_1.LogLevel.WARN:
-                                    logger.warn(message);
-                                    break;
-                                case logging_1.LogLevel.ERROR:
-                                    logger.error(message);
-                                    break;
-                                case logging_1.LogLevel.INFO:
-                                default:
-                                    logger.info(message);
-                                    break;
-                            }
+                            logger.error(message);
                         }
+                    }
+                }
+                else if (utp.message && (0, utp_benign_1.utpMessageMatchesBenignRemap)(utp.message)) {
+                    // Remapped at normalize time (e.g. multicast WSAEACCES); surface as info, not error.
+                    const stacktrace = sanitizeStackTrace(utp.stackTrace);
+                    const message = stacktrace == undefined ? utp.message : `${utp.message}\n${stacktrace}`;
+                    if (!annotationCommandPrefixRegex.test(message)) {
+                        logger.info(message);
                     }
                 }
                 else if (logging_1.Logger.instance.logLevel === logging_1.LogLevel.UTP) {
@@ -8145,8 +9869,25 @@ function TailLogFile(logPath, projectPath) {
             }
         }
         else {
+            // Skip plain-log false positives (e.g. "Socket: bind failed, error: …" matching \berror\b).
+            if ((0, utp_benign_1.utpMessageMatchesBenignRemap)(line)) {
+                if (logging_1.Logger.instance.logLevel !== logging_1.LogLevel.UTP) {
+                    process.stdout.write(`${line}\n`);
+                }
+                return;
+            }
             const scan = parsePlainLogIssue(line);
+            if (((scan && scan.severity === utp_1.Severity.Error) || isErrorRecapLine(line)) &&
+                !(scan && (0, utp_benign_1.utpMessageMatchesBenignRemap)(scan.message))) {
+                recordErrorLine(line);
+            }
             if (scan) {
+                if ((0, utp_benign_1.utpMessageMatchesBenignRemap)(scan.message)) {
+                    if (logging_1.Logger.instance.logLevel !== logging_1.LogLevel.UTP) {
+                        process.stdout.write(`${line}\n`);
+                    }
+                    return;
+                }
                 const key = buildIssueKey(scan.file, scan.line, scan.message);
                 if (!seenIssueKeys.has(key)) {
                     seenIssueKeys.add(key);
@@ -8296,7 +10037,7 @@ function TailLogFile(logPath, projectPath) {
     function stopLogTail() {
         logEnded = true;
     }
-    return { tailPromise, stopLogTail, telemetry };
+    return { tailPromise, stopLogTail, telemetry, errorLines, errorLineCount: () => seenErrorLines.size };
 }
 //# sourceMappingURL=unity-logging.js.map
 
@@ -8384,6 +10125,86 @@ class UnityProject {
         this.version = new unity_version_1.UnityVersion(match.groups.version, match.groups?.changeset, undefined);
     }
     /**
+     * The build targets of the build profiles saved under the project's Assets folder (Unity 6 and newer).
+     * @returns Build target names such as Android or StandaloneWindows64, without duplicates.
+     */
+    GetBuildProfileTargets() {
+        const targets = new Set();
+        const pending = [path_1.default.join(this.projectPath, 'Assets')];
+        while (pending.length > 0) {
+            const dir = pending.pop();
+            let entries;
+            try {
+                entries = fs_1.default.readdirSync(dir, { withFileTypes: true });
+            }
+            catch {
+                continue;
+            }
+            for (const entry of entries) {
+                const entryPath = path_1.default.join(dir, entry.name);
+                if (entry.isDirectory()) {
+                    pending.push(entryPath);
+                    continue;
+                }
+                if (!entry.isFile() || !entry.name.endsWith('.asset')) {
+                    continue;
+                }
+                const target = UnityProject.readBuildProfileTarget(UnityProject.readBuildProfileAsset(entryPath));
+                if (target) {
+                    targets.add(target);
+                }
+            }
+        }
+        return [...targets];
+    }
+    /**
+     * Reads an asset that may be a build profile through one open handle, so the checks and the read see the same file.
+     * Only the first kilobyte is read unless it names the BuildProfile script, so a large project's other assets are
+     * not read in full. Other, larger than 1 MB or unreadable files read as empty.
+     */
+    static readBuildProfileAsset(filePath) {
+        let fd;
+        try {
+            fd = fs_1.default.openSync(filePath, 'r');
+            const head = Buffer.alloc(1024);
+            const headLength = fs_1.default.readSync(fd, head, 0, head.length, 0);
+            if (!head.subarray(0, headLength).toString('utf-8').includes('fileID: 15003,') || fs_1.default.fstatSync(fd).size > 1024 * 1024) {
+                return '';
+            }
+            return fs_1.default.readFileSync(fd, 'utf-8');
+        }
+        catch {
+            return '';
+        }
+        finally {
+            if (fd !== undefined) {
+                fs_1.default.closeSync(fd);
+            }
+        }
+    }
+    /** BuildTarget enum values a build profile stores, by name. */
+    static BuildTargetNames = {
+        2: 'StandaloneOSX',
+        5: 'StandaloneWindows',
+        9: 'iOS',
+        13: 'Android',
+        19: 'StandaloneWindows64',
+        20: 'WebGL',
+        21: 'WSAPlayer',
+        24: 'StandaloneLinux64',
+        37: 'tvOS',
+        47: 'VisionOS',
+    };
+    /** The build target of a BuildProfile asset, or undefined for any other asset. */
+    static readBuildProfileTarget(asset) {
+        // BuildProfile is a built-in MonoBehaviour: script fileID 15003 in the editor's built-in guid
+        if (!asset.includes('fileID: 15003, guid: 0000000000000000e000000000000000') || !asset.includes('m_PlatformBuildProfile:')) {
+            return undefined;
+        }
+        const match = /^ {2}m_BuildTarget: (\d+)\r?$/m.exec(asset);
+        return match ? UnityProject.BuildTargetNames[Number(match[1])] ?? `BuildTarget(${match[1]})` : undefined;
+    }
+    /**
      * Gets the Unity project located at the specified path, or the current working directory if no path is provided.
      * @param projectPath The path to the Unity project. If undefined, the current working directory is used.
      * @returns The UnityProject instance representing the project at the specified path.
@@ -8403,6 +10224,425 @@ class UnityProject {
 }
 exports.UnityProject = UnityProject;
 //# sourceMappingURL=unity-project.js.map
+
+/***/ }),
+
+/***/ 2954:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.UnitySecurityAlertError = exports.SECURITY_ALERT_ENV = exports.SECURITY_ALERT_TITLE = void 0;
+exports.IsSecurityAlertAllowedByEnv = IsSecurityAlertAllowedByEnv;
+exports.IsSecurityLabel = IsSecurityLabel;
+exports.ParseLabelDescription = ParseLabelDescription;
+exports.FormatCliWarning = FormatCliWarning;
+exports.IsSecurityCliWarning = IsSecurityCliWarning;
+exports.GetUnitySecurityAlert = GetUnitySecurityAlert;
+exports.GetLegacySecurityAlert = GetLegacySecurityAlert;
+exports.FormatUnitySecurityAlert = FormatUnitySecurityAlert;
+exports.ReportUnitySecurityAlert = ReportUnitySecurityAlert;
+exports.BuildSecurityAlertRerunCommand = BuildSecurityAlertRerunCommand;
+exports.QuoteShellArgument = QuoteShellArgument;
+const logging_1 = __nccwpck_require__(4486);
+const unity_version_1 = __nccwpck_require__(3331);
+const unity_releases_api_1 = __nccwpck_require__(7278);
+/** Annotation title for a Unity Security Alert, as an error without the opt-in and a warning with it. */
+exports.SECURITY_ALERT_TITLE = 'Unity Security Alert';
+/** The Releases API's largest page, and a bound on the pages read for one branch. */
+const PAGE_SIZE = 25;
+const MAX_BRANCH_PAGES = 20;
+/** The environment variable that opts in to installing or selecting an editor with a security alert. */
+exports.SECURITY_ALERT_ENV = 'UNITY_ALLOW_SECURITY_ALERT';
+/** Thrown when an editor has a Unity Security Alert and the opt-in was not given. */
+class UnitySecurityAlertError extends Error {
+    title = exports.SECURITY_ALERT_TITLE;
+    constructor(message) {
+        super(message);
+        this.name = 'UnitySecurityAlertError';
+    }
+}
+exports.UnitySecurityAlertError = UnitySecurityAlertError;
+/**
+ * Whether UNITY_ALLOW_SECURITY_ALERT opts in to editors with a security alert.
+ * @returns true when it is 1 or true, ignoring case.
+ */
+function IsSecurityAlertAllowedByEnv() {
+    const value = process.env[exports.SECURITY_ALERT_ENV]?.trim().toLowerCase();
+    return value === '1' || value === 'true';
+}
+/**
+ * Whether a release label is a security alert: Security in its text, or Unity's error color.
+ * @param label The release's label, if any.
+ */
+function IsSecurityLabel(label) {
+    if (!label || typeof label !== 'object') {
+        return false;
+    }
+    return (typeof label.labelText === 'string' && /security/i.test(label.labelText)) ||
+        (typeof label.color === 'string' && label.color.toUpperCase() === 'ERROR');
+}
+/**
+ * Turns a label description into plain text and the links it carries. Tags are dropped and their text kept, so
+ * Unity's own wording prints as it is: an http or https link follows its text, as in "Read more: https://...",
+ * <br> becomes a space, entities are decoded, and links with any other scheme are dropped.
+ * @param description The label's HTML description.
+ */
+function ParseLabelDescription(description) {
+    if (!description) {
+        return { text: '', links: [] };
+    }
+    const links = [];
+    let text = '';
+    let index = 0;
+    let openLink;
+    let afterLink = false;
+    while (index < description.length) {
+        const char = description[index];
+        if (char !== '<') {
+            // terminals and log viewers take punctuation right after a URL into the link, so none is left there:
+            // at the end of the text it is dropped, and before more text it becomes a separator
+            if (afterLink && /[.,;:!?)]/.test(char)) {
+                if (hasTextAfter(description, index + 1)) {
+                    text += ' |';
+                }
+            }
+            else {
+                text += char;
+            }
+            afterLink = false;
+            index++;
+            continue;
+        }
+        const end = description.indexOf('>', index);
+        if (end === -1) {
+            break;
+        }
+        const tag = description.slice(index, end);
+        const href = /\bhref\s*=\s*["']([^"']*)["']/i.exec(tag);
+        if (href?.[1] && /^https?:\/\/[^\s"'<>]+$/i.test(href[1])) {
+            openLink = href[1];
+            if (!links.includes(href[1])) {
+                links.push(href[1]);
+            }
+        }
+        else if (/^<\/a\b/i.test(tag) && openLink) {
+            text += `: ${openLink}`;
+            openLink = undefined;
+            afterLink = true;
+        }
+        else if (/^<br\b/i.test(tag)) {
+            text += ' ';
+        }
+        index = end + 1;
+    }
+    // &amp; last, so an escaped entity such as &amp;lt; is not decoded twice
+    text = text
+        .replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Math.min(parseInt(code, 10), 0x10ffff)))
+        .replace(/&#x([0-9a-f]+);/gi, (_, code) => String.fromCodePoint(Math.min(parseInt(code, 16), 0x10ffff)))
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, '\'')
+        .replace(/&nbsp;/g, ' ')
+        .replace(/&amp;/g, '&');
+    // a <br> next to a space would otherwise leave two
+    return { text: sanitizeText(text).replace(/ {2,}/g, ' '), links };
+}
+/**
+ * Reads the text of a warning from the official Unity CLI's JSON `warnings`.
+ * @param warning One entry of the envelope's `warnings`.
+ */
+function FormatCliWarning(warning) {
+    if (typeof warning === 'string') {
+        return sanitizeText(warning);
+    }
+    if (warning && typeof warning === 'object') {
+        const record = warning;
+        if (typeof record.message === 'string') {
+            return sanitizeText(typeof record.code === 'string' && record.code.length > 0 ? `${record.code}: ${record.message}` : record.message);
+        }
+    }
+    return sanitizeText(JSON.stringify(warning) ?? '');
+}
+/**
+ * Whether a warning from the official Unity CLI is a security warning.
+ * @param warning One entry of the envelope's `warnings`.
+ */
+function IsSecurityCliWarning(warning) {
+    return /security/i.test(FormatCliWarning(warning));
+}
+/**
+ * Checks the Unity Releases API for a Unity Security Alert on an exact release.
+ * 4.x and 5.x are skipped, since the API lists only 2017 and newer. When the API cannot be reached, a warning is
+ * logged and the check passes, so an outage does not stop installs.
+ * @param unityVersion The exact release.
+ * @returns The alert, or undefined when the release has none or could not be checked.
+ */
+async function GetUnitySecurityAlert(unityVersion) {
+    const logger = logging_1.Logger.instance;
+    if (unityVersion.isLessThan('2017.0.0') || !unityVersion.isFullyQualified()) {
+        return undefined;
+    }
+    let label;
+    try {
+        const release = await findRelease(unityVersion);
+        if (!release) {
+            throw new Error(`Unity ${unityVersion.version} is not listed`);
+        }
+        label = release.label ?? undefined;
+    }
+    catch (error) {
+        logger.warn(`could not check Unity security status for ${unityVersion.version}: ${error instanceof Error ? error.message : error}`);
+        return undefined;
+    }
+    if (!IsSecurityLabel(label)) {
+        return undefined;
+    }
+    // Unity's text as it is, then the patched release and the advisory, which covers the binary patch tool
+    const { text, links } = ParseLabelDescription(label.description);
+    const patched = await getPatchedRelease(unityVersion);
+    return {
+        version: unityVersion.version,
+        // a link the text does not already carry still prints after it
+        summary: [text || sanitizeText(label.labelText ?? ''), patched, ...links.filter(link => !text.includes(link))].filter(part => part.length > 0).join(' | '),
+        patched,
+        details: [],
+    };
+}
+/** Known Unity Editor CVEs that affect 4.x and 5.x, with the first fixed release of each 5.x line. */
+const LEGACY_EDITOR_CVES = [
+    {
+        id: 'CVE-2017-12939',
+        summary: 'Windows editor RCE',
+        affects: (major) => major === 4 || major === 5,
+        fixed: { '5.3': '5.3.8p2', '5.4': '5.4.5p5', '5.5': '5.5.4p3', '5.6': '5.6.3p1' },
+    },
+    {
+        id: 'CVE-2019-9197',
+        summary: 'editor RCE',
+        affects: (major, minor) => major === 5 && minor === 6,
+        fixed: { '5.6': '5.6.7f1' },
+    },
+];
+/**
+ * The fixed Unity Security Alert for 4.x and 5.x editors, which the Releases API does not list. Unity publishes no
+ * security metadata for them and never patched them, so every one needs the opt-in; the text names the known editor
+ * CVEs that reach the requested version.
+ * @param unityVersion A 4.x or 5.x version, with or without its channel, such as 4.7.2 or 5.6.7f1.
+ * @returns The alert, or undefined for 2017 and newer.
+ */
+function GetLegacySecurityAlert(unityVersion) {
+    const parsed = parseLegacyVersion(unityVersion.version);
+    if (!parsed || parsed.major > 5) {
+        return undefined;
+    }
+    const cves = LEGACY_EDITOR_CVES.filter(cve => {
+        if (!cve.affects(parsed.major, parsed.minor)) {
+            return false;
+        }
+        const fixed = cve.fixed[`${parsed.major}.${parsed.minor}`];
+        return !fixed || compareLegacyVersions(parsed, parseLegacyVersion(fixed)) < 0;
+    });
+    // the same shape as an API label: Unity's style of sentence, the link, the CVEs, then the patched release
+    return {
+        version: unityVersion.version,
+        summary: [
+            'Applications built with this Editor version have known security issues. Read more: https://unity.com/security',
+            ...cves.map(cve => `${cve.id}: https://nvd.nist.gov/vuln/detail/${cve.id}`),
+            'No patched release on this branch',
+        ].join(' | '),
+        details: [],
+    };
+}
+function parseLegacyVersion(version) {
+    const match = /^(\d+)\.(\d+)\.(\d+)(?:([abcfpx])(\d+))?$/.exec(version);
+    if (!match) {
+        return undefined;
+    }
+    return {
+        major: parseInt(match[1], 10),
+        minor: parseInt(match[2], 10),
+        patch: parseInt(match[3], 10),
+        channel: match[4] ?? 'f',
+        build: match[5] ? parseInt(match[5], 10) : 0,
+    };
+}
+/** Orders releases the way Unity ships them: on one patch number, alphas and betas, then the final release, then its patch releases. */
+function compareLegacyVersions(a, b) {
+    const rank = { a: 0, b: 1, c: 2, x: 2, f: 3, p: 4 };
+    return (a.major - b.major) || (a.minor - b.minor) || (a.patch - b.patch) ||
+        ((rank[a.channel] ?? 3) - (rank[b.channel] ?? 3)) || (a.build - b.build);
+}
+/**
+ * Formats a Unity Security Alert as one annotation: the alert on one line and, when it stops the command, how to continue.
+ * @param alert The alert.
+ * @param allow Whether --allow-security-alert or UNITY_ALLOW_SECURITY_ALERT was given.
+ * @param rerunCommand The command that was run, with --allow-security-alert added, to show when the alert stops it.
+ */
+function FormatUnitySecurityAlert(alert, allow, rerunCommand = undefined) {
+    const lines = [
+        `${exports.SECURITY_ALERT_TITLE} for ${alert.version}${allow ? ' (allowed)' : ''}: ${alert.summary}`,
+        ...alert.details.map(detail => `  ${detail}`),
+    ];
+    if (!allow) {
+        lines.push(rerunCommand
+            ? `To continue, re-run: ${rerunCommand} (or set ${exports.SECURITY_ALERT_ENV}=1)`
+            : `Pass --allow-security-alert or set ${exports.SECURITY_ALERT_ENV}=1 to continue.`);
+    }
+    return lines.join('\n');
+}
+/**
+ * Reports a Unity Security Alert: a warning annotation with the opt-in, otherwise an error that stops the command.
+ * @param alert The alert, from the Releases API, the official CLI or the fixed 4.x and 5.x alert.
+ * @param allow Whether --allow-security-alert or UNITY_ALLOW_SECURITY_ALERT was given.
+ * @param rerunCommand The command to re-run with the opt-in, shown when the alert stops it.
+ */
+function ReportUnitySecurityAlert(alert, allow, rerunCommand = undefined) {
+    if (allow) {
+        logging_1.Logger.instance.annotate(logging_1.LogLevel.WARN, FormatUnitySecurityAlert(alert, true), undefined, undefined, undefined, undefined, undefined, exports.SECURITY_ALERT_TITLE);
+        return;
+    }
+    throw new UnitySecurityAlertError(FormatUnitySecurityAlert(alert, false, rerunCommand));
+}
+/** Argument names whose values are never echoed in a re-run command. */
+const SECRET_ARGUMENT = /pass(word)?|token|secret|serial|key|username|user|license|credential/i;
+/**
+ * The command line a user ran, with --allow-security-alert added, for the hint an alert prints when it stops the command.
+ * Values of arguments such as --password, -serial or --token=... are shown as <redacted>. Arguments are quoted to paste
+ * into the shell of the platform: POSIX shells off Windows, PowerShell on Windows.
+ * @param args The arguments after the executable and script, as in process.argv.slice(2).
+ * @param executable The command name to show.
+ * @param platform The platform whose shell the command is quoted for.
+ */
+function BuildSecurityAlertRerunCommand(args, executable = 'unity-cli', platform = process.platform) {
+    const quote = (arg) => QuoteShellArgument(arg, platform);
+    const shown = [executable];
+    let redactNext = false;
+    for (const arg of args) {
+        if (redactNext) {
+            shown.push('<redacted>');
+            redactNext = false;
+            continue;
+        }
+        const flag = /^(--?[\w-]+)(=.*)?$/.exec(arg);
+        if (flag && SECRET_ARGUMENT.test(flag[1])) {
+            if (flag[2] !== undefined) {
+                shown.push(`${flag[1]}=<redacted>`);
+            }
+            else {
+                shown.push(quote(arg));
+                redactNext = true;
+            }
+            continue;
+        }
+        shown.push(quote(arg));
+    }
+    if (!args.includes('--allow-security-alert')) {
+        shown.push('--allow-security-alert');
+    }
+    return shown.join(' ');
+}
+/**
+ * Quotes an argument so it pastes into a shell as one word, leaving it as it is when nothing in it needs quoting.
+ * Single quotes keep everything inside literal in both shells, so only a single quote itself needs care: POSIX shells
+ * close the quote around an escaped one ('\''), and PowerShell doubles it ('').
+ * @param arg The argument.
+ * @param platform `win32` for PowerShell; any other platform for a POSIX shell.
+ */
+function QuoteShellArgument(arg, platform = process.platform) {
+    const windows = platform === 'win32';
+    // a backslash is an ordinary character in PowerShell, so Windows paths stay unquoted
+    const special = windows ? /[\s"'`$;&|(){}@#,<>]/ : /[\s"'`$\\;&|(){}<>*?#~!]/;
+    if (arg.length > 0 && !special.test(arg)) {
+        return arg;
+    }
+    return `'${arg.split('\'').join(windows ? '\'\'' : '\'\\\'\'')}'`;
+}
+/**
+ * Names the newest stable release on the same major.minor without a label, or says there is none.
+ */
+async function getPatchedRelease(unityVersion) {
+    const [major, minor] = unityVersion.version.split('.');
+    const branch = `${major}.${minor}`;
+    const releases = [];
+    try {
+        // every page, so "no patched release" is never claimed from the first 25 rows alone
+        for (let page = 0; page < MAX_BRANCH_PAGES; page++) {
+            const results = await getReleases({
+                version: branch,
+                architecture: [unityVersion.architecture],
+                platform: getPlatform(),
+                limit: PAGE_SIZE,
+                offset: page * PAGE_SIZE,
+                order: 'RELEASE_DATE_DESC',
+            });
+            releases.push(...results);
+            if (results.length < PAGE_SIZE) {
+                break;
+            }
+        }
+    }
+    catch (error) {
+        logging_1.Logger.instance.debug(`Could not look up a patched Unity ${branch} release: ${error}`);
+        return `Update to a newer ${branch} release`;
+    }
+    const patched = releases
+        .filter(release => typeof release.version === 'string' && /^\d+\.\d+\.\d+f\d+$/.test(release.version) && release.version.startsWith(`${branch}.`))
+        .filter(release => !release.label)
+        .map(release => new unity_version_1.UnityVersion(release.version, release.shortRevision, unityVersion.architecture))
+        .sort((a, b) => unity_version_1.UnityVersion.compare(b, a))[0];
+    return patched ? `Patched: ${patched.version}` : 'No patched release on this branch';
+}
+async function findRelease(unityVersion) {
+    const releases = await getReleases({ version: unityVersion.version, limit: 5 });
+    return releases.find(release => release.version === unityVersion.version);
+}
+async function getReleases(query) {
+    const releasesClient = new unity_releases_api_1.UnityReleasesClient();
+    const { data, error } = await releasesClient.api.Release.getUnityReleases({
+        url: '/unity/editor/release/v1/releases',
+        query,
+    });
+    if (error) {
+        throw new Error(`the Unity Releases API returned ${JSON.stringify(error)}`);
+    }
+    return data?.results ?? [];
+}
+function getPlatform() {
+    switch (process.platform) {
+        case 'darwin':
+            return ['MAC_OS'];
+        case 'win32':
+            return ['WINDOWS'];
+        default:
+            return ['LINUX'];
+    }
+}
+/** Whether any text other than whitespace and tags follows a position in an HTML string. */
+function hasTextAfter(html, start) {
+    let inTag = false;
+    for (let i = start; i < html.length; i++) {
+        const char = html[i];
+        if (char === '<') {
+            inTag = true;
+        }
+        else if (char === '>') {
+            inTag = false;
+        }
+        else if (!inTag && char.trim().length > 0) {
+            return true;
+        }
+    }
+    return false;
+}
+/** Drops control characters, so text from the API or the CLI cannot move the cursor or recolor the log. */
+function sanitizeText(text) {
+    // eslint-disable-next-line no-control-regex
+    return text.replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, '').trim();
+}
+//# sourceMappingURL=unity-security.js.map
 
 /***/ }),
 
@@ -8456,6 +10696,12 @@ class UnityVersion {
     semVer;
     logger = logging_1.Logger.instance;
     constructor(version, changeset = undefined, architecture = undefined) {
+        // Accept ProjectVersion / matrix style: "5.6.7f1 (e80cc3114ac1)" (no regex: avoid ReDoS).
+        const embedded = UnityVersion.tryParseEmbeddedChangeset(version);
+        if (embedded) {
+            version = embedded.version;
+            changeset = changeset ?? embedded.changeset;
+        }
         this.version = version;
         this.changeset = changeset;
         this.semVer = UnityVersion.createSemVer(version);
@@ -8514,9 +10760,12 @@ class UnityVersion {
                 this.logger.debug(`Found Unity ${latest.version}`);
                 return new UnityVersion(latest.version, null, this.architecture);
             }
+            throw new Error(`No Unity release matching ${this.version} for channel(s) [${channels.join(', ')}]. ` +
+                (channels.length === 1 && channels[0] === 'f'
+                    ? `No stable (f) release for ${this.version}; use --channel b/a or a fully-qualified version (e.g. 6000.6.0b7).`
+                    : `Try a different --channel or a fully-qualified version.`));
         }
-        this.logger.debug(`No matching Unity version found for ${this.version}`);
-        return this;
+        throw new Error(`No matching Unity version found for ${this.version}`);
     }
     satisfies(version) {
         return (0, semver_1.satisfies)(version.semVer, `^${this.semVer.version}`);
@@ -8545,6 +10794,35 @@ class UnityVersion {
     }
     static UNITY_RELEASE_PATTERN = /^(\d{1,4})\.(\d+)\.(\d+)([abcfpx])(\d+)$/;
     static VERSION_TOKEN_PATTERN = /^(\d{1,4})(?:\.(\d+|x|\*))?(?:\.(\d+|x|\*))?/;
+    /**
+     * Parses trailing " (hexchangeset)" without regex to avoid ReDoS on hostile input.
+     */
+    static tryParseEmbeddedChangeset(raw) {
+        if (!raw.endsWith(')')) {
+            return null;
+        }
+        const open = raw.lastIndexOf('(');
+        if (open <= 0 || raw[open - 1] !== ' ') {
+            return null;
+        }
+        const hex = raw.slice(open + 1, -1);
+        if (hex.length === 0) {
+            return null;
+        }
+        for (let i = 0; i < hex.length; i++) {
+            const c = hex.charCodeAt(i);
+            const isHex = (c >= 48 && c <= 57) || // 0-9
+                (c >= 97 && c <= 102) || // a-f
+                (c >= 65 && c <= 70); // A-F
+            if (!isHex) {
+                return null;
+            }
+        }
+        return {
+            version: raw.slice(0, open - 1).trimEnd(),
+            changeset: hex,
+        };
+    }
     static UNITY_CHANNEL_ORDER = {
         a: 0,
         b: 1,
@@ -8690,472 +10968,6 @@ exports.UnityVersion = UnityVersion;
 
 /***/ }),
 
-/***/ 7501:
-/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
-
-"use strict";
-
-var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    var desc = Object.getOwnPropertyDescriptor(m, k);
-    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
-      desc = { enumerable: true, get: function() { return m[k]; } };
-    }
-    Object.defineProperty(o, k2, desc);
-}) : (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    o[k2] = m[k];
-}));
-var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
-    Object.defineProperty(o, "default", { enumerable: true, value: v });
-}) : function(o, v) {
-    o["default"] = v;
-});
-var __importStar = (this && this.__importStar) || (function () {
-    var ownKeys = function(o) {
-        ownKeys = Object.getOwnPropertyNames || function (o) {
-            var ar = [];
-            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
-            return ar;
-        };
-        return ownKeys(o);
-    };
-    return function (mod) {
-        if (mod && mod.__esModule) return mod;
-        var result = {};
-        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
-        __setModuleDefault(result, mod);
-        return result;
-    };
-})();
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.UpmCli = void 0;
-const fs = __importStar(__nccwpck_require__(7147));
-const os = __importStar(__nccwpck_require__(2037));
-const path = __importStar(__nccwpck_require__(1017));
-const semver_1 = __nccwpck_require__(1383);
-const logging_1 = __nccwpck_require__(4486);
-const utilities_1 = __nccwpck_require__(9746);
-/**
- * Managed Unity Package Manager CLI (unity-cli–installed `UnityPackageManager`), modeled after {@link UnityHub}:
- * parameterless constructor resolves roots and executable preference, {@link Install} manages downloads, {@link Exec} runs the binary.
- */
-class UpmCli {
-    /** Root directory for managed installs (~/.unity-cli/upm), analogous to {@link UnityHub.rootDirectory}. */
-    managedRoot;
-    logger = logging_1.Logger.instance;
-    constructor() {
-        this.managedRoot = path.join(os.homedir(), '.unity-cli', 'upm');
-    }
-    static getCdnBaseUrl() {
-        const override = process.env.UPM_CDN_BASE_URL?.trim();
-        if (override && override.length > 0) {
-            return `${override.replace(/\/$/, '')}/upm-cli`;
-        }
-        return 'https://cdn.packages.unity.com/upm-cli';
-    }
-    static normalizeSemver(version) {
-        const normalized = (0, semver_1.valid)(version);
-        if (normalized) {
-            return normalized;
-        }
-        const coerced = (0, semver_1.coerce)(version);
-        return coerced?.version;
-    }
-    static parseVerifiedSemVerFromLine(line) {
-        const t = line.trim();
-        if (!t) {
-            return null;
-        }
-        const direct = (0, semver_1.valid)(t);
-        if (direct) {
-            const parsed = (0, semver_1.parse)(direct, false);
-            if (parsed && (0, semver_1.valid)(parsed.version)) {
-                return parsed;
-            }
-        }
-        const coerced = (0, semver_1.coerce)(t);
-        if (coerced && (0, semver_1.valid)(coerced)) {
-            return coerced;
-        }
-        return null;
-    }
-    static parseCliVersionStdout(output) {
-        const trimmed = output.trim();
-        if (!trimmed) {
-            throw new Error('Upm cli --version produced empty output.');
-        }
-        const lines = trimmed.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
-        for (let i = lines.length - 1; i >= 0; i--) {
-            const version = UpmCli.parseVerifiedSemVerFromLine(lines[i]);
-            if (version) {
-                return version;
-            }
-        }
-        const fallback = UpmCli.parseVerifiedSemVerFromLine(trimmed);
-        if (fallback) {
-            return fallback;
-        }
-        throw new Error(`Failed to parse upm cli version: ${JSON.stringify(trimmed)}`);
-    }
-    getVersionInstallDir(version) {
-        const t = version.trim();
-        this.validateVersionFormat(t);
-        if (t.includes('..') || path.normalize(t) !== t) {
-            throw new Error(`Invalid upm cli release tag for path use: ${version}`);
-        }
-        const dir = path.join(this.managedRoot, t);
-        const resolvedDir = path.resolve(dir);
-        const resolvedRoot = path.resolve(this.managedRoot);
-        const rootPrefix = resolvedRoot.endsWith(path.sep) ? resolvedRoot : `${resolvedRoot}${path.sep}`;
-        if (resolvedDir !== resolvedRoot && !resolvedDir.startsWith(rootPrefix)) {
-            throw new Error('Resolved UPM install directory left managed root.');
-        }
-        return dir;
-    }
-    getCurrentVersionFilePath() {
-        return path.join(this.managedRoot, 'current-version.txt');
-    }
-    getPlatformId() {
-        const plat = process.platform;
-        const arch = process.arch;
-        if (plat === 'win32') {
-            if (arch === 'arm64') {
-                return 'windows-arm64';
-            }
-            return 'windows-x64';
-        }
-        if (plat === 'darwin') {
-            if (arch === 'arm64') {
-                return 'macos-arm64';
-            }
-            return 'macos-x64';
-        }
-        if (plat === 'linux') {
-            if (arch === 'arm64') {
-                return 'linux-arm64';
-            }
-            return 'linux-x64';
-        }
-        throw new Error(`Unsupported platform for upm cli: ${plat} ${arch}`);
-    }
-    validateVersionFormat(version) {
-        const t = version.trim();
-        if (!t.startsWith('v') || !(0, semver_1.valid)(t)) {
-            throw new Error(`Invalid upm cli version format: ${version}. Expected a semver release tag with leading v (e.g. v9.27.0).`);
-        }
-    }
-    findPrimaryExecutable(installDir) {
-        if (process.platform === 'win32') {
-            const exe = path.join(installDir, 'UnityPackageManager.exe');
-            if (fs.existsSync(exe)) {
-                return exe;
-            }
-        }
-        else {
-            const bin = path.join(installDir, 'UnityPackageManager');
-            if (fs.existsSync(bin)) {
-                return bin;
-            }
-        }
-        throw new Error(`Could not find UnityPackageManager binary under ${installDir}`);
-    }
-    /** Optional executable override (mirrors `UNITY_HUB_PATH` for {@link UnityHub}). */
-    getExecutablePathOverride() {
-        const p = process.env.UPM_CLI_PATH?.trim();
-        return p && p.length > 0 ? path.normalize(p) : undefined;
-    }
-    executableOverrideIsUsable() {
-        const p = this.getExecutablePathOverride();
-        if (!p) {
-            return false;
-        }
-        try {
-            fs.accessSync(p, fs.constants.R_OK | fs.constants.X_OK);
-            return true;
-        }
-        catch {
-            return false;
-        }
-    }
-    /**
-     * Release tag of the managed install from `current-version.txt`, if present and valid.
-     */
-    GetInstalledReleaseTag() {
-        const currentFile = this.getCurrentVersionFilePath();
-        if (!fs.existsSync(currentFile)) {
-            return undefined;
-        }
-        try {
-            const version = fs.readFileSync(currentFile, 'utf8').trim();
-            if (!version) {
-                return undefined;
-            }
-            this.validateVersionFormat(version);
-            return version;
-        }
-        catch {
-            return undefined;
-        }
-    }
-    /**
-     * Path to the primary `UnityPackageManager` binary for a managed release, or `undefined` if missing.
-     */
-    ResolveManagedPrimaryPath(version) {
-        let v = version?.trim() || this.GetInstalledReleaseTag();
-        if (!v) {
-            return undefined;
-        }
-        const installDir = this.getVersionInstallDir(v);
-        try {
-            return this.findPrimaryExecutable(installDir);
-        }
-        catch {
-            return undefined;
-        }
-    }
-    /**
-     * Resolved path used to spawn the UPM CLI: `UPM_CLI_PATH` override when set, otherwise the managed primary binary.
-     * @throws If nothing usable is installed (mirrors Hub/Editor behavior when the executable cannot be used).
-     */
-    GetExecutablePath() {
-        const overridePath = this.getExecutablePathOverride();
-        if (overridePath) {
-            fs.accessSync(overridePath, fs.constants.R_OK | fs.constants.X_OK);
-            return overridePath;
-        }
-        const managed = this.ResolveManagedPrimaryPath();
-        if (!managed) {
-            throw new Error('Upm cli is not installed. Run `unity-cli upm-install` first.');
-        }
-        fs.accessSync(managed, fs.constants.R_OK | fs.constants.X_OK);
-        return managed;
-    }
-    /** Same role as {@link UnityHub.executable}: path used to spawn the UPM CLI (may reflect `UPM_CLI_PATH` or the managed install). */
-    get executable() {
-        return this.GetExecutablePath();
-    }
-    async GetLatestReleaseTag() {
-        const cdn = UpmCli.getCdnBaseUrl();
-        const latestUrl = `${cdn}/latest.txt`;
-        const version = (await (0, utilities_1.HttpsGetText)(latestUrl)).trim();
-        this.validateVersionFormat(version);
-        return version;
-    }
-    /** True if `latestTag` is newer than the installed managed release, or nothing is installed yet. */
-    IsUpdateAvailable(latestTag) {
-        const current = this.GetInstalledReleaseTag();
-        if (!current) {
-            return true;
-        }
-        const normalizedCurrent = UpmCli.normalizeSemver(current);
-        const normalizedLatest = UpmCli.normalizeSemver(latestTag);
-        if (normalizedCurrent && normalizedLatest) {
-            return (0, semver_1.compare)(normalizedLatest, normalizedCurrent) > 0;
-        }
-        return latestTag.trim() !== current.trim();
-    }
-    /**
-     * Installs or updates the managed UPM CLI (mirrors {@link UnityHub.Install} for the Hub itself).
-     * @returns Installed release tag (e.g. v9.27.0).
-     */
-    async Install(options) {
-        const cdn = UpmCli.getCdnBaseUrl();
-        let version = options?.version?.trim();
-        if (!version || version.length === 0) {
-            version = await this.GetLatestReleaseTag();
-        }
-        version = version.trim();
-        const installDir = this.getVersionInstallDir(version);
-        const markerPath = path.join(installDir, '.unity-cli-upm-installed');
-        if (options?.skipIfInstalled !== false && fs.existsSync(markerPath)) {
-            try {
-                this.findPrimaryExecutable(installDir);
-                const recordedTag = path.basename(installDir);
-                await fs.promises.writeFile(this.getCurrentVersionFilePath(), `${recordedTag}\n`, 'utf8');
-                return version;
-            }
-            catch {
-                // reinstall
-            }
-        }
-        const platform = this.getPlatformId();
-        const zipName = `upm-${platform}.zip`;
-        const baseReleaseUrl = `${cdn}/releases/${version}`;
-        const zipUrl = `${baseReleaseUrl}/${zipName}`;
-        const checksumUrl = `${baseReleaseUrl}/${zipName}.sha256`;
-        const tempRoot = path.join((0, utilities_1.GetTempDir)(), `unity-cli-upm-${Date.now()}`);
-        const resolvedTempRoot = path.resolve(tempRoot);
-        const zipPath = path.join(resolvedTempRoot, zipName);
-        const checksumPath = path.join(resolvedTempRoot, `${zipName}.sha256`);
-        try {
-            this.logger.info(`Installing upm cli ${version} (${platform})...`);
-            await (0, utilities_1.DownloadFile)(zipUrl, zipPath);
-            await (0, utilities_1.DownloadFile)(checksumUrl, checksumPath);
-            const checksumContent = (await fs.promises.readFile(checksumPath, 'utf8')).trim();
-            const expectedHash = checksumContent.split(/\s+/)[0]?.toLowerCase();
-            if (!expectedHash) {
-                throw new Error(`Could not read SHA-256 from ${checksumPath}`);
-            }
-            const actualHash = (await (0, utilities_1.Sha256FileHex)(zipPath)).toLowerCase();
-            if (actualHash !== expectedHash) {
-                throw new Error(`SHA-256 mismatch for upm cli zip. Expected ${expectedHash}, got ${actualHash}`);
-            }
-            await (0, utilities_1.DeleteDirectory)(installDir);
-            await fs.promises.mkdir(installDir, { recursive: true });
-            await (0, utilities_1.extractZipNative)(zipPath, installDir, {
-                zipUnder: resolvedTempRoot,
-                destUnder: path.resolve(this.managedRoot),
-            }, {
-                silent: false,
-                showCommand: this.logger.logLevel === logging_1.LogLevel.DEBUG
-            });
-            const primary = this.findPrimaryExecutable(installDir);
-            if (process.platform !== 'win32') {
-                try {
-                    fs.chmodSync(primary, 0o755);
-                }
-                catch {
-                    // ignore
-                }
-            }
-            const wrapperUnix = path.join(installDir, 'upm');
-            if (process.platform !== 'win32' && fs.existsSync(wrapperUnix)) {
-                try {
-                    fs.chmodSync(wrapperUnix, 0o755);
-                }
-                catch {
-                    // ignore
-                }
-            }
-            await fs.promises.writeFile(markerPath, `${new Date().toISOString()}\n`, 'utf8');
-            const recordedTag = path.basename(installDir);
-            await fs.promises.writeFile(this.getCurrentVersionFilePath(), `${recordedTag}\n`, 'utf8');
-            return version;
-        }
-        finally {
-            await (0, utilities_1.DeleteDirectory)(tempRoot);
-        }
-    }
-    /**
-     * When running in an interactive terminal, may prompt to install a missing UPM CLI or update to the latest CDN release.
-     * When not interactive, logs a warning if the running binary is older than the CDN latest (no install).
-     * Compares the running binary ({@link Version}) to {@link GetLatestReleaseTag} (including when {@code UPM_CLI_PATH} overrides the managed install).
-     * Call before {@link GetExecutablePath} / {@link Exec} for Hub-style optional install/update (e.g. pack).
-     */
-    async PromptInstallOrUpdateWhenInteractive() {
-        const overrideUsable = this.executableOverrideIsUsable();
-        const managedExe = this.ResolveManagedPrimaryPath();
-        const hasExecutable = overrideUsable || managedExe !== undefined;
-        if (!hasExecutable) {
-            if ((0, utilities_1.isInteractiveTerminalSession)()) {
-                const install = await (0, utilities_1.PromptYesNo)('The upm cli is not installed. Download and install it now?', true);
-                if (install) {
-                    await this.Install({ skipIfInstalled: false });
-                }
-            }
-            return;
-        }
-        try {
-            const latestTag = await this.GetLatestReleaseTag();
-            const latestSem = UpmCli.parseVerifiedSemVerFromLine(latestTag);
-            if (!latestSem) {
-                return;
-            }
-            const installedSem = await this.Version();
-            if ((0, semver_1.compare)(latestSem, installedSem) <= 0) {
-                return;
-            }
-            const usingOverride = overrideUsable;
-            if (!(0, utilities_1.isInteractiveTerminalSession)()) {
-                if (usingOverride) {
-                    this.logger.warn(`The upm cli (UPM_CLI_PATH) reports ${installedSem.version}, but ${latestTag} is available on the CDN. This run still uses UPM_CLI_PATH; update that binary or unset it and run unity-cli upm-install to use the managed release.`);
-                }
-                else {
-                    this.logger.warn(`The upm cli (${installedSem.version}) is older than the latest release (${latestTag}). Run unity-cli upm-install or unity-cli upm-install --auto-update to update.`);
-                }
-                return;
-            }
-            const prompt = usingOverride
-                ? `Your upm cli (UPM_CLI_PATH) reports ${installedSem.version}, but ${latestTag} is available. Install the latest to the managed location now? This run will keep using UPM_CLI_PATH until you unset it or point it at the new binary.`
-                : `A newer upm cli version is available (${installedSem.version} -> ${latestTag}). Install it now?`;
-            const shouldUpdate = await (0, utilities_1.PromptYesNo)(prompt, !usingOverride);
-            if (!shouldUpdate) {
-                return;
-            }
-            await this.Install({
-                version: latestTag,
-                skipIfInstalled: false,
-            });
-            if (usingOverride) {
-                this.logger.warn(`Installed upm cli ${latestTag} under ${this.managedRoot}. Unset UPM_CLI_PATH (or update it) so subsequent commands use the new install.`);
-            }
-        }
-        catch (error) {
-            this.logger.debug(`Failed to check for upm cli updates: ${error}`);
-        }
-    }
-    /**
-     * Executes the UPM CLI with the given arguments (mirrors {@link UnityHub.Exec}).
-     */
-    async Exec(args, options = { silent: this.logger.logLevel > logging_1.LogLevel.CI, showCommand: this.logger.logLevel <= logging_1.LogLevel.CI }) {
-        const exe = this.GetExecutablePath();
-        if (exe.includes(path.sep)) {
-            fs.accessSync(exe, fs.constants.R_OK | fs.constants.X_OK);
-        }
-        return (0, utilities_1.Exec)(exe, args, options);
-    }
-    /**
-     * Runs `--version` and returns the verified semver from the binary.
-     * @param expectedReleaseTag When set (e.g. from {@link Install}), ensures the reported semver matches this CDN release tag.
-     */
-    async Version(expectedReleaseTag) {
-        const raw = await this.Exec(['--version'], {
-            silent: true,
-            showCommand: this.logger.logLevel === logging_1.LogLevel.DEBUG,
-        });
-        const version = UpmCli.parseCliVersionStdout(raw);
-        if (expectedReleaseTag !== undefined && expectedReleaseTag.trim().length > 0) {
-            const tag = expectedReleaseTag.trim();
-            const expected = UpmCli.parseVerifiedSemVerFromLine(tag);
-            if (!expected) {
-                throw new Error(`Invalid installed upm cli release tag: ${expectedReleaseTag}`);
-            }
-            if ((0, semver_1.compare)(version, expected) !== 0) {
-                throw new Error(`Upm cli binary version mismatch: binary reported ${version.version} (--version), expected ${expected.version} (${expectedReleaseTag}).`);
-            }
-        }
-        return version;
-    }
-    /**
-     * Runs the UPM CLI `pack` subcommand (builds argv from {@link UpmPackOptions}, then {@link Exec}).
-     */
-    async Pack(options, execOptions) {
-        const orgId = options.organizationId.trim();
-        if (!orgId) {
-            throw new Error('UpmCli.Pack requires a non-empty organizationId.');
-        }
-        const args = [];
-        if (this.logger.logLevel === logging_1.LogLevel.DEBUG) {
-            args.push('--log-level', '5', '--console-log-level', '5');
-        }
-        args.push('pack', '--organization-id', orgId);
-        const dest = options.destination?.trim();
-        if (dest && dest.length > 0) {
-            args.push('--destination', dest);
-        }
-        const dir = options.packageDirectory?.trim();
-        if (dir && dir.length > 0) {
-            args.push(dir);
-        }
-        return this.Exec(args, execOptions);
-    }
-}
-exports.UpmCli = UpmCli;
-//# sourceMappingURL=upm-cli.js.map
-
-/***/ }),
-
 /***/ 9746:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
@@ -9208,6 +11020,8 @@ exports.extractZipNative = extractZipNative;
 exports.HttpsGetText = HttpsGetText;
 exports.Sha256FileHex = Sha256FileHex;
 exports.DownloadFile = DownloadFile;
+exports.HashFileHex = HashFileHex;
+exports.SanitizeLogText = SanitizeLogText;
 exports.DeleteDirectory = DeleteDirectory;
 exports.ReadFileContents = ReadFileContents;
 exports.GetTempDir = GetTempDir;
@@ -9217,7 +11031,6 @@ exports.Delay = Delay;
 exports.WaitForFileToBeUnlocked = WaitForFileToBeUnlocked;
 exports.TestFileAccess = TestFileAccess;
 exports.KillProcess = KillProcess;
-exports.KillChildProcesses = KillChildProcesses;
 exports.isProcessElevated = isProcessElevated;
 exports.tryParseJson = tryParseJson;
 const crypto = __importStar(__nccwpck_require__(6113));
@@ -9379,9 +11192,13 @@ async function Exec(command, args, options = { silent: false, showCommand: true 
     }
     try {
         exitCode = await new Promise((resolve, reject) => {
+            const spawnEnv = options.env !== undefined && Object.keys(options.env).length > 0
+                ? { ...process.env, ...options.env }
+                : undefined;
             const child = (0, child_process_1.spawn)(command, args, {
-                env: process.env,
+                shell: false,
                 stdio: ['ignore', 'pipe', 'pipe'],
+                ...(spawnEnv !== undefined ? { env: spawnEnv } : {}),
             });
             const sigintHandler = () => child.kill('SIGINT');
             const sigtermHandler = () => child.kill('SIGTERM');
@@ -9478,8 +11295,7 @@ function assertResolvedPathUnderRoot(candidate, root, label) {
     }
 }
 /**
- * Extracts a zip archive using only OS tools (`tar` or PowerShell on Windows, `unzip` on macOS/Linux).
- * Does not use a Node unzip library.
+ * Extracts a zip archive using OS tools (PowerShell on Windows, `unzip` elsewhere).
  */
 async function extractZipNative(zipPath, destDir, pathTrust, execOptions) {
     assertResolvedPathUnderRoot(zipPath, pathTrust.zipUnder, 'extractZipNative zipPath');
@@ -9488,40 +11304,27 @@ async function extractZipNative(zipPath, destDir, pathTrust, execOptions) {
     const silent = execOptions?.silent ?? true;
     const show = execOptions?.showCommand ?? false;
     if (process.platform === 'win32') {
+        const scriptBody = 'param([Parameter(Mandatory=$true)][string]$ZipPath,[Parameter(Mandatory=$true)][string]$DestPath)\n' +
+            '$ErrorActionPreference = "Stop"\n' +
+            'Expand-Archive -LiteralPath $ZipPath -DestinationPath $DestPath -Force\n';
+        const tmpDir = await fs.promises.mkdtemp(path.join(GetTempDir(), 'unity-cli-expand-zip-'));
+        const scriptPath = path.join(tmpDir, 'Expand-Archive.ps1');
         try {
-            await Exec('tar', [
-                '-xf',
+            await fs.promises.writeFile(scriptPath, scriptBody, 'utf8');
+            await Exec('powershell.exe', [
+                '-NoProfile',
+                '-NonInteractive',
+                '-File',
+                scriptPath,
                 zipPath,
-                '-C',
-                destDir
+                destDir,
             ], {
                 silent,
-                showCommand: show
+                showCommand: show,
             });
         }
-        catch {
-            const scriptBody = 'param([Parameter(Mandatory=$true)][string]$ZipPath,[Parameter(Mandatory=$true)][string]$DestPath)\n' +
-                '$ErrorActionPreference = "Stop"\n' +
-                'Expand-Archive -LiteralPath $ZipPath -DestinationPath $DestPath -Force\n';
-            const tmpDir = await fs.promises.mkdtemp(path.join(GetTempDir(), 'unity-cli-expand-zip-'));
-            const scriptPath = path.join(tmpDir, 'Expand-Archive.ps1');
-            try {
-                await fs.promises.writeFile(scriptPath, scriptBody, 'utf8');
-                await Exec('powershell.exe', [
-                    '-NoProfile',
-                    '-NonInteractive',
-                    '-File',
-                    scriptPath,
-                    zipPath,
-                    destDir,
-                ], {
-                    silent,
-                    showCommand: show,
-                });
-            }
-            finally {
-                await fs.promises.rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
-            }
+        finally {
+            await fs.promises.rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
         }
     }
     else {
@@ -9543,18 +11346,33 @@ async function extractZipNative(zipPath, destDir, pathTrust, execOptions) {
  */
 async function HttpsGetText(url) {
     return new Promise((resolve, reject) => {
-        https.get(url, (response) => {
+        const request = https.get(url, { timeout: DOWNLOAD_IDLE_TIMEOUT_MS }, (response) => {
             if (response.statusCode !== 200) {
                 reject(new Error(`GET ${url} failed: HTTP ${response.statusCode}`));
                 response.resume();
                 return;
             }
             const chunks = [];
-            response.on('data', (c) => chunks.push(c));
+            let size = 0;
+            response.on('data', (c) => {
+                size += c.length;
+                // text responses here are small manifests; anything larger is not what was asked for
+                if (size > MAX_TEXT_RESPONSE_BYTES) {
+                    request.destroy(new Error(`GET ${url} returned more than ${MAX_TEXT_RESPONSE_BYTES} bytes`));
+                    return;
+                }
+                chunks.push(c);
+            });
             response.on('end', () => resolve(Buffer.concat(chunks).toString('utf8').trim()));
-        }).on('error', reject);
+        });
+        request.on('timeout', () => request.destroy(new Error(`GET ${url} timed out`)));
+        request.on('error', reject);
     });
 }
+/** A download fails when no data arrives for this long. */
+const DOWNLOAD_IDLE_TIMEOUT_MS = 2 * 60 * 1000;
+/** The largest response HttpsGetText accepts. */
+const MAX_TEXT_RESPONSE_BYTES = 10 * 1024 * 1024;
 /**
  * Computes the SHA-256 digest of a file as a lowercase hex string.
  */
@@ -9574,37 +11392,114 @@ async function Sha256FileHex(filePath) {
  * Requires HTTP status 200 before writing. Verifies the file is readable after download.
  * @param url The URL to download from.
  * @param downloadPath The path to save the downloaded file.
- * @throws An error if the download fails or the file is not accessible after download.
+ * @param options Integrity and mode options.
+ * @throws An error if the download fails, its SHA-256 does not match, or the file is not accessible after download.
  */
-async function DownloadFile(url, downloadPath) {
+async function DownloadFile(url, downloadPath, options = {}) {
     logger.ci(`Downloading from ${url} to ${downloadPath}...`);
     await fs.promises.mkdir(path.dirname(downloadPath), { recursive: true });
+    // installers move between hosts, so HTTPS redirects are followed; every download is checked against a pinned
+    // SHA-256 or Releases API integrity value afterwards, so where it was served from does not change what is accepted
+    let currentUrl = url;
+    let redirects = 0;
     await new Promise((resolve, reject) => {
-        https.get(url, (response) => {
-            if (response.statusCode !== 200) {
-                response.resume();
-                reject(new Error(`GET ${url} failed: HTTP ${response.statusCode}`));
-                return;
-            }
-            const file = fs.createWriteStream(downloadPath, { mode: 0o755 });
-            const fail = (err) => {
-                file.destroy();
-                void fs.promises.unlink(downloadPath).catch(() => undefined);
-                reject(err);
-            };
-            response.once('error', fail);
-            file.once('error', fail);
-            response.pipe(file);
-            file.on('finish', () => {
-                file.close(() => resolve());
+        const get = () => {
+            const request = https.get(currentUrl, { timeout: DOWNLOAD_IDLE_TIMEOUT_MS }, (response) => {
+                const location = response.headers.location;
+                if (response.statusCode && [301, 302, 303, 307, 308].includes(response.statusCode) && location) {
+                    response.resume();
+                    const next = new URL(location, currentUrl);
+                    if (next.protocol !== 'https:' || ++redirects > 5) {
+                        reject(new Error(`GET ${url} failed: ${next.protocol !== 'https:' ? `redirected to ${next.protocol}` : 'too many redirects'}`));
+                        return;
+                    }
+                    currentUrl = next.href;
+                    get();
+                    return;
+                }
+                if (response.statusCode !== 200) {
+                    response.resume();
+                    reject(new Error(`GET ${url} failed: HTTP ${response.statusCode}`));
+                    return;
+                }
+                const file = fs.createWriteStream(downloadPath, { mode: options.executable ? 0o755 : 0o644 });
+                const fail = (err) => {
+                    file.destroy();
+                    void fs.promises.unlink(downloadPath).catch(() => undefined);
+                    reject(err);
+                };
+                response.once('error', fail);
+                file.once('error', fail);
+                response.pipe(file);
+                file.on('finish', () => {
+                    file.close(() => resolve());
+                });
             });
-        }).on('error', (error) => {
-            void fs.promises.unlink(downloadPath).catch(() => undefined);
-            reject(error);
-        });
+            request.on('timeout', () => request.destroy(new Error(`GET ${url} timed out`)));
+            request.on('error', (error) => {
+                void fs.promises.unlink(downloadPath).catch(() => undefined);
+                reject(error);
+            });
+        };
+        get();
     });
     await new Promise((r) => setTimeout(r, 100));
     await fs.promises.access(downloadPath, fs.constants.R_OK);
+    if (options.sha256) {
+        const actual = await Sha256FileHex(downloadPath);
+        if (actual.toLowerCase() !== options.sha256.toLowerCase()) {
+            await fs.promises.rm(downloadPath, { force: true });
+            throw new Error(`SHA-256 mismatch for ${url}: expected ${options.sha256}, got ${actual}`);
+        }
+    }
+    if (options.integrity) {
+        const separator = options.integrity.indexOf('-');
+        const algorithm = options.integrity.slice(0, separator).toLowerCase();
+        const encoded = options.integrity.slice(separator + 1);
+        if (separator <= 0 || !['md5', 'sha1', 'sha256', 'sha384', 'sha512'].includes(algorithm)) {
+            await fs.promises.rm(downloadPath, { force: true });
+            throw new Error(`Unsupported integrity value for ${url}: ${options.integrity}`);
+        }
+        const decoded = Buffer.from(encoded, 'base64');
+        const asText = decoded.toString('utf8');
+        const expected = /^[0-9a-f]+$/i.test(asText) ? asText.toLowerCase() : decoded.toString('hex');
+        const actual = await HashFileHex(downloadPath, algorithm);
+        if (actual !== expected) {
+            await fs.promises.rm(downloadPath, { force: true });
+            throw new Error(`${algorithm.toUpperCase()} mismatch for ${url}: expected ${expected}, got ${actual}`);
+        }
+    }
+}
+/**
+ * Computes a file digest as a lowercase hex string.
+ * @param filePath The file to hash.
+ * @param algorithm A Node crypto hash name, such as sha256 or md5.
+ */
+async function HashFileHex(filePath, algorithm) {
+    const hash = crypto.createHash(algorithm);
+    const stream = fs.createReadStream(filePath);
+    return new Promise((resolve, reject) => {
+        stream.on('data', (chunk) => hash.update(chunk));
+        stream.on('end', () => resolve(hash.digest('hex')));
+        stream.on('error', reject);
+    });
+}
+/**
+ * Redacts known secrets, email addresses and long token-like strings (JWTs, access and refresh tokens) from log text.
+ * Each line is split on separator characters and every piece is checked on its own, which stays linear on any input.
+ * @param text The text to sanitize.
+ * @param secrets Literal values to redact.
+ */
+function SanitizeLogText(text, secrets = []) {
+    return redactSensitiveLiterals(text, secrets)
+        .split(/([\s"'<>=,;()[\]]+)/)
+        .map(part => {
+        const at = part.indexOf('@');
+        const isEmail = at > 0 && part.lastIndexOf('.') > at + 1;
+        const isToken = part.length >= 32 && /^[A-Za-z0-9+_.-]+$/.test(part);
+        return isEmail || isToken ? '*****' : part;
+    })
+        .join('');
 }
 /**
  * Deletes a directory and its contents if it exists.
@@ -9821,43 +11716,6 @@ async function KillProcess(procInfo, signal = 'SIGTERM') {
     }
 }
 /**
- * Kills all child processes of the given process.
- * @param procInfo The process information of the parent process.
- */
-async function KillChildProcesses(procInfo) {
-    logger.debug(`Killing child processes of [${procInfo.pid}] ${procInfo.name}...`);
-    try {
-        if (process.platform === 'win32') {
-            const command = `Get-CimInstance Win32_Process -Filter "ParentProcessId=${procInfo.pid}" | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }`;
-            await Exec('powershell', [
-                '-NoProfile',
-                '-Command',
-                command
-            ], { silent: true, showCommand: false });
-        }
-        else { // linux and macos
-            const psOutput = await Exec('ps', ['-eo', 'pid,ppid,comm'], { silent: true, showCommand: false });
-            const lines = psOutput.split('\n').slice(1); // Skip header line
-            const killPromises = [];
-            for (const line of lines) {
-                const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
-                if (match) {
-                    const pid = parseInt(match[1], 10);
-                    const ppid = parseInt(match[2], 10);
-                    const name = match[3].trim();
-                    if (ppid === procInfo.pid) {
-                        killPromises.push(KillProcess({ pid, ppid, name }));
-                    }
-                }
-            }
-            await Promise.all(killPromises);
-        }
-    }
-    catch (error) {
-        logger.error(`Failed to kill child processes of pid ${procInfo.pid}:\n${JSON.stringify(error)}`);
-    }
-}
-/**
  * Checks if the current process is running with elevated (administrator) privileges.
  * @returns True if the process is elevated, false otherwise.
  */
@@ -9887,15 +11745,69 @@ function tryParseJson(content) {
 
 /***/ }),
 
+/***/ 6239:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.UTP_BENIGN_SEVERITY_REMAPS = void 0;
+exports.utpMessageMatchesBenignRemap = utpMessageMatchesBenignRemap;
+/**
+ * Known Unity/editor messages that are non-actionable despite elevated UTP severity.
+ * Kept in a leaf module (no imports) so normalize, summaries, and CI share one list
+ * without circular deps between utp.ts and logging.ts.
+ *
+ * Severity strings must match {@link Severity} in utp.ts.
+ */
+exports.UTP_BENIGN_SEVERITY_REMAPS = [
+    // Longer OpenCL form first so summary strip does not leave a "Failed to find a suitable" prefix.
+    { fragment: 'Failed to find a suitable OpenCL device, baking cannot use GPU lightmapper.', severity: 'Info' },
+    { fragment: 'OpenCL device, baking cannot use GPU lightmapper.', severity: 'Info' },
+    {
+        fragment: '~StackAllocator(ALLOC_TEMP_MAIN) m_LastAlloc not NULL. Did you forget to call FreeAllStackAllocations()?',
+        severity: 'Info',
+    },
+    // Windows hosted CI: WSAEACCES (10013) — player-connection multicast / socket bind. Unity falls back.
+    { fragment: 'Unable to join player connection multicast group', severity: 'Info' },
+    { fragment: 'Socket: bind failed', severity: 'Info' },
+    {
+        fragment: 'An attempt was made to access a socket in a way forbidden by its access permissions',
+        severity: 'Info',
+    },
+    { fragment: 'Access token is unavailable; failed to update', severity: 'Info' },
+];
+/** True if the message matches a known benign Unity/CI noise fragment. */
+function utpMessageMatchesBenignRemap(message) {
+    if (!message) {
+        return false;
+    }
+    for (const { fragment } of exports.UTP_BENIGN_SEVERITY_REMAPS) {
+        if (message.includes(fragment)) {
+            return true;
+        }
+    }
+    return false;
+}
+//# sourceMappingURL=utp-benign.js.map
+
+/***/ }),
+
 /***/ 6282:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 "use strict";
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.UTP_SUPPORTED_TOP_LEVEL_PROPERTIES = exports.Severity = exports.Phase = exports.UTPPlayerBuildInfo = exports.UTPTestStatus = exports.UTPQualitySettings = exports.UTPPlayerSystemInfo = exports.UTPBuildSettings = exports.UTPPlayerSettings = exports.UTPScreenSettings = exports.UTPTestPlan = exports.UTPCompiler = exports.UTPLogEntry = exports.UTPMemoryLeaks = exports.UTPMemoryLeak = exports.UTPAction = exports.UTPBase = void 0;
+exports.UTP_SUPPORTED_TOP_LEVEL_PROPERTIES = exports.Severity = exports.Phase = exports.UTPPlayerBuildInfo = exports.UTPTestStatus = exports.UTPQualitySettings = exports.UTPPlayerSystemInfo = exports.UTPBuildSettings = exports.UTPPlayerSettings = exports.UTPScreenSettings = exports.UTPTestPlan = exports.UTPCompiler = exports.UTPLogEntry = exports.UTPMemoryLeaks = exports.UTPMemoryLeak = exports.UTPAction = exports.UTPBase = exports.utpMessageMatchesBenignRemap = exports.UTP_BENIGN_SEVERITY_REMAPS = void 0;
+exports.isElevatedUtpSeverity = isElevatedUtpSeverity;
+exports.remapBenignUtpSeverity = remapBenignUtpSeverity;
 exports.normalizeTelemetryEntry = normalizeTelemetryEntry;
 const logging_1 = __nccwpck_require__(4486);
+const utp_benign_1 = __nccwpck_require__(6239);
+var utp_benign_2 = __nccwpck_require__(6239);
+Object.defineProperty(exports, "UTP_BENIGN_SEVERITY_REMAPS", ({ enumerable: true, get: function () { return utp_benign_2.UTP_BENIGN_SEVERITY_REMAPS; } }));
+Object.defineProperty(exports, "utpMessageMatchesBenignRemap", ({ enumerable: true, get: function () { return utp_benign_2.utpMessageMatchesBenignRemap; } }));
 class UTPBase {
     type;
     version;
@@ -9981,6 +11893,28 @@ var Severity;
     Severity["Exception"] = "Exception";
     Severity["Assert"] = "Assert";
 })(Severity || (exports.Severity = Severity = {}));
+/** Severities that normally fail builds / CI expected-success checks. */
+function isElevatedUtpSeverity(severity) {
+    return severity === Severity.Error
+        || severity === Severity.Exception
+        || severity === Severity.Assert;
+}
+/**
+ * Downgrades elevated severity on known benign messages. Mutates `utp`.
+ * @returns true when severity was changed.
+ */
+function remapBenignUtpSeverity(utp) {
+    if (!utp.message || !isElevatedUtpSeverity(utp.severity)) {
+        return false;
+    }
+    for (const { fragment, severity } of utp_benign_1.UTP_BENIGN_SEVERITY_REMAPS) {
+        if (utp.message.includes(fragment)) {
+            utp.severity = severity;
+            return true;
+        }
+    }
+    return false;
+}
 /**
  * Root-level JSON keys on UTP objects that this CLI recognizes. Other keys are still parsed
  * but reported via {@link normalizeTelemetryEntry}'s `unknownTopLevelKeys` for logging.
@@ -10018,8 +11952,9 @@ exports.UTP_SUPPORTED_TOP_LEVEL_PROPERTIES = new Set([
     'version',
 ]);
 /**
- * Normalizes UTP telemetry entries to canonical shapes. Unknown top-level keys are listed
- * for the caller to log (with the raw `##utp:` line when tailing logs).
+ * Normalizes UTP telemetry entries to canonical shapes and remaps known benign elevated
+ * severities. Unknown top-level keys are listed for the caller to log (with the raw
+ * `##utp:` line when tailing logs).
  */
 function normalizeTelemetryEntry(entry) {
     if (!entry || typeof entry !== 'object') {
@@ -10045,6 +11980,14 @@ function normalizeTelemetryEntry(entry) {
     if (utp.lineNumber === undefined && typeof utp.line === 'number') {
         utp.lineNumber = utp.line;
     }
+    // Canonicalize severity string casing from Unity payloads.
+    if (typeof utp.severity === 'string') {
+        const matched = Object.values(Severity).find(s => s.toLowerCase() === utp.severity.toLowerCase());
+        if (matched) {
+            utp.severity = matched;
+        }
+    }
+    remapBenignUtpSeverity(utp);
     if (!utp.type) {
         logging_1.Logger.instance.warn('UTP entry missing type property; telemetry entry may be ignored.');
     }
@@ -12189,6 +14132,9 @@ class Range {
   }
 
   parseRange (range) {
+    // strip build metadata so it can't bleed into the version
+    range = range.replace(BUILDSTRIPRE, '')
+
     // memoize range parsing for performance.
     // this is a very hot path, and fully deterministic.
     const memoOpts =
@@ -12314,12 +14260,16 @@ const debug = __nccwpck_require__(427)
 const SemVer = __nccwpck_require__(8088)
 const {
   safeRe: re,
+  src,
   t,
   comparatorTrimReplace,
   tildeTrimReplace,
   caretTrimReplace,
 } = __nccwpck_require__(9523)
 const { FLAG_INCLUDE_PRERELEASE, FLAG_LOOSE } = __nccwpck_require__(2293)
+
+// unbounded global build-metadata stripper used by parseRange
+const BUILDSTRIPRE = new RegExp(src[t.BUILD], 'g')
 
 const isNullSet = c => c.value === '<0.0.0-0'
 const isAny = c => c.value === ''
@@ -12361,6 +14311,11 @@ const parseComparator = (comp, options) => {
 
 const isX = id => !id || id.toLowerCase() === 'x' || id === '*'
 
+const invalidXRangeOrder = (M, m, p) => (
+  (isX(M) && !isX(m)) ||
+  (isX(m) && p && !isX(p))
+)
+
 // ~, ~> --> * (any, kinda silly)
 // ~2, ~2.x, ~2.x.x, ~>2, ~>2.x ~>2.x.x --> >=2.0.0 <3.0.0-0
 // ~2.0, ~2.0.x, ~>2.0, ~>2.0.x --> >=2.0.0 <2.1.0-0
@@ -12378,6 +14333,10 @@ const replaceTildes = (comp, options) => {
 
 const replaceTilde = (comp, options) => {
   const r = options.loose ? re[t.TILDELOOSE] : re[t.TILDE]
+  // if we're including prereleases in the match, then the lower bound is
+  // -0, the lowest possible prerelease value, just like x-ranges and carets.
+  // this keeps `~1.2` equivalent to the `1.2.x` x-range it's documented as.
+  const z = options.includePrerelease ? '-0' : ''
   return comp.replace(r, (_, M, m, p, pr) => {
     debug('tilde', comp, _, M, m, p, pr)
     let ret
@@ -12385,10 +14344,10 @@ const replaceTilde = (comp, options) => {
     if (isX(M)) {
       ret = ''
     } else if (isX(m)) {
-      ret = `>=${M}.0.0 <${+M + 1}.0.0-0`
+      ret = `>=${M}.0.0${z} <${+M + 1}.0.0-0`
     } else if (isX(p)) {
       // ~1.2 == >=1.2.0 <1.3.0-0
-      ret = `>=${M}.${m}.0 <${M}.${+m + 1}.0-0`
+      ret = `>=${M}.${m}.0${z} <${M}.${+m + 1}.0-0`
     } else if (pr) {
       debug('replaceTilde pr', pr)
       ret = `>=${M}.${m}.${p}-${pr
@@ -12457,10 +14416,10 @@ const replaceCaret = (comp, options) => {
       if (M === '0') {
         if (m === '0') {
           ret = `>=${M}.${m}.${p
-          }${z} <${M}.${m}.${+p + 1}-0`
+          } <${M}.${m}.${+p + 1}-0`
         } else {
           ret = `>=${M}.${m}.${p
-          }${z} <${M}.${+m + 1}.0-0`
+          } <${M}.${+m + 1}.0-0`
         }
       } else {
         ret = `>=${M}.${m}.${p
@@ -12486,6 +14445,10 @@ const replaceXRange = (comp, options) => {
   const r = options.loose ? re[t.XRANGELOOSE] : re[t.XRANGE]
   return comp.replace(r, (ret, gtlt, M, m, p, pr) => {
     debug('xRange', comp, ret, gtlt, M, m, p, pr)
+    if (invalidXRangeOrder(M, m, p)) {
+      return comp
+    }
+
     const xM = isX(M)
     const xm = xM || isX(m)
     const xp = xm || isX(p)
@@ -12661,7 +14624,23 @@ const { MAX_LENGTH, MAX_SAFE_INTEGER } = __nccwpck_require__(2293)
 const { safeRe: re, t } = __nccwpck_require__(9523)
 
 const parseOptions = __nccwpck_require__(785)
-const { compareIdentifiers } = __nccwpck_require__(5865)
+const { compareIdentifiers } = __nccwpck_require__(2463)
+
+const isPrereleaseIdentifier = (prerelease, identifier) => {
+  const identifiers = identifier.split('.')
+  if (identifiers.length > prerelease.length) {
+    return false
+  }
+
+  for (let i = 0; i < identifiers.length; i++) {
+    if (compareIdentifiers(prerelease[i], identifiers[i]) !== 0) {
+      return false
+    }
+  }
+
+  return true
+}
+
 class SemVer {
   constructor (version, options) {
     options = parseOptions(options)
@@ -12965,8 +14944,9 @@ class SemVer {
           if (identifierBase === false) {
             prerelease = [identifier]
           }
-          if (compareIdentifiers(this.prerelease[0], identifier) === 0) {
-            if (isNaN(this.prerelease[1])) {
+          if (isPrereleaseIdentifier(this.prerelease, identifier)) {
+            const prereleaseBase = this.prerelease[identifier.split('.').length]
+            if (isNaN(prereleaseBase)) {
               this.prerelease = prerelease
             }
           } else {
@@ -13069,7 +15049,7 @@ module.exports = cmp
 
 /***/ }),
 
-/***/ 5280:
+/***/ 3466:
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 "use strict";
@@ -13581,7 +15561,7 @@ module.exports = valid
 const internalRe = __nccwpck_require__(9523)
 const constants = __nccwpck_require__(2293)
 const SemVer = __nccwpck_require__(8088)
-const identifiers = __nccwpck_require__(5865)
+const identifiers = __nccwpck_require__(2463)
 const parse = __nccwpck_require__(5925)
 const valid = __nccwpck_require__(9601)
 const clean = __nccwpck_require__(8848)
@@ -13604,7 +15584,7 @@ const neq = __nccwpck_require__(6017)
 const gte = __nccwpck_require__(5522)
 const lte = __nccwpck_require__(7520)
 const cmp = __nccwpck_require__(5098)
-const coerce = __nccwpck_require__(5280)
+const coerce = __nccwpck_require__(3466)
 const truncate = __nccwpck_require__(5937)
 const Comparator = __nccwpck_require__(1532)
 const Range = __nccwpck_require__(9828)
@@ -13736,7 +15716,7 @@ module.exports = debug
 
 /***/ }),
 
-/***/ 5865:
+/***/ 2463:
 /***/ ((module) => {
 
 "use strict";
@@ -14591,7 +16571,7 @@ const simpleSubset = (sub, dom, options) => {
         if (higher === c && higher !== gt) {
           return false
         }
-      } else if (gt.operator === '>=' && !satisfies(gt.semver, String(c), options)) {
+      } else if (gt.operator === '>=' && !c.test(gt.semver)) {
         return false
       }
     }
@@ -14609,7 +16589,7 @@ const simpleSubset = (sub, dom, options) => {
         if (lower === c && lower !== lt) {
           return false
         }
-      } else if (lt.operator === '<=' && !satisfies(lt.semver, String(c), options)) {
+      } else if (lt.operator === '<=' && !c.test(lt.semver)) {
         return false
       }
     }
@@ -17963,11 +19943,77 @@ class Request {
     }
   }
 
-  onUpgrade (statusCode, headers, socket) {
+  /**
+   * @param {number|null} statusCode
+   * @param {Buffer[]|null} headers
+   * @param {import('node:stream').Duplex} socket
+   * @param {string} [statusText]
+   */
+  onUpgrade (statusCode, headers, socket, statusText = '') {
+    this.onFinally()
+
     assert(!this.aborted)
     assert(!this.completed)
 
-    return this[kHandler].onUpgrade(statusCode, headers, socket)
+    if (statusCode !== null) {
+      this.#publishUpgradeHeaders(statusCode, headers, statusText)
+    }
+
+    const result = this[kHandler].onUpgrade(statusCode, headers, socket)
+
+    if (!this.aborted) {
+      this.completed = true
+      if (statusCode !== null) {
+        this.#publishUpgradeTrailers()
+      }
+    }
+
+    return result
+  }
+
+  /**
+   * @param {number} statusCode
+   * @param {import('node:http2').IncomingHttpHeaders} headers
+   * @param {(headers: import('node:http2').IncomingHttpHeaders) => Buffer[]} parseHeaders
+   * @param {string} [statusText]
+   */
+  onUpgradeResponse (statusCode, headers, parseHeaders, statusText = '') {
+    assert(!this.aborted)
+    assert(this.completed)
+
+    if (channels.headers.hasSubscribers) {
+      this.#publishUpgradeHeaders(statusCode, parseHeaders(headers), statusText)
+    }
+    this.#publishUpgradeTrailers()
+  }
+
+  /**
+   * @param {Error} error
+   */
+  onUpgradeError (error) {
+    assert(!this.aborted)
+    assert(this.completed)
+
+    if (channels.error.hasSubscribers) {
+      channels.error.publish({ request: this, error })
+    }
+  }
+
+  /**
+   * @param {number} statusCode
+   * @param {Buffer[]} headers
+   * @param {string} statusText
+   */
+  #publishUpgradeHeaders (statusCode, headers, statusText) {
+    if (channels.headers.hasSubscribers) {
+      channels.headers.publish({ request: this, response: { statusCode, headers, statusText } })
+    }
+  }
+
+  #publishUpgradeTrailers () {
+    if (channels.trailers.hasSubscribers) {
+      channels.trailers.publish({ request: this, trailers: [] })
+    }
   }
 
   onComplete (trailers) {
@@ -18050,7 +20096,13 @@ function processHeader (request, key, val) {
       } else if (typeof val[i] === 'object') {
         throw new InvalidArgumentError(`invalid ${key} header`)
       } else {
-        arr.push(`${val[i]}`)
+        // Coerce primitives (and reject unsafe coercions such as functions
+        // with a crafted toString/Symbol.toPrimitive).
+        const str = `${val[i]}`
+        if (!isValidHeaderValue(str)) {
+          throw new InvalidArgumentError(`invalid ${key} header`)
+        }
+        arr.push(str)
       }
     }
     val = arr
@@ -18061,7 +20113,12 @@ function processHeader (request, key, val) {
   } else if (val === null) {
     val = ''
   } else {
+    // Coerce primitives (and reject unsafe coercions such as functions
+    // with a crafted toString/Symbol.toPrimitive).
     val = `${val}`
+    if (!isValidHeaderValue(val)) {
+      throw new InvalidArgumentError(`invalid ${key} header`)
+    }
   }
 
   if (headerName === 'host') {
@@ -19097,8 +21154,7 @@ function defaultFactory (origin, opts) {
 }
 
 class Agent extends DispatcherBase {
-  constructor ({ factory = defaultFactory, maxRedirections = 0, connect, ...options } = {}) {
-
+  constructor ({ factory = defaultFactory, maxRedirections = 0, connect, tls, ...options } = {}) {
     if (typeof factory !== 'function') {
       throw new InvalidArgumentError('factory must be a function.')
     }
@@ -19117,11 +21173,15 @@ class Agent extends DispatcherBase {
       connect = { ...connect }
     }
 
+    if (tls && typeof tls !== 'function') {
+      tls = { ...tls }
+    }
+
     this[kInterceptors] = options.interceptors?.Agent && Array.isArray(options.interceptors.Agent)
       ? options.interceptors.Agent
       : [createRedirectInterceptor({ maxRedirections })]
 
-    this[kOptions] = { ...util.deepClone(options), connect }
+    this[kOptions] = { ...util.deepClone(options), connect, tls }
     this[kOptions].interceptors = options.interceptors
       ? { ...options.interceptors }
       : undefined
@@ -19439,6 +21499,7 @@ const {
   RequestContentLengthMismatchError,
   ResponseContentLengthMismatchError,
   RequestAbortedError,
+  InvalidArgumentError,
   HeadersTimeoutError,
   HeadersOverflowError,
   SocketError,
@@ -19486,6 +21547,9 @@ const EMPTY_BUF = Buffer.alloc(0)
 const FastBuffer = Buffer[Symbol.species]
 const addListener = util.addListener
 const removeAllListeners = util.removeAllListeners
+const kIdleSocketValidation = Symbol('kIdleSocketValidation')
+const kIdleSocketValidationTimeout = Symbol('kIdleSocketValidationTimeout')
+const kSocketUsed = Symbol('kSocketUsed')
 
 let extractBody
 
@@ -19708,27 +21772,69 @@ class Parser {
 
       const offset = llhttp.llhttp_get_error_pos(this.ptr) - currentBufferPtr
 
-      if (ret === constants.ERROR.PAUSED_UPGRADE) {
-        this.onUpgrade(data.slice(offset))
-      } else if (ret === constants.ERROR.PAUSED) {
-        this.paused = true
-        socket.unshift(data.slice(offset))
-      } else if (ret !== constants.ERROR.OK) {
-        const ptr = llhttp.llhttp_get_error_reason(this.ptr)
-        let message = ''
-        /* istanbul ignore else: difficult to make a test case for */
-        if (ptr) {
-          const len = new Uint8Array(llhttp.memory.buffer, ptr).indexOf(0)
-          message =
-            'Response does not match the HTTP/1.1 protocol (' +
-            Buffer.from(llhttp.memory.buffer, ptr, len).toString() +
-            ')'
+      if (ret !== constants.ERROR.OK) {
+        const body = data.subarray(offset)
+
+        if (ret === constants.ERROR.PAUSED_UPGRADE) {
+          this.onUpgrade(body)
+        } else if (ret === constants.ERROR.PAUSED) {
+          this.paused = true
+          socket.unshift(body)
+        } else {
+          throw this.createError(ret, body)
         }
-        throw new HTTPParserError(message, constants.ERROR[ret], data.slice(offset))
       }
     } catch (err) {
       util.destroy(socket, err)
     }
+  }
+
+  finish () {
+    assert(currentParser === null)
+    assert(this.ptr != null)
+    assert(!this.paused)
+
+    const { llhttp } = this
+
+    let ret
+
+    try {
+      currentParser = this
+      ret = llhttp.llhttp_finish(this.ptr)
+    } finally {
+      currentParser = null
+    }
+
+    if (ret === constants.ERROR.OK) {
+      return null
+    }
+
+    if (ret === constants.ERROR.PAUSED || ret === constants.ERROR.PAUSED_UPGRADE) {
+      this.paused = true
+      return null
+    }
+
+    return this.createError(ret, EMPTY_BUF)
+  }
+
+  createError (ret, data) {
+    const { llhttp, contentLength, bytesRead } = this
+
+    if (contentLength && bytesRead !== parseInt(contentLength, 10)) {
+      return new ResponseContentLengthMismatchError()
+    }
+
+    const ptr = llhttp.llhttp_get_error_reason(this.ptr)
+    let message = ''
+    if (ptr) {
+      const len = new Uint8Array(llhttp.memory.buffer, ptr).indexOf(0)
+      message =
+        'Response does not match the HTTP/1.1 protocol (' +
+        Buffer.from(llhttp.memory.buffer, ptr, len).toString() +
+        ')'
+    }
+
+    return new HTTPParserError(message, constants.ERROR[ret], data)
   }
 
   destroy () {
@@ -19755,6 +21861,11 @@ class Parser {
 
     /* istanbul ignore next: difficult to make a test case for */
     if (socket.destroyed) {
+      return -1
+    }
+
+    if (client[kRunning] === 0) {
+      util.destroy(socket, new SocketError('bad response', util.getSocketInfo(socket)))
       return -1
     }
 
@@ -19810,7 +21921,7 @@ class Parser {
   }
 
   onUpgrade (head) {
-    const { upgrade, client, socket, headers, statusCode } = this
+    const { upgrade, client, socket, headers, statusCode, statusText } = this
 
     assert(upgrade)
     assert(client[kSocket] === socket)
@@ -19845,9 +21956,10 @@ class Parser {
     client.emit('disconnect', client[kUrl], [client], new InformationalError('upgrade'))
 
     try {
-      request.onUpgrade(statusCode, headers, socket)
-    } catch (err) {
-      util.destroy(socket, err)
+      request.onUpgrade(statusCode, headers, socket, statusText)
+    } catch (error) {
+      util.errorRequest(client, request, error)
+      util.destroy(socket, error)
     }
 
     client[kResume]()
@@ -19858,6 +21970,11 @@ class Parser {
 
     /* istanbul ignore next: difficult to make a test case for */
     if (socket.destroyed) {
+      return -1
+    }
+
+    if (client[kRunning] === 0) {
+      util.destroy(socket, new SocketError('bad response', util.getSocketInfo(socket)))
       return -1
     }
 
@@ -20034,6 +22151,7 @@ class Parser {
     request.onComplete(headers)
 
     client[kQueue][client[kRunningIdx]++] = null
+    socket[kSocketUsed] = true
 
     if (socket[kWriting]) {
       assert(client[kRunning] === 0)
@@ -20092,18 +22210,22 @@ async function connectH1 (client, socket) {
   socket[kWriting] = false
   socket[kReset] = false
   socket[kBlocking] = false
+  socket[kIdleSocketValidation] = 0
+  socket[kIdleSocketValidationTimeout] = null
+  socket[kSocketUsed] = false
   socket[kParser] = new Parser(client, socket, llhttpInstance)
 
   addListener(socket, 'error', function (err) {
-    assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
     const parser = this[kParser]
 
     // On Mac OS, we get an ECONNRESET even if there is a full body to be forwarded
     // to the user.
     if (err.code === 'ECONNRESET' && parser.statusCode && !parser.shouldKeepAlive) {
-      // We treat all incoming data so for as a valid response.
-      parser.onMessageComplete()
+      const parserErr = parser.finish()
+      if (parserErr) {
+        this[kError] = parserErr
+        this[kClient][kOnError](parserErr)
+      }
       return
     }
 
@@ -20122,8 +22244,10 @@ async function connectH1 (client, socket) {
     const parser = this[kParser]
 
     if (parser.statusCode && !parser.shouldKeepAlive) {
-      // We treat all incoming data so far as a valid response.
-      parser.onMessageComplete()
+      const parserErr = parser.finish()
+      if (parserErr) {
+        util.destroy(this, parserErr)
+      }
       return
     }
 
@@ -20133,10 +22257,11 @@ async function connectH1 (client, socket) {
     const client = this[kClient]
     const parser = this[kParser]
 
+    clearIdleSocketValidation(this)
+
     if (parser) {
       if (!this[kError] && parser.statusCode && !parser.shouldKeepAlive) {
-        // We treat all incoming data so far as a valid response.
-        parser.onMessageComplete()
+        this[kError] = parser.finish() || this[kError]
       }
 
       this[kParser].destroy()
@@ -20199,7 +22324,7 @@ async function connectH1 (client, socket) {
       return socket.destroyed
     },
     busy (request) {
-      if (socket[kWriting] || socket[kReset] || socket[kBlocking]) {
+      if (socket[kWriting] || socket[kReset] || socket[kBlocking] || socket[kIdleSocketValidation] === 1) {
         return true
       }
 
@@ -20237,6 +22362,39 @@ async function connectH1 (client, socket) {
   }
 }
 
+function clearIdleSocketValidation (socket) {
+  if (socket[kIdleSocketValidationTimeout]) {
+    clearImmediate(socket[kIdleSocketValidationTimeout])
+    socket[kIdleSocketValidationTimeout] = null
+  }
+
+  socket[kIdleSocketValidation] = 0
+}
+
+function scheduleIdleSocketValidation (client, socket) {
+  socket[kIdleSocketValidation] = 1
+  // Yield to the check phase (after poll) so unsolicited bytes / FIN / RST
+  // already pending on this idle keep-alive socket are processed before the
+  // next request is written (GHSA-35p6-xmwp-9g52).
+  //
+  // setTimeout(0) pays Node's ~1ms timer floor on every sequential reuse
+  // (#5493). setImmediate avoids that, but an *unref'd* Immediate lets poll
+  // block for ~500ms when the event loop is otherwise idle (#5600 / #5606).
+  // A ref'd Immediate both keeps the pending request alive and makes poll
+  // return immediately — the hybrid those issues asked for.
+  socket[kIdleSocketValidationTimeout] = setImmediate(() => {
+    socket[kIdleSocketValidationTimeout] = null
+    socket[kIdleSocketValidation] = 2
+
+    if (client[kSocket] === socket && !socket.destroyed) {
+      client[kResume]()
+    }
+  })
+}
+
+/**
+ * @param {import('./client.js')} client
+ */
 function resumeH1 (client) {
   const socket = client[kSocket]
 
@@ -20249,6 +22407,32 @@ function resumeH1 (client) {
     } else if (socket[kNoRef] && socket.ref) {
       socket.ref()
       socket[kNoRef] = false
+    }
+
+    if (client[kRunning] === 0 && client[kPending] > 0 && socket[kSocketUsed]) {
+      if (socket[kIdleSocketValidation] === 0) {
+        scheduleIdleSocketValidation(client, socket)
+        socket[kParser].readMore()
+        if (socket.destroyed) {
+          return
+        }
+        return
+      }
+
+      if (socket[kIdleSocketValidation] === 1) {
+        socket[kParser].readMore()
+        if (socket.destroyed) {
+          return
+        }
+        return
+      }
+    }
+
+    if (client[kRunning] === 0) {
+      socket[kParser].readMore()
+      if (socket.destroyed) {
+        return
+      }
     }
 
     if (client[kSize] === 0) {
@@ -20306,8 +22490,16 @@ function writeH1 (client, request) {
     }
     body = bodyStream.stream
     contentLength = bodyStream.length
-  } else if (util.isBlobLike(body) && request.contentType == null && body.type) {
-    headers.push('content-type', body.type)
+  } else if (util.isBlobLike(body) && request.contentType == null) {
+    const contentType = body.type
+    if (contentType) {
+      const contentTypeValue = `${contentType}`
+      if (!util.isValidHeaderValue(contentTypeValue)) {
+        util.errorRequest(client, request, new InvalidArgumentError('invalid content-type header'))
+        return false
+      }
+      headers.push('content-type', contentTypeValue)
+    }
   }
 
   if (body && typeof body.read === 'function') {
@@ -20344,13 +22536,24 @@ function writeH1 (client, request) {
   }
 
   const socket = client[kSocket]
+  clearIdleSocketValidation(socket)
 
-  const abort = (err) => {
-    if (request.aborted || request.completed) {
+  /**
+   * @param {Error} [error]
+   */
+  const abort = (error) => {
+    if (request.aborted) {
       return
     }
 
-    util.errorRequest(client, request, err || new RequestAbortedError())
+    if (request.completed) {
+      if (request.upgrade || request.method === 'CONNECT') {
+        util.destroy(socket, new InformationalError('aborted'))
+      }
+      return
+    }
+
+    util.errorRequest(client, request, error || new RequestAbortedError())
 
     util.destroy(body)
     util.destroy(socket, new InformationalError('aborted'))
@@ -20808,6 +23011,7 @@ module.exports = connectH1
 
 
 const assert = __nccwpck_require__(8061)
+const { errorMonitor } = __nccwpck_require__(5673)
 const { pipeline } = __nccwpck_require__(4492)
 const util = __nccwpck_require__(3983)
 const {
@@ -20884,6 +23088,15 @@ function parseH2Headers (headers) {
   return result
 }
 
+/**
+ * @param {import('node:http2').IncomingHttpHeaders} headers
+ * @returns {Buffer[]}
+ */
+function parseH2ResponseHeaders (headers) {
+  const { [HTTP2_HEADER_STATUS]: _statusCode, ...realHeaders } = headers
+  return parseH2Headers(realHeaders)
+}
+
 async function connectH2 (client, socket) {
   client[kSocket] = socket
 
@@ -20933,8 +23146,6 @@ async function connectH2 (client, socket) {
   socket[kHTTP2Session] = session
 
   util.addListener(socket, 'error', function (err) {
-    assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
     this[kError] = err
 
     this[kClient][kOnError](err)
@@ -21008,8 +23219,6 @@ function resumeH2 (client) {
 }
 
 function onHttp2SessionError (err) {
-  assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
-
   this[kSocket][kError] = err
   this[kClient][kOnError](err)
 }
@@ -21104,22 +23313,32 @@ function writeH2 (client, request) {
   headers[HTTP2_HEADER_AUTHORITY] = host || `${hostname}${port ? `:${port}` : ''}`
   headers[HTTP2_HEADER_METHOD] = method
 
-  const abort = (err) => {
-    if (request.aborted || request.completed) {
+  /**
+   * @param {Error} [error]
+   */
+  const abort = (error) => {
+    if (request.aborted) {
       return
     }
 
-    err = err || new RequestAbortedError()
+    if (request.completed) {
+      if (method === 'CONNECT' && stream != null) {
+        util.destroy(stream, error || new RequestAbortedError())
+      }
+      return
+    }
 
-    util.errorRequest(client, request, err)
+    error = error || new RequestAbortedError()
+
+    util.errorRequest(client, request, error)
 
     if (stream != null) {
-      util.destroy(stream, err)
+      util.destroy(stream, error)
     }
 
     // We do not destroy the socket as we can continue using the session
     // the stream get's destroyed and the session remains to create new streams
-    util.destroy(body, err)
+    util.destroy(body, error)
     client[kQueue][client[kRunningIdx]++] = null
     client[kResume]()
   }
@@ -21138,25 +23357,57 @@ function writeH2 (client, request) {
 
   if (method === 'CONNECT') {
     session.ref()
-    // We are already connected, streams are pending, first request
-    // will create a new stream. We trigger a request to create the stream and wait until
-    // `ready` event is triggered
     // We disabled endStream to allow the user to write to the stream
     stream = session.request(headers, { endStream: false, signal })
+    let upgradeResponseFinished = false
 
-    if (stream.id && !stream.pending) {
-      request.onUpgrade(null, null, stream)
-      ++session[kOpenStreams]
-      client[kQueue][client[kRunningIdx]++] = null
-    } else {
-      stream.once('ready', () => {
-        request.onUpgrade(null, null, stream)
-        ++session[kOpenStreams]
-        client[kQueue][client[kRunningIdx]++] = null
-      })
+    /**
+     * @param {import('node:http2').IncomingHttpHeaders} headers
+     */
+    const onResponse = (headers) => {
+      upgradeResponseFinished = true
+      stream.off(errorMonitor, onUpgradeError)
+      request.onUpgradeResponse(Number(headers[HTTP2_HEADER_STATUS]), headers, parseH2ResponseHeaders)
     }
 
+    /**
+     * @param {Error} error
+     */
+    const onUpgradeError = (error) => {
+      upgradeResponseFinished = true
+      stream.off('response', onResponse)
+      request.onUpgradeError(error)
+    }
+
+    const onReady = () => {
+      try {
+        request.onUpgrade(null, null, stream)
+      } catch (error) {
+        stream.off('response', onResponse)
+        abort(error)
+        return
+      }
+
+      if (request.aborted) {
+        return
+      }
+
+      stream.off('error', abort)
+      stream.once(errorMonitor, onUpgradeError)
+      client[kQueue][client[kRunningIdx]++] = null
+    }
+
+    stream.once('response', onResponse)
+    stream.once('error', abort)
+    ++session[kOpenStreams]
+    onReady()
+
     stream.once('close', () => {
+      if (!upgradeResponseFinished && request.completed) {
+        stream.off('response', onResponse)
+        stream.off(errorMonitor, onUpgradeError)
+        request.onUpgradeError(new InformationalError(`HTTP/2: "stream error" received - code ${stream.rstCode}`))
+      }
       session[kOpenStreams] -= 1
       if (session[kOpenStreams] === 0) session.unref()
     })
@@ -21666,9 +23917,10 @@ class Client extends DispatcherBase {
     // h2
     maxConcurrentStreams,
     allowH2,
-    webSocket
+    webSocket,
+    eventSource
   } = {}) {
-    super({ webSocket })
+    super({ webSocket, eventSource })
 
     if (keepAlive !== undefined) {
       throw new InvalidArgumentError('unsupported keepAlive, use pipelining=0 instead')
@@ -22190,6 +24442,7 @@ module.exports = Client
 "use strict";
 
 
+const buffer = __nccwpck_require__(2254)
 const Dispatcher = __nccwpck_require__(7781)
 const {
   ClientDestroyedError,
@@ -22202,6 +24455,7 @@ const kOnDestroyed = Symbol('onDestroyed')
 const kOnClosed = Symbol('onClosed')
 const kInterceptedDispatch = Symbol('Intercepted Dispatch')
 const kWebSocketOptions = Symbol('webSocketOptions')
+const kEventSourceOptions = Symbol('eventSourceOptions')
 
 class DispatcherBase extends Dispatcher {
   constructor (opts) {
@@ -22212,11 +24466,19 @@ class DispatcherBase extends Dispatcher {
     this[kClosed] = false
     this[kOnClosed] = []
     this[kWebSocketOptions] = opts?.webSocket ?? {}
+    this[kEventSourceOptions] = opts?.eventSource ?? {}
   }
 
   get webSocketOptions () {
     return {
+      maxFragments: this[kWebSocketOptions].maxFragments ?? 131072,
       maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024
+    }
+  }
+
+  get eventSourceOptions () {
+    return {
+      maxEventSize: this[kEventSourceOptions].maxEventSize ?? buffer.kStringMaxLength
     }
   }
 
@@ -23792,6 +26054,28 @@ function calculateRetryAfterHeader (retryAfter) {
   return new Date(retryAfter).getTime() - current
 }
 
+function validatePartialResponseContentLength (headers, range, statusCode, retryCount) {
+  const contentLength = headers['content-length']
+  if (contentLength == null) {
+    return null
+  }
+
+  if (!Number.isFinite(range.start) || !Number.isFinite(range.end)) {
+    return null
+  }
+
+  const length = Number(contentLength)
+  const expectedLength = range.end - range.start + 1
+  if (!Number.isFinite(length) || length !== expectedLength) {
+    return new RequestRetryError('Content-Length mismatch', statusCode, {
+      headers,
+      data: { count: retryCount }
+    })
+  }
+
+  return null
+}
+
 class RetryHandler {
   constructor (opts, handlers) {
     const { retryOptions, ...dispatchOpts } = opts
@@ -23845,6 +26129,7 @@ class RetryHandler {
     this.end = null
     this.etag = null
     this.resume = null
+    this.headersSent = false
 
     // Handle possible onConnect duplication
     this.handler.onConnect(reason => {
@@ -23855,6 +26140,20 @@ class RetryHandler {
         this.reason = reason
       }
     })
+  }
+
+  checkpointResponseEnd (headers, resume) {
+    if (this.end == null && this.opts.method !== 'HEAD') {
+      const contentLength = headers['content-length']
+      this.end = contentLength != null ? Number(contentLength) - 1 : null
+
+      assert(
+        this.end == null || Number.isFinite(this.end),
+        'invalid content-length'
+      )
+    }
+
+    this.resume = this.end != null ? resume : null
   }
 
   onRequestSent () {
@@ -23945,7 +26244,12 @@ class RetryHandler {
     this.retryCount += 1
 
     if (statusCode >= 300) {
-      if (this.retryOpts.statusCodes.includes(statusCode) === false) {
+      // Only expose a response if no earlier attempt has reached the caller.
+      // Otherwise abort this attempt so the error settles the existing body
+      // instead of replacing it with a new response.
+      if (!this.headersSent && this.retryOpts.statusCodes.includes(statusCode) === false) {
+        this.headersSent = true
+        this.checkpointResponseEnd(headers, resume)
         return this.handler.onHeaders(
           statusCode,
           rawHeaders,
@@ -24006,10 +26310,23 @@ class RetryHandler {
         return false
       }
 
+      const contentLengthError = validatePartialResponseContentLength(headers, contentRange, statusCode, this.retryCount)
+      if (contentLengthError != null) {
+        this.abort(contentLengthError)
+        return false
+      }
+
       const { start, size, end = size - 1 } = contentRange
 
-      assert(this.start === start, 'content-range mismatch')
-      assert(this.end == null || this.end === end, 'content-range mismatch')
+      if (this.start !== start || (this.end != null && this.end !== end)) {
+        this.abort(
+          new RequestRetryError('Content-Range mismatch', statusCode, {
+            headers,
+            data: { count: this.retryCount }
+          })
+        )
+        return false
+      }
 
       this.resume = resume
       return true
@@ -24021,12 +26338,19 @@ class RetryHandler {
         const range = parseRangeHeader(headers['content-range'])
 
         if (range == null) {
+          this.headersSent = true
           return this.handler.onHeaders(
             statusCode,
             rawHeaders,
             resume,
             statusMessage
           )
+        }
+
+        const contentLengthError = validatePartialResponseContentLength(headers, range, statusCode, this.retryCount)
+        if (contentLengthError != null) {
+          this.abort(contentLengthError)
+          return false
         }
 
         const { start, size, end = size - 1 } = range
@@ -24053,6 +26377,7 @@ class RetryHandler {
       )
 
       this.resume = resume
+      this.headersSent = true
       this.etag = headers.etag != null ? headers.etag : null
 
       // Weak etags are not useful for comparison nor cache
@@ -24092,7 +26417,7 @@ class RetryHandler {
   }
 
   onError (err) {
-    if (this.aborted || isDisturbed(this.opts.body)) {
+    if (this.aborted || isDisturbed(this.opts.body) || (this.headersSent && this.resume == null)) {
       return this.handler.onError(err)
     }
 
@@ -28152,32 +30477,25 @@ function parseUnparsedAttributes (unparsedAttributes, cookieAttributeList = {}) 
     // If the attribute-name case-insensitively matches the string
     // "SameSite", the user agent MUST process the cookie-av as follows:
 
-    // 1. Let enforcement be "Default".
-    let enforcement = 'Default'
-
     const attributeValueLowercase = attributeValue.toLowerCase()
-    // 2. If cookie-av's attribute-value is a case-insensitive match for
-    //    "None", set enforcement to "None".
-    if (attributeValueLowercase.includes('none')) {
-      enforcement = 'None'
-    }
 
-    // 3. If cookie-av's attribute-value is a case-insensitive match for
-    //    "Strict", set enforcement to "Strict".
-    if (attributeValueLowercase.includes('strict')) {
-      enforcement = 'Strict'
+    // 1. If cookie-av's attribute-value is a case-insensitive match for
+    //    "None", append an attribute to the cookie-attribute-list with an
+    //    attribute-name of "SameSite" and an attribute-value of "None".
+    if (attributeValueLowercase === 'none') {
+      cookieAttributeList.sameSite = 'None'
+    } else if (attributeValueLowercase === 'strict') {
+      // 2. If cookie-av's attribute-value is a case-insensitive match for
+      //    "Strict", append an attribute to the cookie-attribute-list with
+      //    an attribute-name of "SameSite" and an attribute-value of
+      //    "Strict".
+      cookieAttributeList.sameSite = 'Strict'
+    } else if (attributeValueLowercase === 'lax') {
+      // 3. If cookie-av's attribute-value is a case-insensitive match for
+      //    "Lax", append an attribute to the cookie-attribute-list with an
+      //    attribute-name of "SameSite" and an attribute-value of "Lax".
+      cookieAttributeList.sameSite = 'Lax'
     }
-
-    // 4. If cookie-av's attribute-value is a case-insensitive match for
-    //    "Lax", set enforcement to "Lax".
-    if (attributeValueLowercase.includes('lax')) {
-      enforcement = 'Lax'
-    }
-
-    // 5. Append an attribute to the cookie-attribute-list with an
-    //    attribute-name of "SameSite" and an attribute-value of
-    //    enforcement.
-    cookieAttributeList.sameSite = enforcement
   } else {
     cookieAttributeList.unparsed ??= []
 
@@ -28307,7 +30625,7 @@ function validateCookiePath (path) {
 
     if (
       code < 0x20 || // exclude CTLs (0-31)
-      code === 0x7F || // DEL
+      code > 0x7E || // exclude DEL and non-ascii
       code === 0x3B // ;
     ) {
       throw new Error('Invalid cookie path')
@@ -28316,16 +30634,80 @@ function validateCookiePath (path) {
 }
 
 /**
- * I have no idea why these values aren't allowed to be honest,
- * but Deno tests these. - Khafra
+ * <let-dig> ::= <letter> | <digit>
+ *
+ * <letter> ::= any one of the 52 alphabetic characters A through Z in
+ * upper case and a through z in lower case
+ *
+ * <digit> ::= any one of the ten digits 0 through 9r
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc1034#section-3.5
+ * @param {number} code
+ */
+function isLetterOrDigit (code) {
+  return (
+    (code >= 0x30 && code <= 0x39) || // 0-9
+    (code >= 0x41 && code <= 0x5A) || // A-Z
+    (code >= 0x61 && code <= 0x7A) // a-z
+  )
+}
+
+/**
+ * Validates a cookie domain against the "preferred name syntax".
+ *
+ * <domain>      ::= <subdomain> | " "
+ * <subdomain>   ::= <label> | <subdomain> "." <label>
+ * <label>       ::= <let-dig> [ [ <ldh-str> ] <let-dig> ]
+ * <ldh-str>     ::= <let-dig-hyp> | <let-dig-hyp> <ldh-str>
+ * <let-dig-hyp> ::= <let-dig> | "-"
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc1034#section-3.5
+ * @see https://www.rfc-editor.org/rfc/rfc1123#section-2.1
+ * @see https://www.rfc-editor.org/rfc/rfc1035#section-2.3.4
  * @param {string} domain
  */
 function validateCookieDomain (domain) {
-  if (
-    domain.startsWith('-') ||
-    domain.endsWith('.') ||
-    domain.endsWith('-')
-  ) {
+  // <domain> ::= <subdomain> | " "
+  if (domain === ' ') {
+    return
+  }
+
+  if (domain.length > 255) {
+    throw new Error('Invalid cookie domain')
+  }
+
+  let labelLength = 0
+
+  for (let i = 0; i < domain.length; ++i) {
+    const code = domain.charCodeAt(i)
+
+    if (code === 0x2E) {
+      if (labelLength === 0) {
+        throw new Error('Invalid cookie domain')
+      }
+
+      if (domain.charCodeAt(i - 1) === 0x2D) { // "-"
+        throw new Error('Invalid cookie domain')
+      }
+
+      labelLength = 0
+      continue
+    }
+
+    if (labelLength === 0 && !isLetterOrDigit(code)) {
+      throw new Error('Invalid cookie domain')
+    }
+
+    if (!isLetterOrDigit(code) && code !== 0x2D) { // "-"
+      throw new Error('Invalid cookie domain')
+    }
+
+    if (++labelLength > 63) {
+      throw new Error('Invalid cookie domain')
+    }
+  }
+
+  if (labelLength === 0 || domain.charCodeAt(domain.length - 1) === 0x2D) { // "-"
     throw new Error('Invalid cookie domain')
   }
 }
@@ -28468,7 +30850,13 @@ function stringify (cookie) {
 
     const [key, ...value] = part.split('=')
 
-    out.push(`${key.trim()}=${value.join('=')}`)
+    const trimmedKey = key.trim()
+    const joinedValue = value.join('=')
+
+    validateCookieName(trimmedKey)
+    validateCookieValue(joinedValue)
+
+    out.push(`${trimmedKey}=${joinedValue}`)
   }
 
   return out.join('; ')
@@ -28491,6 +30879,7 @@ module.exports = {
 
 "use strict";
 
+const buffer = __nccwpck_require__(2254)
 const { Transform } = __nccwpck_require__(4492)
 const { isASCIINumber, isValidLastEventId } = __nccwpck_require__(8865)
 
@@ -28514,6 +30903,63 @@ const COLON = 0x3A
  * @type {32} SPACE
  */
 const SPACE = 0x20
+
+const defaultMaxEventSize = buffer.kStringMaxLength
+
+const DATA = Buffer.from('data')
+const EVENT = Buffer.from('event')
+const ID = Buffer.from('id')
+const RETRY = Buffer.from('retry')
+
+// Each data field creates a string node, and each unconsumed input chunk keeps
+// a Buffer wrapper. The absolute ceiling protects the large default byte limit.
+const minParserItems = 1024
+const maxParserItems = 131072
+const bytesPerParserItem = 128
+
+function isASCIINumberBytes (buffer, start) {
+  if (start >= buffer.length) {
+    return false
+  }
+
+  for (let i = start; i < buffer.length; i++) {
+    if (buffer[i] < 0x30 || buffer[i] > 0x39) {
+      return false
+    }
+  }
+
+  return true
+}
+
+function isValidLastEventIdBytes (buffer, start) {
+  for (let i = start; i < buffer.length; i++) {
+    if (buffer[i] === 0x00) {
+      return false
+    }
+  }
+
+  return true
+}
+
+function isFieldName (line, length, field) {
+  if (length !== field.length) {
+    return false
+  }
+
+  for (let i = 0; i < length; i++) {
+    if (line[i] !== field[i]) {
+      return false
+    }
+  }
+
+  return true
+}
+
+function createMaxEventSizeExceededError () {
+  const error = new Error('EventSource message size exceeded')
+  error.aborted = false
+  return error
+}
 
 /**
  * @typedef {object} EventSourceStreamEvent
@@ -28555,11 +31001,21 @@ class EventSourceStream extends Transform {
   eventEndCheck = false
 
   /**
-   * @type {Buffer}
+   * @type {Buffer[]}
    */
-  buffer = null
+  chunks = []
 
+  chunkIndex = 0
   pos = 0
+  lineChunkIndex = 0
+  linePos = 0
+  lineLength = 0
+  eventSize = 0
+  eventFieldSizes = { data: 0, event: 0, id: 0, retry: 0 }
+  dataLineCount = 0
+  maxEventSize
+  maxDataLines
+  maxBufferedChunks
 
   event = {
     data: undefined,
@@ -28570,6 +31026,7 @@ class EventSourceStream extends Transform {
 
   /**
    * @param {object} options
+   * @param {number} [options.maxEventSize]
    * @param {eventSourceSettings} options.eventSourceSettings
    * @param {Function} [options.push]
    */
@@ -28581,6 +31038,12 @@ class EventSourceStream extends Transform {
     super(options)
 
     this.state = options.eventSourceSettings || {}
+    this.maxEventSize = options.maxEventSize ?? defaultMaxEventSize
+    const parserItemLimit = this.maxEventSize > 0
+      ? Math.min(maxParserItems, Math.max(minParserItems, Math.floor(this.maxEventSize / bytesPerParserItem)))
+      : 0
+    this.maxDataLines = parserItemLimit
+    this.maxBufferedChunks = parserItemLimit
     if (options.push) {
       this.push = options.push
     }
@@ -28598,92 +31061,28 @@ class EventSourceStream extends Transform {
       return
     }
 
-    // Cache the chunk in the buffer, as the data might not be complete while
-    // processing it
-    // TODO: Investigate if there is a more performant way to handle
-    // incoming chunks
-    // see: https://github.com/nodejs/undici/issues/2630
-    if (this.buffer) {
-      this.buffer = Buffer.concat([this.buffer, chunk])
-    } else {
-      this.buffer = chunk
+    // A leading line ending can immediately release the currently buffered
+    // line, even when it uses the final allowed chunk slot.
+    if (this.maxEventSize > 0 &&
+        this.chunks.length >= this.maxBufferedChunks &&
+        chunk[0] !== LF && chunk[0] !== CR) {
+      callback(createMaxEventSizeExceededError())
+      return
     }
+    this.chunks.push(chunk)
 
     // Strip leading byte-order-mark if we opened the stream and started
     // the processing of the incoming data
     if (this.checkBOM) {
-      switch (this.buffer.length) {
-        case 1:
-          // Check if the first byte is the same as the first byte of the BOM
-          if (this.buffer[0] === BOM[0]) {
-            // If it is, we need to wait for more data
-            callback()
-            return
-          }
-          // Set the checkBOM flag to false as we don't need to check for the
-          // BOM anymore
-          this.checkBOM = false
-
-          // The buffer only contains one byte so we need to wait for more data
-          callback()
-          return
-        case 2:
-          // Check if the first two bytes are the same as the first two bytes
-          // of the BOM
-          if (
-            this.buffer[0] === BOM[0] &&
-            this.buffer[1] === BOM[1]
-          ) {
-            // If it is, we need to wait for more data, because the third byte
-            // is needed to determine if it is the BOM or not
-            callback()
-            return
-          }
-
-          // Set the checkBOM flag to false as we don't need to check for the
-          // BOM anymore
-          this.checkBOM = false
-          break
-        case 3:
-          // Check if the first three bytes are the same as the first three
-          // bytes of the BOM
-          if (
-            this.buffer[0] === BOM[0] &&
-            this.buffer[1] === BOM[1] &&
-            this.buffer[2] === BOM[2]
-          ) {
-            // If it is, we can drop the buffered data, as it is only the BOM
-            this.buffer = Buffer.alloc(0)
-            // Set the checkBOM flag to false as we don't need to check for the
-            // BOM anymore
-            this.checkBOM = false
-
-            // Await more data
-            callback()
-            return
-          }
-          // If it is not the BOM, we can start processing the data
-          this.checkBOM = false
-          break
-        default:
-          // The buffer is longer than 3 bytes, so we can drop the BOM if it is
-          // present
-          if (
-            this.buffer[0] === BOM[0] &&
-            this.buffer[1] === BOM[1] &&
-            this.buffer[2] === BOM[2]
-          ) {
-            // Remove the BOM from the buffer
-            this.buffer = this.buffer.subarray(3)
-          }
-
-          // Set the checkBOM flag to false as we don't need to check for the
-          this.checkBOM = false
-          break
+      if (this.handleBOM()) {
+        callback()
+        return
       }
     }
 
-    while (this.pos < this.buffer.length) {
+    while (this.hasCurrentByte()) {
+      const byte = this.currentByte()
+
       // If the previous line ended with an end-of-line, we need to check
       // if the next character is also an end-of-line.
       if (this.eventEndCheck) {
@@ -28696,10 +31095,9 @@ class EventSourceStream extends Transform {
         if (this.crlfCheck) {
           // If the current character is a line feed, we can remove it
           // from the buffer and reset the crlfCheck flag
-          if (this.buffer[this.pos] === LF) {
-            this.buffer = this.buffer.subarray(this.pos + 1)
-            this.pos = 0
+          if (byte === LF) {
             this.crlfCheck = false
+            this.consumeCurrentByte()
 
             // It is possible that the line feed is not the end of the
             // event. We need to check if the next character is an
@@ -28715,19 +31113,17 @@ class EventSourceStream extends Transform {
           this.crlfCheck = false
         }
 
-        if (this.buffer[this.pos] === LF || this.buffer[this.pos] === CR) {
+        if (byte === LF || byte === CR) {
           // If the current character is a carriage return, we need to
           // set the crlfCheck flag to true, as we need to check if the
           // next character is a line feed so we can remove it from the
           // buffer
-          if (this.buffer[this.pos] === CR) {
+          if (byte === CR) {
             this.crlfCheck = true
           }
 
-          this.buffer = this.buffer.subarray(this.pos + 1)
-          this.pos = 0
-          if (
-            this.event.data !== undefined || this.event.event || this.event.id || this.event.retry) {
+          this.consumeCurrentByte()
+          if (this.hasPendingEvent()) {
             this.processEvent(this.event)
           }
           this.clearEvent()
@@ -28741,22 +31137,23 @@ class EventSourceStream extends Transform {
 
       // If the current character is an end-of-line, we can process the
       // line
-      if (this.buffer[this.pos] === LF || this.buffer[this.pos] === CR) {
+      if (byte === LF || byte === CR) {
         // If the current character is a carriage return, we need to
         // set the crlfCheck flag to true, as we need to check if the
         // next character is a line feed
-        if (this.buffer[this.pos] === CR) {
+        if (byte === CR) {
           this.crlfCheck = true
         }
 
         // In any case, we can process the line as we reached an
         // end-of-line character
-        this.parseLine(this.buffer.subarray(0, this.pos), this.event)
-
-        // Remove the processed line from the buffer
-        this.buffer = this.buffer.subarray(this.pos + 1)
-        // Reset the position as we removed the processed line from the buffer
-        this.pos = 0
+        try {
+          this.parseLine(this.readLine(), this.event)
+        } catch (error) {
+          callback(error)
+          return
+        }
+        this.consumeCurrentByte()
         // A line was processed and this could be the end of the event. We need
         // to check if the next line is empty to determine if the event is
         // finished.
@@ -28764,15 +31161,28 @@ class EventSourceStream extends Transform {
         continue
       }
 
-      this.pos++
+      // readLine() is only called after CR or LF. Reject an unfinished line
+      // before it can retain an unbounded number of decoded chunks. The seven
+      // extra bytes allow the longest field prefix ("event: " or "retry: ").
+      if (this.maxEventSize > 0 && ++this.lineLength > this.maxEventSize + 7) {
+        callback(createMaxEventSizeExceededError())
+        return
+      }
+      this.advanceCursor()
     }
 
     callback()
   }
 
+  _destroy (error, callback) {
+    this.chunks.length = 0
+    this.clearEvent()
+    super._destroy(error, callback)
+  }
+
   /**
    * @param {Buffer} line
-   * @param {EventStreamEvent} event
+   * @param {EventSourceStreamEvent} event
    */
   parseLine (line, event) {
     // If the line is empty (a blank line)
@@ -28789,65 +31199,72 @@ class EventSourceStream extends Transform {
       return
     }
 
-    let field = ''
-    let value = ''
+    let fieldLength = line.length
+    let valueStart = line.length
 
     // If the line contains a U+003A COLON character (:)
     if (colonPosition !== -1) {
-      // Collect the characters on the line before the first U+003A COLON
-      // character (:), and let field be that string.
-      // TODO: Investigate if there is a more performant way to extract the
-      // field
-      // see: https://github.com/nodejs/undici/issues/2630
-      field = line.subarray(0, colonPosition).toString('utf8')
+      fieldLength = colonPosition
 
       // Collect the characters on the line after the first U+003A COLON
       // character (:), and let value be that string.
       // If value starts with a U+0020 SPACE character, remove it from value.
-      let valueStart = colonPosition + 1
+      valueStart = colonPosition + 1
       if (line[valueStart] === SPACE) {
         ++valueStart
       }
-      // TODO: Investigate if there is a more performant way to extract the
-      // value
-      // see: https://github.com/nodejs/undici/issues/2630
-      value = line.subarray(valueStart).toString('utf8')
-
-      // Otherwise, the string is not empty but does not contain a U+003A COLON
-      // character (:)
-    } else {
-      // Process the field using the steps described below, using the whole
-      // line as the field name, and the empty string as the field value.
-      field = line.toString('utf8')
-      value = ''
     }
 
-    // Modify the event with the field name and value. The value is also
-    // decoded as UTF-8
-    switch (field) {
-      case 'data':
-        if (event[field] === undefined) {
-          event[field] = value
-        } else {
-          event[field] += `\n${value}`
-        }
-        break
-      case 'retry':
-        if (isASCIINumber(value)) {
-          event[field] = value
-        }
-        break
-      case 'id':
-        if (isValidLastEventId(value)) {
-          event[field] = value
-        }
-        break
-      case 'event':
-        if (value.length > 0) {
-          event[field] = value
-        }
-        break
+    if (isFieldName(line, fieldLength, DATA)) {
+      if (this.maxEventSize > 0 && this.dataLineCount >= this.maxDataLines) {
+        throw createMaxEventSizeExceededError()
+      }
+      const valueBytes = line.length - valueStart
+      const dataSize = this.eventFieldSizes.data + (event.data === undefined ? 0 : 1) + valueBytes
+      this.setEventFieldSize('data', dataSize)
+
+      const value = line.toString('utf8', valueStart)
+
+      if (event.data === undefined) {
+        event.data = value
+      } else {
+        event.data += `\n${value}`
+      }
+      this.dataLineCount++
+      return
     }
+
+    if (isFieldName(line, fieldLength, RETRY)) {
+      if (isASCIINumberBytes(line, valueStart)) {
+        this.setEventFieldSize('retry', line.length - valueStart)
+        event.retry = line.toString('utf8', valueStart)
+      }
+      return
+    }
+
+    if (isFieldName(line, fieldLength, ID)) {
+      if (isValidLastEventIdBytes(line, valueStart)) {
+        this.setEventFieldSize('id', line.length - valueStart)
+        event.id = line.toString('utf8', valueStart)
+      }
+      return
+    }
+
+    if (isFieldName(line, fieldLength, EVENT)) {
+      if (valueStart < line.length) {
+        this.setEventFieldSize('event', line.length - valueStart)
+        event.event = line.toString('utf8', valueStart)
+      }
+    }
+  }
+
+  setEventFieldSize (field, size) {
+    const eventSize = this.eventSize - this.eventFieldSizes[field] + size
+    if (this.maxEventSize > 0 && eventSize > this.maxEventSize) {
+      throw createMaxEventSizeExceededError()
+    }
+    this.eventSize = eventSize
+    this.eventFieldSizes[field] = size
   }
 
   /**
@@ -28876,12 +31293,159 @@ class EventSourceStream extends Transform {
   }
 
   clearEvent () {
-    this.event = {
-      data: undefined,
-      event: undefined,
-      id: undefined,
-      retry: undefined
+    this.event.data = undefined
+    this.event.event = undefined
+    this.event.id = undefined
+    this.event.retry = undefined
+    this.eventSize = 0
+    this.dataLineCount = 0
+    this.eventFieldSizes.data = 0
+    this.eventFieldSizes.event = 0
+    this.eventFieldSizes.id = 0
+    this.eventFieldSizes.retry = 0
+  }
+
+  hasPendingEvent () {
+    return this.event.data !== undefined ||
+      this.event.event !== undefined ||
+      this.event.id !== undefined ||
+      this.event.retry !== undefined
+  }
+
+  hasCurrentByte () {
+    return this.chunkIndex < this.chunks.length &&
+      this.pos < this.chunks[this.chunkIndex].length
+  }
+
+  currentByte () {
+    return this.chunks[this.chunkIndex][this.pos]
+  }
+
+  consumeCurrentByte () {
+    this.advanceCursor()
+    this.syncLineStartToCursor()
+  }
+
+  advanceCursor () {
+    this.pos++
+
+    while (this.chunkIndex < this.chunks.length && this.pos >= this.chunks[this.chunkIndex].length) {
+      this.chunkIndex++
+      this.pos = 0
     }
+  }
+
+  syncLineStartToCursor () {
+    this.lineChunkIndex = this.chunkIndex
+    this.linePos = this.pos
+    this.lineLength = 0
+    this.dropConsumedChunks()
+  }
+
+  dropConsumedChunks () {
+    if (this.lineChunkIndex > 0) {
+      const consumed = this.lineChunkIndex
+      this.chunks.splice(0, consumed)
+      this.lineChunkIndex = 0
+      this.chunkIndex -= consumed
+    }
+
+    if (this.chunkIndex === this.chunks.length) {
+      this.chunks.length = 0
+      this.chunkIndex = 0
+      this.pos = 0
+      this.lineChunkIndex = 0
+      this.linePos = 0
+    }
+  }
+
+  readLine () {
+    if (this.lineChunkIndex === this.chunkIndex) {
+      return this.chunks[this.chunkIndex].subarray(this.linePos, this.pos)
+    }
+
+    const chunks = []
+    let length = 0
+
+    for (let i = this.lineChunkIndex; i <= this.chunkIndex; i++) {
+      const chunk = this.chunks[i]
+      const start = i === this.lineChunkIndex ? this.linePos : 0
+      const end = i === this.chunkIndex ? this.pos : chunk.length
+      const slice = chunk.subarray(start, end)
+      length += slice.length
+      chunks.push(slice)
+    }
+
+    return Buffer.concat(chunks, length)
+  }
+
+  peekBufferedByte (offset) {
+    let chunkIndex = this.lineChunkIndex
+    let pos = this.linePos
+
+    while (chunkIndex < this.chunks.length) {
+      const chunk = this.chunks[chunkIndex]
+      const remaining = chunk.length - pos
+
+      if (offset < remaining) {
+        return chunk[pos + offset]
+      }
+
+      offset -= remaining
+      chunkIndex++
+      pos = 0
+    }
+  }
+
+  discardLeadingBytes (count) {
+    while (count > 0 && this.lineChunkIndex < this.chunks.length) {
+      const chunk = this.chunks[this.lineChunkIndex]
+      const remaining = chunk.length - this.linePos
+
+      if (count < remaining) {
+        this.linePos += count
+        count = 0
+      } else {
+        count -= remaining
+        this.lineChunkIndex++
+        this.linePos = 0
+      }
+    }
+
+    this.chunkIndex = this.lineChunkIndex
+    this.pos = this.linePos
+    this.dropConsumedChunks()
+  }
+
+  handleBOM () {
+    const first = this.peekBufferedByte(0)
+    const second = this.peekBufferedByte(1)
+    const third = this.peekBufferedByte(2)
+
+    if (second === undefined) {
+      if (first === BOM[0]) {
+        return true
+      }
+
+      this.checkBOM = false
+      return true
+    }
+
+    if (third === undefined) {
+      if (first === BOM[0] && second === BOM[1]) {
+        return true
+      }
+
+      this.checkBOM = false
+      return false
+    }
+
+    if (first === BOM[0] && second === BOM[1] && third === BOM[2]) {
+      this.discardLeadingBytes(3)
+    }
+
+    this.checkBOM = false
+    return !this.hasCurrentByte()
   }
 }
 
@@ -28909,6 +31473,7 @@ const { isNetworkError } = __nccwpck_require__(2583)
 const { delay } = __nccwpck_require__(8865)
 const { kEnumerableProperty } = __nccwpck_require__(3983)
 const { environmentSettingsObject } = __nccwpck_require__(1310)
+const { getGlobalDispatcher } = __nccwpck_require__(1892)
 
 let experimentalWarned = false
 
@@ -29190,6 +31755,7 @@ class EventSource extends EventTarget {
 
       const eventSourceStream = new EventSourceStream({
         eventSourceSettings: this.#state,
+        maxEventSize: this.#dispatcher.eventSourceOptions?.maxEventSize,
         push: (event) => {
           this.dispatchEvent(createFastMessageEvent(
             event.type,
@@ -29368,7 +31934,8 @@ webidl.converters.EventSourceInitDict = webidl.dictionaryConverter([
   },
   {
     key: 'dispatcher', // undici only
-    converter: webidl.converters.any
+    converter: webidl.converters.any,
+    defaultValue: () => getGlobalDispatcher()
   }
 ])
 
@@ -34475,8 +37042,10 @@ async function httpNetworkFetch (
   // 19. Run these steps in parallel:
 
   //    1. Run these steps, but abort when fetchParams is canceled:
-  fetchParams.controller.onAborted = onAborted
-  fetchParams.controller.on('terminated', onAborted)
+  if (!fetchParams.controller.resume) {
+    fetchParams.controller.on('terminated', onAborted)
+  }
+
   fetchParams.controller.resume = async () => {
     // 1. While true
     while (true) {
@@ -34645,8 +37214,6 @@ async function httpNetworkFetch (
           }
           location = headersList.get('location', true)
 
-          this.body = new Readable({ read: resume })
-
           const decoders = []
 
           const willFollow = location && request.redirect === 'follow' &&
@@ -34664,7 +37231,7 @@ async function httpNetworkFetch (
             // CVE fix similar to urllib3 (GHSA-gm62-xv2j-4w53) and curl (CVE-2022-32206).
             const maxContentEncodings = 5
             if (codings.length > maxContentEncodings) {
-              reject(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`))
+              this.abort(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`))
               return true
             }
 
@@ -34696,6 +37263,8 @@ async function httpNetworkFetch (
               }
             }
           }
+
+          this.body = new Readable({ read: resume })
 
           const onError = this.onError.bind(this)
 
@@ -34741,10 +37310,6 @@ async function httpNetworkFetch (
         onComplete () {
           if (this.abort) {
             fetchParams.controller.off('terminated', this.abort)
-          }
-
-          if (fetchParams.controller.onAborted) {
-            fetchParams.controller.off('terminated', fetchParams.controller.onAborted)
           }
 
           fetchParams.controller.ended = true
@@ -40173,7 +42738,7 @@ function establishWebSocketConnection (url, protocols, client, ws, onEstablish, 
         // is specified, the server needs to include the same field and one of
         // the selected subprotocol values in its response for the connection to
         // be established.
-        if (!requestProtocols.includes(secProtocol)) {
+        if (requestProtocols === null || !requestProtocols.includes(secProtocol)) {
           failWebsocketConnection(ws, 'Protocol was not set in the opening handshake.')
           return
         }
@@ -40938,7 +43503,12 @@ class PerMessageDeflate {
 
         if (this.#maxPayloadSize > 0 && this.#inflate[kLength] > this.#maxPayloadSize) {
           callback(new MessageSizeExceededError())
+          // The inflater may still hold buffered input that can emit a late
+          // zlib error. Remove the data listener, then deterministically stop
+          // the stream so a subsequent 'error' cannot fire without a listener
+          // (which would terminate the process as an unhandled error event).
           this.#inflate.removeAllListeners()
+          this.#inflate.destroy()
           this.#inflate = null
           return
         }
@@ -41003,6 +43573,11 @@ const { closeWebSocketConnection } = __nccwpck_require__(8380)
 const { PerMessageDeflate } = __nccwpck_require__(8236)
 const { MessageSizeExceededError } = __nccwpck_require__(8045)
 
+function failWebsocketConnectionWithCode (ws, code, reason) {
+  closeWebSocketConnection(ws, code, reason, Buffer.byteLength(reason))
+  failWebsocketConnection(ws, reason)
+}
+
 // This code was influenced by ws released under the MIT license.
 // Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com>
 // Copyright (c) 2013 Arnout Kazemier and contributors
@@ -41023,18 +43598,22 @@ class ByteParser extends Writable {
   #extensions
 
   /** @type {number} */
+  #maxFragments
+
+  /** @type {number} */
   #maxPayloadSize
 
   /**
    * @param {import('./websocket').WebSocket} ws
    * @param {Map<string, string>|null} extensions
-   * @param {{ maxPayloadSize?: number }} [options]
+   * @param {{ maxFragments?: number, maxPayloadSize?: number }} [options]
    */
   constructor (ws, extensions, options = {}) {
     super()
 
     this.ws = ws
     this.#extensions = extensions == null ? new Map() : extensions
+    this.#maxFragments = options.maxFragments ?? 0
     this.#maxPayloadSize = options.maxPayloadSize ?? 0
 
     if (this.#extensions.has('permessage-deflate')) {
@@ -41058,9 +43637,9 @@ class ByteParser extends Writable {
     if (
       this.#maxPayloadSize > 0 &&
       !isControlFrame(this.#info.opcode) &&
-      this.#info.payloadLength > this.#maxPayloadSize
+      this.#info.payloadLength + this.#fragmentsBytes > this.#maxPayloadSize
     ) {
-      failWebsocketConnection(this.ws, 'Payload size exceeds maximum allowed size')
+      failWebsocketConnectionWithCode(this.ws, 1009, 'Payload size exceeds maximum allowed size')
       return false
     }
 
@@ -41223,12 +43802,28 @@ class ByteParser extends Writable {
         if (isControlFrame(this.#info.opcode)) {
           this.#loop = this.parseControlFrame(body)
           this.#state = parserStates.INFO
+
+          // If the automatic PONG/CLOSE reply filled the socket's write buffer,
+          // stop parsing and resume on drain so a PING flood cannot grow the
+          // outbound queue without bound.
+          const socket = this.ws[kResponse].socket
+          if (this.#loop && socket.writableNeedDrain) {
+            this.#loop = false
+            socket.once('drain', () => {
+              if (this.destroyed) return
+              this.#loop = true
+              this.run(callback)
+            })
+            return
+          }
         } else {
           if (!this.#info.compressed) {
-            this.writeFragments(body)
+            if (!this.writeFragments(body)) {
+              return
+            }
 
             if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
-              failWebsocketConnection(this.ws, new MessageSizeExceededError().message)
+              failWebsocketConnectionWithCode(this.ws, 1009, new MessageSizeExceededError().message)
               return
             }
 
@@ -41247,14 +43842,17 @@ class ByteParser extends Writable {
               this.#info.fin,
               (error, data) => {
                 if (error) {
-                  failWebsocketConnection(this.ws, error.message)
+                  const code = error instanceof MessageSizeExceededError ? 1009 : 1007
+                  failWebsocketConnectionWithCode(this.ws, code, error.message)
                   return
                 }
 
-                this.writeFragments(data)
+                if (!this.writeFragments(data)) {
+                  return
+                }
 
                 if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
-                  failWebsocketConnection(this.ws, new MessageSizeExceededError().message)
+                  failWebsocketConnectionWithCode(this.ws, 1009, new MessageSizeExceededError().message)
                   return
                 }
 
@@ -41324,8 +43922,17 @@ class ByteParser extends Writable {
   }
 
   writeFragments (fragment) {
+    if (
+      this.#maxFragments > 0 &&
+      this.#fragments.length === this.#maxFragments
+    ) {
+      failWebsocketConnectionWithCode(this.ws, 1008, 'Too many message fragments')
+      return false
+    }
+
     this.#fragmentsBytes += fragment.length
     this.#fragments.push(fragment)
+    return true
   }
 
   consumeFragments () {
@@ -42378,9 +44985,12 @@ class WebSocket extends EventTarget {
     // once this happens, the connection is open
     this[kResponse] = response
 
-    const maxPayloadSize = this[kController]?.dispatcher?.webSocketOptions?.maxPayloadSize
+    const webSocketOptions = this[kController]?.dispatcher?.webSocketOptions
+    const maxFragments = webSocketOptions?.maxFragments
+    const maxPayloadSize = webSocketOptions?.maxPayloadSize
 
     const parser = new ByteParser(this, parsedExtensions, {
+      maxFragments,
       maxPayloadSize
     })
     parser.on('drain', onParserDrain)
@@ -42546,12 +45156,12 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.Activate = Activate;
 const core = __nccwpck_require__(2186);
 const unity_cli_1 = __nccwpck_require__(4858);
+const failure_markers_1 = __nccwpck_require__(8545);
+const deactivate_1 = __nccwpck_require__(8146);
 async function Activate() {
-    let licensingClient;
     let licenseType = undefined;
     try {
         core.saveState('isPost', true);
-        licensingClient = new unity_cli_1.LicensingClient(core.getInput('license-version'));
         const licenseInput = core.getInput('license', { required: true });
         licenseType = licenseInput.toLowerCase();
         switch (licenseType) {
@@ -42562,14 +45172,11 @@ async function Activate() {
             default:
                 throw Error(`Invalid License: ${licenseInput}! Must be one of: ${Object.values(unity_cli_1.LicenseType).join(', ')}`);
         }
-        core.saveState('license', licenseType);
-        if (licenseType !== unity_cli_1.LicenseType.floating) {
-            let activeLicenses = await licensingClient.GetActiveEntitlements();
-            if (activeLicenses.includes(licenseType)) {
-                core.info(`Unity ${licenseType} License already activated!`);
-                process.exit(0);
-            }
+        const returnLicense = (core.getInput('return-license') || 'auto').trim().toLowerCase();
+        if (!['auto', 'always', 'never'].includes(returnLicense)) {
+            throw Error(`Invalid return-license: ${returnLicense}! Must be one of: auto, always, never`);
         }
+        core.saveState('return-license', returnLicense);
         core.info('Attempting to activate Unity License...');
         let servicesConfig = undefined;
         let username = undefined;
@@ -42614,20 +45221,28 @@ async function Activate() {
             if (password.length === 0) {
                 throw Error('Password is required for Unity License Activation!');
             }
+            core.setSecret(username);
+            core.setSecret(password);
+            if (serial) {
+                core.setSecret(serial);
+            }
         }
-        const token = await licensingClient.Activate({ licenseType, servicesConfig, serial, username, password }, true);
+        const token = await (0, unity_cli_1.ActivateLicense)({ licenseType, servicesConfig, serial, username, password });
+        core.saveState('license', licenseType);
         if (token) {
             core.saveState('activation-token', token);
-        }
-        if (licenseType !== unity_cli_1.LicenseType.floating) {
-            let activeLicenses = await licensingClient.GetActiveEntitlements();
-            if (!activeLicenses.includes(licenseType)) {
-                throw Error(`Failed to activate Unity License with ${licenseType}!`);
-            }
         }
         core.info(`Unity ${licenseType} License Activated!`);
     }
     catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const marker = (0, failure_markers_1.ClassifyFailure)(message);
+        if (marker) {
+            core.notice(`Retryable failure: ${message}`, { title: marker });
+        }
+        if (marker === failure_markers_1.LICENSE_EXHAUSTED_MARKER && licenseType === unity_cli_1.LicenseType.professional) {
+            core.warning(`The Unity professional serial may have no free activations. ${deactivate_1.SEAT_FIX}`);
+        }
         core.setFailed(`Unity License Activation Failed!\n${error}`);
         process.exit(1);
     }
@@ -42642,23 +45257,36 @@ async function Activate() {
 "use strict";
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.SEAT_FIX = void 0;
 exports.Deactivate = Deactivate;
 const core = __nccwpck_require__(2186);
 const unity_cli_1 = __nccwpck_require__(4858);
+exports.SEAT_FIX = 'Release it at https://id.unity.com under My Seats, or set `return-license: always`.';
 async function Deactivate() {
+    let license = undefined;
     try {
-        const license = core.getState('license');
+        license = core.getState('license');
         if (!license) {
-            core.error(`Failed to get license state!`);
+            core.info('No license was activated, so there is nothing to return.');
             return;
         }
+        let when = (core.getState('return-license') || 'auto');
+        if (license === unity_cli_1.LicenseType.professional && when === 'auto') {
+            when = 'always';
+        }
+        if (license === unity_cli_1.LicenseType.professional && when === 'never') {
+            core.warning(`The Unity professional license was not returned, so it keeps holding a seat. ${exports.SEAT_FIX}`);
+        }
         const token = core.getState('activation-token');
-        core.debug(`post state: ${license}`);
+        core.debug(`post state: ${license}, return-license: ${when}`);
         core.info(`Unity ${license} License Deactivation...`);
-        await new unity_cli_1.LicensingClient().Deactivate(license, token);
+        await (0, unity_cli_1.ReturnLicense)(license, token || undefined, when);
     }
     catch (error) {
         core.error(`Failed to deactivate license!\n${error}`);
+        if (license === unity_cli_1.LicenseType.professional) {
+            core.warning(`The Unity professional license could not be returned, so it may keep holding a seat. ${exports.SEAT_FIX}`);
+        }
     }
     finally {
         process.exit(0);
@@ -42673,14 +45301,6 @@ async function Deactivate() {
 
 "use strict";
 module.exports = require("assert");
-
-/***/ }),
-
-/***/ 4300:
-/***/ ((module) => {
-
-"use strict";
-module.exports = require("buffer");
 
 /***/ }),
 
@@ -42948,14 +45568,6 @@ module.exports = require("path");
 
 /***/ }),
 
-/***/ 7282:
-/***/ ((module) => {
-
-"use strict";
-module.exports = require("process");
-
-/***/ }),
-
 /***/ 4521:
 /***/ ((module) => {
 
@@ -43006,12189 +45618,6 @@ globstar while`,t,d,e,u,m),this.matchOne(t.slice(d),e.slice(u),s))return this.de
 //# sourceMappingURL=index.min.js.map
 
 
-/***/ }),
-
-/***/ 8109:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var identity = __nccwpck_require__(5589);
-var Scalar = __nccwpck_require__(9338);
-var YAMLMap = __nccwpck_require__(6011);
-var YAMLSeq = __nccwpck_require__(5161);
-var resolveBlockMap = __nccwpck_require__(2986);
-var resolveBlockSeq = __nccwpck_require__(2289);
-var resolveFlowCollection = __nccwpck_require__(45);
-
-function resolveCollection(CN, ctx, token, onError, tagName, tag) {
-    const coll = token.type === 'block-map'
-        ? resolveBlockMap.resolveBlockMap(CN, ctx, token, onError, tag)
-        : token.type === 'block-seq'
-            ? resolveBlockSeq.resolveBlockSeq(CN, ctx, token, onError, tag)
-            : resolveFlowCollection.resolveFlowCollection(CN, ctx, token, onError, tag);
-    const Coll = coll.constructor;
-    // If we got a tagName matching the class, or the tag name is '!',
-    // then use the tagName from the node class used to create it.
-    if (tagName === '!' || tagName === Coll.tagName) {
-        coll.tag = Coll.tagName;
-        return coll;
-    }
-    if (tagName)
-        coll.tag = tagName;
-    return coll;
-}
-function composeCollection(CN, ctx, token, props, onError) {
-    const tagToken = props.tag;
-    const tagName = !tagToken
-        ? null
-        : ctx.directives.tagName(tagToken.source, msg => onError(tagToken, 'TAG_RESOLVE_FAILED', msg));
-    if (token.type === 'block-seq') {
-        const { anchor, newlineAfterProp: nl } = props;
-        const lastProp = anchor && tagToken
-            ? anchor.offset > tagToken.offset
-                ? anchor
-                : tagToken
-            : (anchor ?? tagToken);
-        if (lastProp && (!nl || nl.offset < lastProp.offset)) {
-            const message = 'Missing newline after block sequence props';
-            onError(lastProp, 'MISSING_CHAR', message);
-        }
-    }
-    const expType = token.type === 'block-map'
-        ? 'map'
-        : token.type === 'block-seq'
-            ? 'seq'
-            : token.start.source === '{'
-                ? 'map'
-                : 'seq';
-    // shortcut: check if it's a generic YAMLMap or YAMLSeq
-    // before jumping into the custom tag logic.
-    if (!tagToken ||
-        !tagName ||
-        tagName === '!' ||
-        (tagName === YAMLMap.YAMLMap.tagName && expType === 'map') ||
-        (tagName === YAMLSeq.YAMLSeq.tagName && expType === 'seq')) {
-        return resolveCollection(CN, ctx, token, onError, tagName);
-    }
-    let tag = ctx.schema.tags.find(t => t.tag === tagName && t.collection === expType);
-    if (!tag) {
-        const kt = ctx.schema.knownTags[tagName];
-        if (kt?.collection === expType) {
-            ctx.schema.tags.push(Object.assign({}, kt, { default: false }));
-            tag = kt;
-        }
-        else {
-            if (kt) {
-                onError(tagToken, 'BAD_COLLECTION_TYPE', `${kt.tag} used for ${expType} collection, but expects ${kt.collection ?? 'scalar'}`, true);
-            }
-            else {
-                onError(tagToken, 'TAG_RESOLVE_FAILED', `Unresolved tag: ${tagName}`, true);
-            }
-            return resolveCollection(CN, ctx, token, onError, tagName);
-        }
-    }
-    const coll = resolveCollection(CN, ctx, token, onError, tagName, tag);
-    const res = tag.resolve?.(coll, msg => onError(tagToken, 'TAG_RESOLVE_FAILED', msg), ctx.options) ?? coll;
-    const node = identity.isNode(res)
-        ? res
-        : new Scalar.Scalar(res);
-    node.range = coll.range;
-    node.tag = tagName;
-    if (tag?.format)
-        node.format = tag.format;
-    return node;
-}
-
-exports.composeCollection = composeCollection;
-
-
-/***/ }),
-
-/***/ 5050:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var Document = __nccwpck_require__(42);
-var composeNode = __nccwpck_require__(8676);
-var resolveEnd = __nccwpck_require__(1250);
-var resolveProps = __nccwpck_require__(6985);
-
-function composeDoc(options, directives, { offset, start, value, end }, onError) {
-    const opts = Object.assign({ _directives: directives }, options);
-    const doc = new Document.Document(undefined, opts);
-    const ctx = {
-        atKey: false,
-        atRoot: true,
-        directives: doc.directives,
-        options: doc.options,
-        schema: doc.schema
-    };
-    const props = resolveProps.resolveProps(start, {
-        indicator: 'doc-start',
-        next: value ?? end?.[0],
-        offset,
-        onError,
-        parentIndent: 0,
-        startOnNewline: true
-    });
-    if (props.found) {
-        doc.directives.docStart = true;
-        if (value &&
-            (value.type === 'block-map' || value.type === 'block-seq') &&
-            !props.hasNewline)
-            onError(props.end, 'MISSING_CHAR', 'Block collection cannot start on same line with directives-end marker');
-    }
-    // @ts-expect-error If Contents is set, let's trust the user
-    doc.contents = value
-        ? composeNode.composeNode(ctx, value, props, onError)
-        : composeNode.composeEmptyNode(ctx, props.end, start, null, props, onError);
-    const contentEnd = doc.contents.range[2];
-    const re = resolveEnd.resolveEnd(end, contentEnd, false, onError);
-    if (re.comment)
-        doc.comment = re.comment;
-    doc.range = [offset, contentEnd, re.offset];
-    return doc;
-}
-
-exports.composeDoc = composeDoc;
-
-
-/***/ }),
-
-/***/ 8676:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var Alias = __nccwpck_require__(5639);
-var identity = __nccwpck_require__(5589);
-var composeCollection = __nccwpck_require__(8109);
-var composeScalar = __nccwpck_require__(4766);
-var resolveEnd = __nccwpck_require__(1250);
-var utilEmptyScalarPosition = __nccwpck_require__(8781);
-
-const CN = { composeNode, composeEmptyNode };
-function composeNode(ctx, token, props, onError) {
-    const atKey = ctx.atKey;
-    const { spaceBefore, comment, anchor, tag } = props;
-    let node;
-    let isSrcToken = true;
-    switch (token.type) {
-        case 'alias':
-            node = composeAlias(ctx, token, onError);
-            if (anchor || tag)
-                onError(token, 'ALIAS_PROPS', 'An alias node must not specify any properties');
-            break;
-        case 'scalar':
-        case 'single-quoted-scalar':
-        case 'double-quoted-scalar':
-        case 'block-scalar':
-            node = composeScalar.composeScalar(ctx, token, tag, onError);
-            if (anchor)
-                node.anchor = anchor.source.substring(1);
-            break;
-        case 'block-map':
-        case 'block-seq':
-        case 'flow-collection':
-            try {
-                node = composeCollection.composeCollection(CN, ctx, token, props, onError);
-                if (anchor)
-                    node.anchor = anchor.source.substring(1);
-            }
-            catch (error) {
-                // Almost certainly here due to a stack overflow
-                const message = error instanceof Error ? error.message : String(error);
-                onError(token, 'RESOURCE_EXHAUSTION', message);
-            }
-            break;
-        default: {
-            const message = token.type === 'error'
-                ? token.message
-                : `Unsupported token (type: ${token.type})`;
-            onError(token, 'UNEXPECTED_TOKEN', message);
-            isSrcToken = false;
-        }
-    }
-    node ?? (node = composeEmptyNode(ctx, token.offset, undefined, null, props, onError));
-    if (anchor && node.anchor === '')
-        onError(anchor, 'BAD_ALIAS', 'Anchor cannot be an empty string');
-    if (atKey &&
-        ctx.options.stringKeys &&
-        (!identity.isScalar(node) ||
-            typeof node.value !== 'string' ||
-            (node.tag && node.tag !== 'tag:yaml.org,2002:str'))) {
-        const msg = 'With stringKeys, all keys must be strings';
-        onError(tag ?? token, 'NON_STRING_KEY', msg);
-    }
-    if (spaceBefore)
-        node.spaceBefore = true;
-    if (comment) {
-        if (token.type === 'scalar' && token.source === '')
-            node.comment = comment;
-        else
-            node.commentBefore = comment;
-    }
-    // @ts-expect-error Type checking misses meaning of isSrcToken
-    if (ctx.options.keepSourceTokens && isSrcToken)
-        node.srcToken = token;
-    return node;
-}
-function composeEmptyNode(ctx, offset, before, pos, { spaceBefore, comment, anchor, tag, end }, onError) {
-    const token = {
-        type: 'scalar',
-        offset: utilEmptyScalarPosition.emptyScalarPosition(offset, before, pos),
-        indent: -1,
-        source: ''
-    };
-    const node = composeScalar.composeScalar(ctx, token, tag, onError);
-    if (anchor) {
-        node.anchor = anchor.source.substring(1);
-        if (node.anchor === '')
-            onError(anchor, 'BAD_ALIAS', 'Anchor cannot be an empty string');
-    }
-    if (spaceBefore)
-        node.spaceBefore = true;
-    if (comment) {
-        node.comment = comment;
-        node.range[2] = end;
-    }
-    return node;
-}
-function composeAlias({ options }, { offset, source, end }, onError) {
-    const alias = new Alias.Alias(source.substring(1));
-    if (alias.source === '')
-        onError(offset, 'BAD_ALIAS', 'Alias cannot be an empty string');
-    if (alias.source.endsWith(':'))
-        onError(offset + source.length - 1, 'BAD_ALIAS', 'Alias ending in : is ambiguous', true);
-    const valueEnd = offset + source.length;
-    const re = resolveEnd.resolveEnd(end, valueEnd, options.strict, onError);
-    alias.range = [offset, valueEnd, re.offset];
-    if (re.comment)
-        alias.comment = re.comment;
-    return alias;
-}
-
-exports.composeEmptyNode = composeEmptyNode;
-exports.composeNode = composeNode;
-
-
-/***/ }),
-
-/***/ 4766:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var identity = __nccwpck_require__(5589);
-var Scalar = __nccwpck_require__(9338);
-var resolveBlockScalar = __nccwpck_require__(9485);
-var resolveFlowScalar = __nccwpck_require__(7578);
-
-function composeScalar(ctx, token, tagToken, onError) {
-    const { value, type, comment, range } = token.type === 'block-scalar'
-        ? resolveBlockScalar.resolveBlockScalar(ctx, token, onError)
-        : resolveFlowScalar.resolveFlowScalar(token, ctx.options.strict, onError);
-    const tagName = tagToken
-        ? ctx.directives.tagName(tagToken.source, msg => onError(tagToken, 'TAG_RESOLVE_FAILED', msg))
-        : null;
-    let tag;
-    if (ctx.options.stringKeys && ctx.atKey) {
-        tag = ctx.schema[identity.SCALAR];
-    }
-    else if (tagName)
-        tag = findScalarTagByName(ctx.schema, value, tagName, tagToken, onError);
-    else if (token.type === 'scalar')
-        tag = findScalarTagByTest(ctx, value, token, onError);
-    else
-        tag = ctx.schema[identity.SCALAR];
-    let scalar;
-    try {
-        const res = tag.resolve(value, msg => onError(tagToken ?? token, 'TAG_RESOLVE_FAILED', msg), ctx.options);
-        scalar = identity.isScalar(res) ? res : new Scalar.Scalar(res);
-    }
-    catch (error) {
-        const msg = error instanceof Error ? error.message : String(error);
-        onError(tagToken ?? token, 'TAG_RESOLVE_FAILED', msg);
-        scalar = new Scalar.Scalar(value);
-    }
-    scalar.range = range;
-    scalar.source = value;
-    if (type)
-        scalar.type = type;
-    if (tagName)
-        scalar.tag = tagName;
-    if (tag.format)
-        scalar.format = tag.format;
-    if (comment)
-        scalar.comment = comment;
-    return scalar;
-}
-function findScalarTagByName(schema, value, tagName, tagToken, onError) {
-    if (tagName === '!')
-        return schema[identity.SCALAR]; // non-specific tag
-    const matchWithTest = [];
-    for (const tag of schema.tags) {
-        if (!tag.collection && tag.tag === tagName) {
-            if (tag.default && tag.test)
-                matchWithTest.push(tag);
-            else
-                return tag;
-        }
-    }
-    for (const tag of matchWithTest)
-        if (tag.test?.test(value))
-            return tag;
-    const kt = schema.knownTags[tagName];
-    if (kt && !kt.collection) {
-        // Ensure that the known tag is available for stringifying,
-        // but does not get used by default.
-        schema.tags.push(Object.assign({}, kt, { default: false, test: undefined }));
-        return kt;
-    }
-    onError(tagToken, 'TAG_RESOLVE_FAILED', `Unresolved tag: ${tagName}`, tagName !== 'tag:yaml.org,2002:str');
-    return schema[identity.SCALAR];
-}
-function findScalarTagByTest({ atKey, directives, schema }, value, token, onError) {
-    const tag = schema.tags.find(tag => (tag.default === true || (atKey && tag.default === 'key')) &&
-        tag.test?.test(value)) || schema[identity.SCALAR];
-    if (schema.compat) {
-        const compat = schema.compat.find(tag => tag.default && tag.test?.test(value)) ??
-            schema[identity.SCALAR];
-        if (tag.tag !== compat.tag) {
-            const ts = directives.tagString(tag.tag);
-            const cs = directives.tagString(compat.tag);
-            const msg = `Value may be parsed as either ${ts} or ${cs}`;
-            onError(token, 'TAG_RESOLVE_FAILED', msg, true);
-        }
-    }
-    return tag;
-}
-
-exports.composeScalar = composeScalar;
-
-
-/***/ }),
-
-/***/ 9493:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var node_process = __nccwpck_require__(7282);
-var directives = __nccwpck_require__(5400);
-var Document = __nccwpck_require__(42);
-var errors = __nccwpck_require__(4236);
-var identity = __nccwpck_require__(5589);
-var composeDoc = __nccwpck_require__(5050);
-var resolveEnd = __nccwpck_require__(1250);
-
-function getErrorPos(src) {
-    if (typeof src === 'number')
-        return [src, src + 1];
-    if (Array.isArray(src))
-        return src.length === 2 ? src : [src[0], src[1]];
-    const { offset, source } = src;
-    return [offset, offset + (typeof source === 'string' ? source.length : 1)];
-}
-function parsePrelude(prelude) {
-    let comment = '';
-    let atComment = false;
-    let afterEmptyLine = false;
-    for (let i = 0; i < prelude.length; ++i) {
-        const source = prelude[i];
-        switch (source[0]) {
-            case '#':
-                comment +=
-                    (comment === '' ? '' : afterEmptyLine ? '\n\n' : '\n') +
-                        (source.substring(1) || ' ');
-                atComment = true;
-                afterEmptyLine = false;
-                break;
-            case '%':
-                if (prelude[i + 1]?.[0] !== '#')
-                    i += 1;
-                atComment = false;
-                break;
-            default:
-                // This may be wrong after doc-end, but in that case it doesn't matter
-                if (!atComment)
-                    afterEmptyLine = true;
-                atComment = false;
-        }
-    }
-    return { comment, afterEmptyLine };
-}
-/**
- * Compose a stream of CST nodes into a stream of YAML Documents.
- *
- * ```ts
- * import { Composer, Parser } from 'yaml'
- *
- * const src: string = ...
- * const tokens = new Parser().parse(src)
- * const docs = new Composer().compose(tokens)
- * ```
- */
-class Composer {
-    constructor(options = {}) {
-        this.doc = null;
-        this.atDirectives = false;
-        this.prelude = [];
-        this.errors = [];
-        this.warnings = [];
-        this.onError = (source, code, message, warning) => {
-            const pos = getErrorPos(source);
-            if (warning)
-                this.warnings.push(new errors.YAMLWarning(pos, code, message));
-            else
-                this.errors.push(new errors.YAMLParseError(pos, code, message));
-        };
-        // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
-        this.directives = new directives.Directives({ version: options.version || '1.2' });
-        this.options = options;
-    }
-    decorate(doc, afterDoc) {
-        const { comment, afterEmptyLine } = parsePrelude(this.prelude);
-        //console.log({ dc: doc.comment, prelude, comment })
-        if (comment) {
-            const dc = doc.contents;
-            if (afterDoc) {
-                doc.comment = doc.comment ? `${doc.comment}\n${comment}` : comment;
-            }
-            else if (afterEmptyLine || doc.directives.docStart || !dc) {
-                doc.commentBefore = comment;
-            }
-            else if (identity.isCollection(dc) && !dc.flow && dc.items.length > 0) {
-                let it = dc.items[0];
-                if (identity.isPair(it))
-                    it = it.key;
-                const cb = it.commentBefore;
-                it.commentBefore = cb ? `${comment}\n${cb}` : comment;
-            }
-            else {
-                const cb = dc.commentBefore;
-                dc.commentBefore = cb ? `${comment}\n${cb}` : comment;
-            }
-        }
-        if (afterDoc) {
-            for (let i = 0; i < this.errors.length; ++i)
-                doc.errors.push(this.errors[i]);
-            for (let i = 0; i < this.warnings.length; ++i)
-                doc.warnings.push(this.warnings[i]);
-        }
-        else {
-            doc.errors = this.errors;
-            doc.warnings = this.warnings;
-        }
-        this.prelude = [];
-        this.errors = [];
-        this.warnings = [];
-    }
-    /**
-     * Current stream status information.
-     *
-     * Mostly useful at the end of input for an empty stream.
-     */
-    streamInfo() {
-        return {
-            comment: parsePrelude(this.prelude).comment,
-            directives: this.directives,
-            errors: this.errors,
-            warnings: this.warnings
-        };
-    }
-    /**
-     * Compose tokens into documents.
-     *
-     * @param forceDoc - If the stream contains no document, still emit a final document including any comments and directives that would be applied to a subsequent document.
-     * @param endOffset - Should be set if `forceDoc` is also set, to set the document range end and to indicate errors correctly.
-     */
-    *compose(tokens, forceDoc = false, endOffset = -1) {
-        for (const token of tokens)
-            yield* this.next(token);
-        yield* this.end(forceDoc, endOffset);
-    }
-    /** Advance the composer by one CST token. */
-    *next(token) {
-        if (node_process.env.LOG_STREAM)
-            console.dir(token, { depth: null });
-        switch (token.type) {
-            case 'directive':
-                this.directives.add(token.source, (offset, message, warning) => {
-                    const pos = getErrorPos(token);
-                    pos[0] += offset;
-                    this.onError(pos, 'BAD_DIRECTIVE', message, warning);
-                });
-                this.prelude.push(token.source);
-                this.atDirectives = true;
-                break;
-            case 'document': {
-                const doc = composeDoc.composeDoc(this.options, this.directives, token, this.onError);
-                if (this.atDirectives && !doc.directives.docStart)
-                    this.onError(token, 'MISSING_CHAR', 'Missing directives-end/doc-start indicator line');
-                this.decorate(doc, false);
-                if (this.doc)
-                    yield this.doc;
-                this.doc = doc;
-                this.atDirectives = false;
-                break;
-            }
-            case 'byte-order-mark':
-            case 'space':
-                break;
-            case 'comment':
-            case 'newline':
-                this.prelude.push(token.source);
-                break;
-            case 'error': {
-                const msg = token.source
-                    ? `${token.message}: ${JSON.stringify(token.source)}`
-                    : token.message;
-                const error = new errors.YAMLParseError(getErrorPos(token), 'UNEXPECTED_TOKEN', msg);
-                if (this.atDirectives || !this.doc)
-                    this.errors.push(error);
-                else
-                    this.doc.errors.push(error);
-                break;
-            }
-            case 'doc-end': {
-                if (!this.doc) {
-                    const msg = 'Unexpected doc-end without preceding document';
-                    this.errors.push(new errors.YAMLParseError(getErrorPos(token), 'UNEXPECTED_TOKEN', msg));
-                    break;
-                }
-                this.doc.directives.docEnd = true;
-                const end = resolveEnd.resolveEnd(token.end, token.offset + token.source.length, this.doc.options.strict, this.onError);
-                this.decorate(this.doc, true);
-                if (end.comment) {
-                    const dc = this.doc.comment;
-                    this.doc.comment = dc ? `${dc}\n${end.comment}` : end.comment;
-                }
-                this.doc.range[2] = end.offset;
-                break;
-            }
-            default:
-                this.errors.push(new errors.YAMLParseError(getErrorPos(token), 'UNEXPECTED_TOKEN', `Unsupported token ${token.type}`));
-        }
-    }
-    /**
-     * Call at end of input to yield any remaining document.
-     *
-     * @param forceDoc - If the stream contains no document, still emit a final document including any comments and directives that would be applied to a subsequent document.
-     * @param endOffset - Should be set if `forceDoc` is also set, to set the document range end and to indicate errors correctly.
-     */
-    *end(forceDoc = false, endOffset = -1) {
-        if (this.doc) {
-            this.decorate(this.doc, true);
-            yield this.doc;
-            this.doc = null;
-        }
-        else if (forceDoc) {
-            const opts = Object.assign({ _directives: this.directives }, this.options);
-            const doc = new Document.Document(undefined, opts);
-            if (this.atDirectives)
-                this.onError(endOffset, 'MISSING_CHAR', 'Missing directives-end indicator line');
-            doc.range = [0, endOffset, endOffset];
-            this.decorate(doc, false);
-            yield doc;
-        }
-    }
-}
-
-exports.Composer = Composer;
-
-
-/***/ }),
-
-/***/ 2986:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var Pair = __nccwpck_require__(246);
-var YAMLMap = __nccwpck_require__(6011);
-var resolveProps = __nccwpck_require__(6985);
-var utilContainsNewline = __nccwpck_require__(976);
-var utilFlowIndentCheck = __nccwpck_require__(3669);
-var utilMapIncludes = __nccwpck_require__(6899);
-
-const startColMsg = 'All mapping items must start at the same column';
-function resolveBlockMap({ composeNode, composeEmptyNode }, ctx, bm, onError, tag) {
-    const NodeClass = tag?.nodeClass ?? YAMLMap.YAMLMap;
-    const map = new NodeClass(ctx.schema);
-    if (ctx.atRoot)
-        ctx.atRoot = false;
-    let offset = bm.offset;
-    let commentEnd = null;
-    for (const collItem of bm.items) {
-        const { start, key, sep, value } = collItem;
-        // key properties
-        const keyProps = resolveProps.resolveProps(start, {
-            indicator: 'explicit-key-ind',
-            next: key ?? sep?.[0],
-            offset,
-            onError,
-            parentIndent: bm.indent,
-            startOnNewline: true
-        });
-        const implicitKey = !keyProps.found;
-        if (implicitKey) {
-            if (key) {
-                if (key.type === 'block-seq')
-                    onError(offset, 'BLOCK_AS_IMPLICIT_KEY', 'A block sequence may not be used as an implicit map key');
-                else if ('indent' in key && key.indent !== bm.indent)
-                    onError(offset, 'BAD_INDENT', startColMsg);
-            }
-            if (!keyProps.anchor && !keyProps.tag && !sep) {
-                commentEnd = keyProps.end;
-                if (keyProps.comment) {
-                    if (map.comment)
-                        map.comment += '\n' + keyProps.comment;
-                    else
-                        map.comment = keyProps.comment;
-                }
-                continue;
-            }
-            if (keyProps.newlineAfterProp || utilContainsNewline.containsNewline(key)) {
-                onError(key ?? start[start.length - 1], 'MULTILINE_IMPLICIT_KEY', 'Implicit keys need to be on a single line');
-            }
-        }
-        else if (keyProps.found?.indent !== bm.indent) {
-            onError(offset, 'BAD_INDENT', startColMsg);
-        }
-        // key value
-        ctx.atKey = true;
-        const keyStart = keyProps.end;
-        const keyNode = key
-            ? composeNode(ctx, key, keyProps, onError)
-            : composeEmptyNode(ctx, keyStart, start, null, keyProps, onError);
-        if (ctx.schema.compat)
-            utilFlowIndentCheck.flowIndentCheck(bm.indent, key, onError);
-        ctx.atKey = false;
-        if (utilMapIncludes.mapIncludes(ctx, map.items, keyNode))
-            onError(keyStart, 'DUPLICATE_KEY', 'Map keys must be unique');
-        // value properties
-        const valueProps = resolveProps.resolveProps(sep ?? [], {
-            indicator: 'map-value-ind',
-            next: value,
-            offset: keyNode.range[2],
-            onError,
-            parentIndent: bm.indent,
-            startOnNewline: !key || key.type === 'block-scalar'
-        });
-        offset = valueProps.end;
-        if (valueProps.found) {
-            if (implicitKey) {
-                if (value?.type === 'block-map' && !valueProps.hasNewline)
-                    onError(offset, 'BLOCK_AS_IMPLICIT_KEY', 'Nested mappings are not allowed in compact mappings');
-                if (ctx.options.strict &&
-                    keyProps.start < valueProps.found.offset - 1024)
-                    onError(keyNode.range, 'KEY_OVER_1024_CHARS', 'The : indicator must be at most 1024 chars after the start of an implicit block mapping key');
-            }
-            // value value
-            const valueNode = value
-                ? composeNode(ctx, value, valueProps, onError)
-                : composeEmptyNode(ctx, offset, sep, null, valueProps, onError);
-            if (ctx.schema.compat)
-                utilFlowIndentCheck.flowIndentCheck(bm.indent, value, onError);
-            offset = valueNode.range[2];
-            const pair = new Pair.Pair(keyNode, valueNode);
-            if (ctx.options.keepSourceTokens)
-                pair.srcToken = collItem;
-            map.items.push(pair);
-        }
-        else {
-            // key with no value
-            if (implicitKey)
-                onError(keyNode.range, 'MISSING_CHAR', 'Implicit map keys need to be followed by map values');
-            if (valueProps.comment) {
-                if (keyNode.comment)
-                    keyNode.comment += '\n' + valueProps.comment;
-                else
-                    keyNode.comment = valueProps.comment;
-            }
-            const pair = new Pair.Pair(keyNode);
-            if (ctx.options.keepSourceTokens)
-                pair.srcToken = collItem;
-            map.items.push(pair);
-        }
-    }
-    if (commentEnd && commentEnd < offset)
-        onError(commentEnd, 'IMPOSSIBLE', 'Map comment with trailing content');
-    map.range = [bm.offset, offset, commentEnd ?? offset];
-    return map;
-}
-
-exports.resolveBlockMap = resolveBlockMap;
-
-
-/***/ }),
-
-/***/ 9485:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var Scalar = __nccwpck_require__(9338);
-
-function resolveBlockScalar(ctx, scalar, onError) {
-    const start = scalar.offset;
-    const header = parseBlockScalarHeader(scalar, ctx.options.strict, onError);
-    if (!header)
-        return { value: '', type: null, comment: '', range: [start, start, start] };
-    const type = header.mode === '>' ? Scalar.Scalar.BLOCK_FOLDED : Scalar.Scalar.BLOCK_LITERAL;
-    const lines = scalar.source ? splitLines(scalar.source) : [];
-    // determine the end of content & start of chomping
-    let chompStart = lines.length;
-    for (let i = lines.length - 1; i >= 0; --i) {
-        const content = lines[i][1];
-        if (content === '' || content === '\r')
-            chompStart = i;
-        else
-            break;
-    }
-    // shortcut for empty contents
-    if (chompStart === 0) {
-        const value = header.chomp === '+' && lines.length > 0
-            ? '\n'.repeat(Math.max(1, lines.length - 1))
-            : '';
-        let end = start + header.length;
-        if (scalar.source)
-            end += scalar.source.length;
-        return { value, type, comment: header.comment, range: [start, end, end] };
-    }
-    // find the indentation level to trim from start
-    let trimIndent = scalar.indent + header.indent;
-    let offset = scalar.offset + header.length;
-    let contentStart = 0;
-    for (let i = 0; i < chompStart; ++i) {
-        const [indent, content] = lines[i];
-        if (content === '' || content === '\r') {
-            if (header.indent === 0 && indent.length > trimIndent)
-                trimIndent = indent.length;
-        }
-        else {
-            if (indent.length < trimIndent) {
-                const message = 'Block scalars with more-indented leading empty lines must use an explicit indentation indicator';
-                onError(offset + indent.length, 'MISSING_CHAR', message);
-            }
-            if (header.indent === 0)
-                trimIndent = indent.length;
-            contentStart = i;
-            if (trimIndent === 0 && !ctx.atRoot) {
-                const message = 'Block scalar values in collections must be indented';
-                onError(offset, 'BAD_INDENT', message);
-            }
-            break;
-        }
-        offset += indent.length + content.length + 1;
-    }
-    // include trailing more-indented empty lines in content
-    for (let i = lines.length - 1; i >= chompStart; --i) {
-        if (lines[i][0].length > trimIndent)
-            chompStart = i + 1;
-    }
-    let value = '';
-    let sep = '';
-    let prevMoreIndented = false;
-    // leading whitespace is kept intact
-    for (let i = 0; i < contentStart; ++i)
-        value += lines[i][0].slice(trimIndent) + '\n';
-    for (let i = contentStart; i < chompStart; ++i) {
-        let [indent, content] = lines[i];
-        offset += indent.length + content.length + 1;
-        const crlf = content[content.length - 1] === '\r';
-        if (crlf)
-            content = content.slice(0, -1);
-        /* istanbul ignore if already caught in lexer */
-        if (content && indent.length < trimIndent) {
-            const src = header.indent
-                ? 'explicit indentation indicator'
-                : 'first line';
-            const message = `Block scalar lines must not be less indented than their ${src}`;
-            onError(offset - content.length - (crlf ? 2 : 1), 'BAD_INDENT', message);
-            indent = '';
-        }
-        if (type === Scalar.Scalar.BLOCK_LITERAL) {
-            value += sep + indent.slice(trimIndent) + content;
-            sep = '\n';
-        }
-        else if (indent.length > trimIndent || content[0] === '\t') {
-            // more-indented content within a folded block
-            if (sep === ' ')
-                sep = '\n';
-            else if (!prevMoreIndented && sep === '\n')
-                sep = '\n\n';
-            value += sep + indent.slice(trimIndent) + content;
-            sep = '\n';
-            prevMoreIndented = true;
-        }
-        else if (content === '') {
-            // empty line
-            if (sep === '\n')
-                value += '\n';
-            else
-                sep = '\n';
-        }
-        else {
-            value += sep + content;
-            sep = ' ';
-            prevMoreIndented = false;
-        }
-    }
-    switch (header.chomp) {
-        case '-':
-            break;
-        case '+':
-            for (let i = chompStart; i < lines.length; ++i)
-                value += '\n' + lines[i][0].slice(trimIndent);
-            if (value[value.length - 1] !== '\n')
-                value += '\n';
-            break;
-        default:
-            value += '\n';
-    }
-    const end = start + header.length + scalar.source.length;
-    return { value, type, comment: header.comment, range: [start, end, end] };
-}
-function parseBlockScalarHeader({ offset, props }, strict, onError) {
-    /* istanbul ignore if should not happen */
-    if (props[0].type !== 'block-scalar-header') {
-        onError(props[0], 'IMPOSSIBLE', 'Block scalar header not found');
-        return null;
-    }
-    const { source } = props[0];
-    const mode = source[0];
-    let indent = 0;
-    let chomp = '';
-    let error = -1;
-    for (let i = 1; i < source.length; ++i) {
-        const ch = source[i];
-        if (!chomp && (ch === '-' || ch === '+'))
-            chomp = ch;
-        else {
-            const n = Number(ch);
-            if (!indent && n)
-                indent = n;
-            else if (error === -1)
-                error = offset + i;
-        }
-    }
-    if (error !== -1)
-        onError(error, 'UNEXPECTED_TOKEN', `Block scalar header includes extra characters: ${source}`);
-    let hasSpace = false;
-    let comment = '';
-    let length = source.length;
-    for (let i = 1; i < props.length; ++i) {
-        const token = props[i];
-        switch (token.type) {
-            case 'space':
-                hasSpace = true;
-            // fallthrough
-            case 'newline':
-                length += token.source.length;
-                break;
-            case 'comment':
-                if (strict && !hasSpace) {
-                    const message = 'Comments must be separated from other tokens by white space characters';
-                    onError(token, 'MISSING_CHAR', message);
-                }
-                length += token.source.length;
-                comment = token.source.substring(1);
-                break;
-            case 'error':
-                onError(token, 'UNEXPECTED_TOKEN', token.message);
-                length += token.source.length;
-                break;
-            /* istanbul ignore next should not happen */
-            default: {
-                const message = `Unexpected token in block scalar header: ${token.type}`;
-                onError(token, 'UNEXPECTED_TOKEN', message);
-                const ts = token.source;
-                if (ts && typeof ts === 'string')
-                    length += ts.length;
-            }
-        }
-    }
-    return { mode, indent, chomp, comment, length };
-}
-/** @returns Array of lines split up as `[indent, content]` */
-function splitLines(source) {
-    const split = source.split(/\n( *)/);
-    const first = split[0];
-    const m = first.match(/^( *)/);
-    const line0 = m?.[1]
-        ? [m[1], first.slice(m[1].length)]
-        : ['', first];
-    const lines = [line0];
-    for (let i = 1; i < split.length; i += 2)
-        lines.push([split[i], split[i + 1]]);
-    return lines;
-}
-
-exports.resolveBlockScalar = resolveBlockScalar;
-
-
-/***/ }),
-
-/***/ 2289:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var YAMLSeq = __nccwpck_require__(5161);
-var resolveProps = __nccwpck_require__(6985);
-var utilFlowIndentCheck = __nccwpck_require__(3669);
-
-function resolveBlockSeq({ composeNode, composeEmptyNode }, ctx, bs, onError, tag) {
-    const NodeClass = tag?.nodeClass ?? YAMLSeq.YAMLSeq;
-    const seq = new NodeClass(ctx.schema);
-    if (ctx.atRoot)
-        ctx.atRoot = false;
-    if (ctx.atKey)
-        ctx.atKey = false;
-    let offset = bs.offset;
-    let commentEnd = null;
-    for (const { start, value } of bs.items) {
-        const props = resolveProps.resolveProps(start, {
-            indicator: 'seq-item-ind',
-            next: value,
-            offset,
-            onError,
-            parentIndent: bs.indent,
-            startOnNewline: true
-        });
-        if (!props.found) {
-            if (props.anchor || props.tag || value) {
-                if (value?.type === 'block-seq')
-                    onError(props.end, 'BAD_INDENT', 'All sequence items must start at the same column');
-                else
-                    onError(offset, 'MISSING_CHAR', 'Sequence item without - indicator');
-            }
-            else {
-                commentEnd = props.end;
-                if (props.comment)
-                    seq.comment = props.comment;
-                continue;
-            }
-        }
-        const node = value
-            ? composeNode(ctx, value, props, onError)
-            : composeEmptyNode(ctx, props.end, start, null, props, onError);
-        if (ctx.schema.compat)
-            utilFlowIndentCheck.flowIndentCheck(bs.indent, value, onError);
-        offset = node.range[2];
-        seq.items.push(node);
-    }
-    seq.range = [bs.offset, offset, commentEnd ?? offset];
-    return seq;
-}
-
-exports.resolveBlockSeq = resolveBlockSeq;
-
-
-/***/ }),
-
-/***/ 1250:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-
-function resolveEnd(end, offset, reqSpace, onError) {
-    let comment = '';
-    if (end) {
-        let hasSpace = false;
-        let sep = '';
-        for (const token of end) {
-            const { source, type } = token;
-            switch (type) {
-                case 'space':
-                    hasSpace = true;
-                    break;
-                case 'comment': {
-                    if (reqSpace && !hasSpace)
-                        onError(token, 'MISSING_CHAR', 'Comments must be separated from other tokens by white space characters');
-                    const cb = source.substring(1) || ' ';
-                    if (!comment)
-                        comment = cb;
-                    else
-                        comment += sep + cb;
-                    sep = '';
-                    break;
-                }
-                case 'newline':
-                    if (comment)
-                        sep += source;
-                    hasSpace = true;
-                    break;
-                default:
-                    onError(token, 'UNEXPECTED_TOKEN', `Unexpected ${type} at node end`);
-            }
-            offset += source.length;
-        }
-    }
-    return { comment, offset };
-}
-
-exports.resolveEnd = resolveEnd;
-
-
-/***/ }),
-
-/***/ 45:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var identity = __nccwpck_require__(5589);
-var Pair = __nccwpck_require__(246);
-var YAMLMap = __nccwpck_require__(6011);
-var YAMLSeq = __nccwpck_require__(5161);
-var resolveEnd = __nccwpck_require__(1250);
-var resolveProps = __nccwpck_require__(6985);
-var utilContainsNewline = __nccwpck_require__(976);
-var utilMapIncludes = __nccwpck_require__(6899);
-
-const blockMsg = 'Block collections are not allowed within flow collections';
-const isBlock = (token) => token && (token.type === 'block-map' || token.type === 'block-seq');
-function resolveFlowCollection({ composeNode, composeEmptyNode }, ctx, fc, onError, tag) {
-    const isMap = fc.start.source === '{';
-    const fcName = isMap ? 'flow map' : 'flow sequence';
-    const NodeClass = (tag?.nodeClass ?? (isMap ? YAMLMap.YAMLMap : YAMLSeq.YAMLSeq));
-    const coll = new NodeClass(ctx.schema);
-    coll.flow = true;
-    const atRoot = ctx.atRoot;
-    if (atRoot)
-        ctx.atRoot = false;
-    if (ctx.atKey)
-        ctx.atKey = false;
-    let offset = fc.offset + fc.start.source.length;
-    for (let i = 0; i < fc.items.length; ++i) {
-        const collItem = fc.items[i];
-        const { start, key, sep, value } = collItem;
-        const props = resolveProps.resolveProps(start, {
-            flow: fcName,
-            indicator: 'explicit-key-ind',
-            next: key ?? sep?.[0],
-            offset,
-            onError,
-            parentIndent: fc.indent,
-            startOnNewline: false
-        });
-        if (!props.found) {
-            if (!props.anchor && !props.tag && !sep && !value) {
-                if (i === 0 && props.comma)
-                    onError(props.comma, 'UNEXPECTED_TOKEN', `Unexpected , in ${fcName}`);
-                else if (i < fc.items.length - 1)
-                    onError(props.start, 'UNEXPECTED_TOKEN', `Unexpected empty item in ${fcName}`);
-                if (props.comment) {
-                    if (coll.comment)
-                        coll.comment += '\n' + props.comment;
-                    else
-                        coll.comment = props.comment;
-                }
-                offset = props.end;
-                continue;
-            }
-            if (!isMap && ctx.options.strict && utilContainsNewline.containsNewline(key))
-                onError(key, // checked by containsNewline()
-                'MULTILINE_IMPLICIT_KEY', 'Implicit keys of flow sequence pairs need to be on a single line');
-        }
-        if (i === 0) {
-            if (props.comma)
-                onError(props.comma, 'UNEXPECTED_TOKEN', `Unexpected , in ${fcName}`);
-        }
-        else {
-            if (!props.comma)
-                onError(props.start, 'MISSING_CHAR', `Missing , between ${fcName} items`);
-            if (props.comment) {
-                let prevItemComment = '';
-                loop: for (const st of start) {
-                    switch (st.type) {
-                        case 'comma':
-                        case 'space':
-                            break;
-                        case 'comment':
-                            prevItemComment = st.source.substring(1);
-                            break loop;
-                        default:
-                            break loop;
-                    }
-                }
-                if (prevItemComment) {
-                    let prev = coll.items[coll.items.length - 1];
-                    if (identity.isPair(prev))
-                        prev = prev.value ?? prev.key;
-                    if (prev.comment)
-                        prev.comment += '\n' + prevItemComment;
-                    else
-                        prev.comment = prevItemComment;
-                    props.comment = props.comment.substring(prevItemComment.length + 1);
-                }
-            }
-        }
-        if (!isMap && !sep && !props.found) {
-            // item is a value in a seq
-            // → key & sep are empty, start does not include ? or :
-            const valueNode = value
-                ? composeNode(ctx, value, props, onError)
-                : composeEmptyNode(ctx, props.end, sep, null, props, onError);
-            coll.items.push(valueNode);
-            offset = valueNode.range[2];
-            if (isBlock(value))
-                onError(valueNode.range, 'BLOCK_IN_FLOW', blockMsg);
-        }
-        else {
-            // item is a key+value pair
-            // key value
-            ctx.atKey = true;
-            const keyStart = props.end;
-            const keyNode = key
-                ? composeNode(ctx, key, props, onError)
-                : composeEmptyNode(ctx, keyStart, start, null, props, onError);
-            if (isBlock(key))
-                onError(keyNode.range, 'BLOCK_IN_FLOW', blockMsg);
-            ctx.atKey = false;
-            // value properties
-            const valueProps = resolveProps.resolveProps(sep ?? [], {
-                flow: fcName,
-                indicator: 'map-value-ind',
-                next: value,
-                offset: keyNode.range[2],
-                onError,
-                parentIndent: fc.indent,
-                startOnNewline: false
-            });
-            if (valueProps.found) {
-                if (!isMap && !props.found && ctx.options.strict) {
-                    if (sep)
-                        for (const st of sep) {
-                            if (st === valueProps.found)
-                                break;
-                            if (st.type === 'newline') {
-                                onError(st, 'MULTILINE_IMPLICIT_KEY', 'Implicit keys of flow sequence pairs need to be on a single line');
-                                break;
-                            }
-                        }
-                    if (props.start < valueProps.found.offset - 1024)
-                        onError(valueProps.found, 'KEY_OVER_1024_CHARS', 'The : indicator must be at most 1024 chars after the start of an implicit flow sequence key');
-                }
-            }
-            else if (value) {
-                if ('source' in value && value.source?.[0] === ':')
-                    onError(value, 'MISSING_CHAR', `Missing space after : in ${fcName}`);
-                else
-                    onError(valueProps.start, 'MISSING_CHAR', `Missing , or : between ${fcName} items`);
-            }
-            // value value
-            const valueNode = value
-                ? composeNode(ctx, value, valueProps, onError)
-                : valueProps.found
-                    ? composeEmptyNode(ctx, valueProps.end, sep, null, valueProps, onError)
-                    : null;
-            if (valueNode) {
-                if (isBlock(value))
-                    onError(valueNode.range, 'BLOCK_IN_FLOW', blockMsg);
-            }
-            else if (valueProps.comment) {
-                if (keyNode.comment)
-                    keyNode.comment += '\n' + valueProps.comment;
-                else
-                    keyNode.comment = valueProps.comment;
-            }
-            const pair = new Pair.Pair(keyNode, valueNode);
-            if (ctx.options.keepSourceTokens)
-                pair.srcToken = collItem;
-            if (isMap) {
-                const map = coll;
-                if (utilMapIncludes.mapIncludes(ctx, map.items, keyNode))
-                    onError(keyStart, 'DUPLICATE_KEY', 'Map keys must be unique');
-                map.items.push(pair);
-            }
-            else {
-                const map = new YAMLMap.YAMLMap(ctx.schema);
-                map.flow = true;
-                map.items.push(pair);
-                const endRange = (valueNode ?? keyNode).range;
-                map.range = [keyNode.range[0], endRange[1], endRange[2]];
-                coll.items.push(map);
-            }
-            offset = valueNode ? valueNode.range[2] : valueProps.end;
-        }
-    }
-    const expectedEnd = isMap ? '}' : ']';
-    const [ce, ...ee] = fc.end;
-    let cePos = offset;
-    if (ce?.source === expectedEnd)
-        cePos = ce.offset + ce.source.length;
-    else {
-        const name = fcName[0].toUpperCase() + fcName.substring(1);
-        const msg = atRoot
-            ? `${name} must end with a ${expectedEnd}`
-            : `${name} in block collection must be sufficiently indented and end with a ${expectedEnd}`;
-        onError(offset, atRoot ? 'MISSING_CHAR' : 'BAD_INDENT', msg);
-        if (ce && ce.source.length !== 1)
-            ee.unshift(ce);
-    }
-    if (ee.length > 0) {
-        const end = resolveEnd.resolveEnd(ee, cePos, ctx.options.strict, onError);
-        if (end.comment) {
-            if (coll.comment)
-                coll.comment += '\n' + end.comment;
-            else
-                coll.comment = end.comment;
-        }
-        coll.range = [fc.offset, cePos, end.offset];
-    }
-    else {
-        coll.range = [fc.offset, cePos, cePos];
-    }
-    return coll;
-}
-
-exports.resolveFlowCollection = resolveFlowCollection;
-
-
-/***/ }),
-
-/***/ 7578:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var Scalar = __nccwpck_require__(9338);
-var resolveEnd = __nccwpck_require__(1250);
-
-function resolveFlowScalar(scalar, strict, onError) {
-    const { offset, type, source, end } = scalar;
-    let _type;
-    let value;
-    const _onError = (rel, code, msg) => onError(offset + rel, code, msg);
-    switch (type) {
-        case 'scalar':
-            _type = Scalar.Scalar.PLAIN;
-            value = plainValue(source, _onError);
-            break;
-        case 'single-quoted-scalar':
-            _type = Scalar.Scalar.QUOTE_SINGLE;
-            value = singleQuotedValue(source, _onError);
-            break;
-        case 'double-quoted-scalar':
-            _type = Scalar.Scalar.QUOTE_DOUBLE;
-            value = doubleQuotedValue(source, _onError);
-            break;
-        /* istanbul ignore next should not happen */
-        default:
-            onError(scalar, 'UNEXPECTED_TOKEN', `Expected a flow scalar value, but found: ${type}`);
-            return {
-                value: '',
-                type: null,
-                comment: '',
-                range: [offset, offset + source.length, offset + source.length]
-            };
-    }
-    const valueEnd = offset + source.length;
-    const re = resolveEnd.resolveEnd(end, valueEnd, strict, onError);
-    return {
-        value,
-        type: _type,
-        comment: re.comment,
-        range: [offset, valueEnd, re.offset]
-    };
-}
-function plainValue(source, onError) {
-    let badChar = '';
-    switch (source[0]) {
-        /* istanbul ignore next should not happen */
-        case '\t':
-            badChar = 'a tab character';
-            break;
-        case ',':
-            badChar = 'flow indicator character ,';
-            break;
-        case '%':
-            badChar = 'directive indicator character %';
-            break;
-        case '|':
-        case '>': {
-            badChar = `block scalar indicator ${source[0]}`;
-            break;
-        }
-        case '@':
-        case '`': {
-            badChar = `reserved character ${source[0]}`;
-            break;
-        }
-    }
-    if (badChar)
-        onError(0, 'BAD_SCALAR_START', `Plain value cannot start with ${badChar}`);
-    return foldLines(source);
-}
-function singleQuotedValue(source, onError) {
-    if (source[source.length - 1] !== "'" || source.length === 1)
-        onError(source.length, 'MISSING_CHAR', "Missing closing 'quote");
-    return foldLines(source.slice(1, -1)).replace(/''/g, "'");
-}
-function foldLines(source) {
-    /**
-     * The negative lookbehind here and in the `re` RegExp is to
-     * prevent causing a polynomial search time in certain cases.
-     *
-     * The try-catch is for Safari, which doesn't support this yet:
-     * https://caniuse.com/js-regexp-lookbehind
-     */
-    let first, line;
-    try {
-        first = new RegExp('(.*?)(?<![ \t])[ \t]*\r?\n', 'sy');
-        line = new RegExp('[ \t]*(.*?)(?:(?<![ \t])[ \t]*)?\r?\n', 'sy');
-    }
-    catch {
-        first = /(.*?)[ \t]*\r?\n/sy;
-        line = /[ \t]*(.*?)[ \t]*\r?\n/sy;
-    }
-    let match = first.exec(source);
-    if (!match)
-        return source;
-    let res = match[1];
-    let sep = ' ';
-    let pos = first.lastIndex;
-    line.lastIndex = pos;
-    while ((match = line.exec(source))) {
-        if (match[1] === '') {
-            if (sep === '\n')
-                res += sep;
-            else
-                sep = '\n';
-        }
-        else {
-            res += sep + match[1];
-            sep = ' ';
-        }
-        pos = line.lastIndex;
-    }
-    const last = /[ \t]*(.*)/sy;
-    last.lastIndex = pos;
-    match = last.exec(source);
-    return res + sep + (match?.[1] ?? '');
-}
-function doubleQuotedValue(source, onError) {
-    let res = '';
-    for (let i = 1; i < source.length - 1; ++i) {
-        const ch = source[i];
-        if (ch === '\r' && source[i + 1] === '\n')
-            continue;
-        if (ch === '\n') {
-            const { fold, offset } = foldNewline(source, i);
-            res += fold;
-            i = offset;
-        }
-        else if (ch === '\\') {
-            let next = source[++i];
-            const cc = escapeCodes[next];
-            if (cc)
-                res += cc;
-            else if (next === '\n') {
-                // skip escaped newlines, but still trim the following line
-                next = source[i + 1];
-                while (next === ' ' || next === '\t')
-                    next = source[++i + 1];
-            }
-            else if (next === '\r' && source[i + 1] === '\n') {
-                // skip escaped CRLF newlines, but still trim the following line
-                next = source[++i + 1];
-                while (next === ' ' || next === '\t')
-                    next = source[++i + 1];
-            }
-            else if (next === 'x' || next === 'u' || next === 'U') {
-                const length = next === 'x' ? 2 : next === 'u' ? 4 : 8;
-                res += parseCharCode(source, i + 1, length, onError);
-                i += length;
-            }
-            else {
-                const raw = source.substr(i - 1, 2);
-                onError(i - 1, 'BAD_DQ_ESCAPE', `Invalid escape sequence ${raw}`);
-                res += raw;
-            }
-        }
-        else if (ch === ' ' || ch === '\t') {
-            // trim trailing whitespace
-            const wsStart = i;
-            let next = source[i + 1];
-            while (next === ' ' || next === '\t')
-                next = source[++i + 1];
-            if (next !== '\n' && !(next === '\r' && source[i + 2] === '\n'))
-                res += i > wsStart ? source.slice(wsStart, i + 1) : ch;
-        }
-        else {
-            res += ch;
-        }
-    }
-    if (source[source.length - 1] !== '"' || source.length === 1)
-        onError(source.length, 'MISSING_CHAR', 'Missing closing "quote');
-    return res;
-}
-/**
- * Fold a single newline into a space, multiple newlines to N - 1 newlines.
- * Presumes `source[offset] === '\n'`
- */
-function foldNewline(source, offset) {
-    let fold = '';
-    let ch = source[offset + 1];
-    while (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r') {
-        if (ch === '\r' && source[offset + 2] !== '\n')
-            break;
-        if (ch === '\n')
-            fold += '\n';
-        offset += 1;
-        ch = source[offset + 1];
-    }
-    if (!fold)
-        fold = ' ';
-    return { fold, offset };
-}
-const escapeCodes = {
-    '0': '\0', // null character
-    a: '\x07', // bell character
-    b: '\b', // backspace
-    e: '\x1b', // escape character
-    f: '\f', // form feed
-    n: '\n', // line feed
-    r: '\r', // carriage return
-    t: '\t', // horizontal tab
-    v: '\v', // vertical tab
-    N: '\u0085', // Unicode next line
-    _: '\u00a0', // Unicode non-breaking space
-    L: '\u2028', // Unicode line separator
-    P: '\u2029', // Unicode paragraph separator
-    ' ': ' ',
-    '"': '"',
-    '/': '/',
-    '\\': '\\',
-    '\t': '\t'
-};
-function parseCharCode(source, offset, length, onError) {
-    const cc = source.substr(offset, length);
-    const ok = cc.length === length && /^[0-9a-fA-F]+$/.test(cc);
-    const code = ok ? parseInt(cc, 16) : NaN;
-    try {
-        return String.fromCodePoint(code);
-    }
-    catch {
-        const raw = source.substr(offset - 2, length + 2);
-        onError(offset - 2, 'BAD_DQ_ESCAPE', `Invalid escape sequence ${raw}`);
-        return raw;
-    }
-}
-
-exports.resolveFlowScalar = resolveFlowScalar;
-
-
-/***/ }),
-
-/***/ 6985:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-
-function resolveProps(tokens, { flow, indicator, next, offset, onError, parentIndent, startOnNewline }) {
-    let spaceBefore = false;
-    let atNewline = startOnNewline;
-    let hasSpace = startOnNewline;
-    let comment = '';
-    let commentSep = '';
-    let hasNewline = false;
-    let reqSpace = false;
-    let tab = null;
-    let anchor = null;
-    let tag = null;
-    let newlineAfterProp = null;
-    let comma = null;
-    let found = null;
-    let start = null;
-    for (const token of tokens) {
-        if (reqSpace) {
-            if (token.type !== 'space' &&
-                token.type !== 'newline' &&
-                token.type !== 'comma')
-                onError(token.offset, 'MISSING_CHAR', 'Tags and anchors must be separated from the next token by white space');
-            reqSpace = false;
-        }
-        if (tab) {
-            if (atNewline && token.type !== 'comment' && token.type !== 'newline') {
-                onError(tab, 'TAB_AS_INDENT', 'Tabs are not allowed as indentation');
-            }
-            tab = null;
-        }
-        switch (token.type) {
-            case 'space':
-                // At the doc level, tabs at line start may be parsed
-                // as leading white space rather than indentation.
-                // In a flow collection, only the parser handles indent.
-                if (!flow &&
-                    (indicator !== 'doc-start' || next?.type !== 'flow-collection') &&
-                    token.source.includes('\t')) {
-                    tab = token;
-                }
-                hasSpace = true;
-                break;
-            case 'comment': {
-                if (!hasSpace)
-                    onError(token, 'MISSING_CHAR', 'Comments must be separated from other tokens by white space characters');
-                const cb = token.source.substring(1) || ' ';
-                if (!comment)
-                    comment = cb;
-                else
-                    comment += commentSep + cb;
-                commentSep = '';
-                atNewline = false;
-                break;
-            }
-            case 'newline':
-                if (atNewline) {
-                    if (comment)
-                        comment += token.source;
-                    else if (!found || indicator !== 'seq-item-ind')
-                        spaceBefore = true;
-                }
-                else
-                    commentSep += token.source;
-                atNewline = true;
-                hasNewline = true;
-                if (anchor || tag)
-                    newlineAfterProp = token;
-                hasSpace = true;
-                break;
-            case 'anchor':
-                if (anchor)
-                    onError(token, 'MULTIPLE_ANCHORS', 'A node can have at most one anchor');
-                if (token.source.endsWith(':'))
-                    onError(token.offset + token.source.length - 1, 'BAD_ALIAS', 'Anchor ending in : is ambiguous', true);
-                anchor = token;
-                start ?? (start = token.offset);
-                atNewline = false;
-                hasSpace = false;
-                reqSpace = true;
-                break;
-            case 'tag': {
-                if (tag)
-                    onError(token, 'MULTIPLE_TAGS', 'A node can have at most one tag');
-                tag = token;
-                start ?? (start = token.offset);
-                atNewline = false;
-                hasSpace = false;
-                reqSpace = true;
-                break;
-            }
-            case indicator:
-                // Could here handle preceding comments differently
-                if (anchor || tag)
-                    onError(token, 'BAD_PROP_ORDER', `Anchors and tags must be after the ${token.source} indicator`);
-                if (found)
-                    onError(token, 'UNEXPECTED_TOKEN', `Unexpected ${token.source} in ${flow ?? 'collection'}`);
-                found = token;
-                atNewline =
-                    indicator === 'seq-item-ind' || indicator === 'explicit-key-ind';
-                hasSpace = false;
-                break;
-            case 'comma':
-                if (flow) {
-                    if (comma)
-                        onError(token, 'UNEXPECTED_TOKEN', `Unexpected , in ${flow}`);
-                    comma = token;
-                    atNewline = false;
-                    hasSpace = false;
-                    break;
-                }
-            // else fallthrough
-            default:
-                onError(token, 'UNEXPECTED_TOKEN', `Unexpected ${token.type} token`);
-                atNewline = false;
-                hasSpace = false;
-        }
-    }
-    const last = tokens[tokens.length - 1];
-    const end = last ? last.offset + last.source.length : offset;
-    if (reqSpace &&
-        next &&
-        next.type !== 'space' &&
-        next.type !== 'newline' &&
-        next.type !== 'comma' &&
-        (next.type !== 'scalar' || next.source !== '')) {
-        onError(next.offset, 'MISSING_CHAR', 'Tags and anchors must be separated from the next token by white space');
-    }
-    if (tab &&
-        ((atNewline && tab.indent <= parentIndent) ||
-            next?.type === 'block-map' ||
-            next?.type === 'block-seq'))
-        onError(tab, 'TAB_AS_INDENT', 'Tabs are not allowed as indentation');
-    return {
-        comma,
-        found,
-        spaceBefore,
-        comment,
-        hasNewline,
-        anchor,
-        tag,
-        newlineAfterProp,
-        end,
-        start: start ?? end
-    };
-}
-
-exports.resolveProps = resolveProps;
-
-
-/***/ }),
-
-/***/ 976:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-
-function containsNewline(key) {
-    if (!key)
-        return null;
-    switch (key.type) {
-        case 'alias':
-        case 'scalar':
-        case 'double-quoted-scalar':
-        case 'single-quoted-scalar':
-            if (key.source.includes('\n'))
-                return true;
-            if (key.end)
-                for (const st of key.end)
-                    if (st.type === 'newline')
-                        return true;
-            return false;
-        case 'flow-collection':
-            for (const it of key.items) {
-                for (const st of it.start)
-                    if (st.type === 'newline')
-                        return true;
-                if (it.sep)
-                    for (const st of it.sep)
-                        if (st.type === 'newline')
-                            return true;
-                if (containsNewline(it.key) || containsNewline(it.value))
-                    return true;
-            }
-            return false;
-        default:
-            return true;
-    }
-}
-
-exports.containsNewline = containsNewline;
-
-
-/***/ }),
-
-/***/ 8781:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-
-function emptyScalarPosition(offset, before, pos) {
-    if (before) {
-        pos ?? (pos = before.length);
-        for (let i = pos - 1; i >= 0; --i) {
-            let st = before[i];
-            switch (st.type) {
-                case 'space':
-                case 'comment':
-                case 'newline':
-                    offset -= st.source.length;
-                    continue;
-            }
-            // Technically, an empty scalar is immediately after the last non-empty
-            // node, but it's more useful to place it after any whitespace.
-            st = before[++i];
-            while (st?.type === 'space') {
-                offset += st.source.length;
-                st = before[++i];
-            }
-            break;
-        }
-    }
-    return offset;
-}
-
-exports.emptyScalarPosition = emptyScalarPosition;
-
-
-/***/ }),
-
-/***/ 3669:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var utilContainsNewline = __nccwpck_require__(976);
-
-function flowIndentCheck(indent, fc, onError) {
-    if (fc?.type === 'flow-collection') {
-        const end = fc.end[0];
-        if (end.indent === indent &&
-            (end.source === ']' || end.source === '}') &&
-            utilContainsNewline.containsNewline(fc)) {
-            const msg = 'Flow end indicator should be more indented than parent';
-            onError(end, 'BAD_INDENT', msg, true);
-        }
-    }
-}
-
-exports.flowIndentCheck = flowIndentCheck;
-
-
-/***/ }),
-
-/***/ 6899:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var identity = __nccwpck_require__(5589);
-
-function mapIncludes(ctx, items, search) {
-    const { uniqueKeys } = ctx.options;
-    if (uniqueKeys === false)
-        return false;
-    const isEqual = typeof uniqueKeys === 'function'
-        ? uniqueKeys
-        : (a, b) => a === b || (identity.isScalar(a) && identity.isScalar(b) && a.value === b.value);
-    return items.some(pair => isEqual(pair.key, search));
-}
-
-exports.mapIncludes = mapIncludes;
-
-
-/***/ }),
-
-/***/ 42:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var Alias = __nccwpck_require__(5639);
-var Collection = __nccwpck_require__(3466);
-var identity = __nccwpck_require__(5589);
-var Pair = __nccwpck_require__(246);
-var toJS = __nccwpck_require__(2463);
-var Schema = __nccwpck_require__(6831);
-var stringifyDocument = __nccwpck_require__(5225);
-var anchors = __nccwpck_require__(8459);
-var applyReviver = __nccwpck_require__(3412);
-var createNode = __nccwpck_require__(9652);
-var directives = __nccwpck_require__(5400);
-
-class Document {
-    constructor(value, replacer, options) {
-        /** A comment before this Document */
-        this.commentBefore = null;
-        /** A comment immediately after this Document */
-        this.comment = null;
-        /** Errors encountered during parsing. */
-        this.errors = [];
-        /** Warnings encountered during parsing. */
-        this.warnings = [];
-        Object.defineProperty(this, identity.NODE_TYPE, { value: identity.DOC });
-        let _replacer = null;
-        if (typeof replacer === 'function' || Array.isArray(replacer)) {
-            _replacer = replacer;
-        }
-        else if (options === undefined && replacer) {
-            options = replacer;
-            replacer = undefined;
-        }
-        const opt = Object.assign({
-            intAsBigInt: false,
-            keepSourceTokens: false,
-            logLevel: 'warn',
-            prettyErrors: true,
-            strict: true,
-            stringKeys: false,
-            uniqueKeys: true,
-            version: '1.2'
-        }, options);
-        this.options = opt;
-        let { version } = opt;
-        if (options?._directives) {
-            this.directives = options._directives.atDocument();
-            if (this.directives.yaml.explicit)
-                version = this.directives.yaml.version;
-        }
-        else
-            this.directives = new directives.Directives({ version });
-        this.setSchema(version, options);
-        // @ts-expect-error We can't really know that this matches Contents.
-        this.contents =
-            value === undefined ? null : this.createNode(value, _replacer, options);
-    }
-    /**
-     * Create a deep copy of this Document and its contents.
-     *
-     * Custom Node values that inherit from `Object` still refer to their original instances.
-     */
-    clone() {
-        const copy = Object.create(Document.prototype, {
-            [identity.NODE_TYPE]: { value: identity.DOC }
-        });
-        copy.commentBefore = this.commentBefore;
-        copy.comment = this.comment;
-        copy.errors = this.errors.slice();
-        copy.warnings = this.warnings.slice();
-        copy.options = Object.assign({}, this.options);
-        if (this.directives)
-            copy.directives = this.directives.clone();
-        copy.schema = this.schema.clone();
-        // @ts-expect-error We can't really know that this matches Contents.
-        copy.contents = identity.isNode(this.contents)
-            ? this.contents.clone(copy.schema)
-            : this.contents;
-        if (this.range)
-            copy.range = this.range.slice();
-        return copy;
-    }
-    /** Adds a value to the document. */
-    add(value) {
-        if (assertCollection(this.contents))
-            this.contents.add(value);
-    }
-    /** Adds a value to the document. */
-    addIn(path, value) {
-        if (assertCollection(this.contents))
-            this.contents.addIn(path, value);
-    }
-    /**
-     * Create a new `Alias` node, ensuring that the target `node` has the required anchor.
-     *
-     * If `node` already has an anchor, `name` is ignored.
-     * Otherwise, the `node.anchor` value will be set to `name`,
-     * or if an anchor with that name is already present in the document,
-     * `name` will be used as a prefix for a new unique anchor.
-     * If `name` is undefined, the generated anchor will use 'a' as a prefix.
-     */
-    createAlias(node, name) {
-        if (!node.anchor) {
-            const prev = anchors.anchorNames(this);
-            node.anchor =
-                // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
-                !name || prev.has(name) ? anchors.findNewAnchor(name || 'a', prev) : name;
-        }
-        return new Alias.Alias(node.anchor);
-    }
-    createNode(value, replacer, options) {
-        let _replacer = undefined;
-        if (typeof replacer === 'function') {
-            value = replacer.call({ '': value }, '', value);
-            _replacer = replacer;
-        }
-        else if (Array.isArray(replacer)) {
-            const keyToStr = (v) => typeof v === 'number' || v instanceof String || v instanceof Number;
-            const asStr = replacer.filter(keyToStr).map(String);
-            if (asStr.length > 0)
-                replacer = replacer.concat(asStr);
-            _replacer = replacer;
-        }
-        else if (options === undefined && replacer) {
-            options = replacer;
-            replacer = undefined;
-        }
-        const { aliasDuplicateObjects, anchorPrefix, flow, keepUndefined, onTagObj, tag } = options ?? {};
-        const { onAnchor, setAnchors, sourceObjects } = anchors.createNodeAnchors(this, 
-        // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing
-        anchorPrefix || 'a');
-        const ctx = {
-            aliasDuplicateObjects: aliasDuplicateObjects ?? true,
-            keepUndefined: keepUndefined ?? false,
-            onAnchor,
-            onTagObj,
-            replacer: _replacer,
-            schema: this.schema,
-            sourceObjects
-        };
-        const node = createNode.createNode(value, tag, ctx);
-        if (flow && identity.isCollection(node))
-            node.flow = true;
-        setAnchors();
-        return node;
-    }
-    /**
-     * Convert a key and a value into a `Pair` using the current schema,
-     * recursively wrapping all values as `Scalar` or `Collection` nodes.
-     */
-    createPair(key, value, options = {}) {
-        const k = this.createNode(key, null, options);
-        const v = this.createNode(value, null, options);
-        return new Pair.Pair(k, v);
-    }
-    /**
-     * Removes a value from the document.
-     * @returns `true` if the item was found and removed.
-     */
-    delete(key) {
-        return assertCollection(this.contents) ? this.contents.delete(key) : false;
-    }
-    /**
-     * Removes a value from the document.
-     * @returns `true` if the item was found and removed.
-     */
-    deleteIn(path) {
-        if (Collection.isEmptyPath(path)) {
-            if (this.contents == null)
-                return false;
-            // @ts-expect-error Presumed impossible if Strict extends false
-            this.contents = null;
-            return true;
-        }
-        return assertCollection(this.contents)
-            ? this.contents.deleteIn(path)
-            : false;
-    }
-    /**
-     * Returns item at `key`, or `undefined` if not found. By default unwraps
-     * scalar values from their surrounding node; to disable set `keepScalar` to
-     * `true` (collections are always returned intact).
-     */
-    get(key, keepScalar) {
-        return identity.isCollection(this.contents)
-            ? this.contents.get(key, keepScalar)
-            : undefined;
-    }
-    /**
-     * Returns item at `path`, or `undefined` if not found. By default unwraps
-     * scalar values from their surrounding node; to disable set `keepScalar` to
-     * `true` (collections are always returned intact).
-     */
-    getIn(path, keepScalar) {
-        if (Collection.isEmptyPath(path))
-            return !keepScalar && identity.isScalar(this.contents)
-                ? this.contents.value
-                : this.contents;
-        return identity.isCollection(this.contents)
-            ? this.contents.getIn(path, keepScalar)
-            : undefined;
-    }
-    /**
-     * Checks if the document includes a value with the key `key`.
-     */
-    has(key) {
-        return identity.isCollection(this.contents) ? this.contents.has(key) : false;
-    }
-    /**
-     * Checks if the document includes a value at `path`.
-     */
-    hasIn(path) {
-        if (Collection.isEmptyPath(path))
-            return this.contents !== undefined;
-        return identity.isCollection(this.contents) ? this.contents.hasIn(path) : false;
-    }
-    /**
-     * Sets a value in this document. For `!!set`, `value` needs to be a
-     * boolean to add/remove the item from the set.
-     */
-    set(key, value) {
-        if (this.contents == null) {
-            // @ts-expect-error We can't really know that this matches Contents.
-            this.contents = Collection.collectionFromPath(this.schema, [key], value);
-        }
-        else if (assertCollection(this.contents)) {
-            this.contents.set(key, value);
-        }
-    }
-    /**
-     * Sets a value in this document. For `!!set`, `value` needs to be a
-     * boolean to add/remove the item from the set.
-     */
-    setIn(path, value) {
-        if (Collection.isEmptyPath(path)) {
-            // @ts-expect-error We can't really know that this matches Contents.
-            this.contents = value;
-        }
-        else if (this.contents == null) {
-            // @ts-expect-error We can't really know that this matches Contents.
-            this.contents = Collection.collectionFromPath(this.schema, Array.from(path), value);
-        }
-        else if (assertCollection(this.contents)) {
-            this.contents.setIn(path, value);
-        }
-    }
-    /**
-     * Change the YAML version and schema used by the document.
-     * A `null` version disables support for directives, explicit tags, anchors, and aliases.
-     * It also requires the `schema` option to be given as a `Schema` instance value.
-     *
-     * Overrides all previously set schema options.
-     */
-    setSchema(version, options = {}) {
-        if (typeof version === 'number')
-            version = String(version);
-        let opt;
-        switch (version) {
-            case '1.1':
-                if (this.directives)
-                    this.directives.yaml.version = '1.1';
-                else
-                    this.directives = new directives.Directives({ version: '1.1' });
-                opt = { resolveKnownTags: false, schema: 'yaml-1.1' };
-                break;
-            case '1.2':
-            case 'next':
-                if (this.directives)
-                    this.directives.yaml.version = version;
-                else
-                    this.directives = new directives.Directives({ version });
-                opt = { resolveKnownTags: true, schema: 'core' };
-                break;
-            case null:
-                if (this.directives)
-                    delete this.directives;
-                opt = null;
-                break;
-            default: {
-                const sv = JSON.stringify(version);
-                throw new Error(`Expected '1.1', '1.2' or null as first argument, but found: ${sv}`);
-            }
-        }
-        // Not using `instanceof Schema` to allow for duck typing
-        if (options.schema instanceof Object)
-            this.schema = options.schema;
-        else if (opt)
-            this.schema = new Schema.Schema(Object.assign(opt, options));
-        else
-            throw new Error(`With a null YAML version, the { schema: Schema } option is required`);
-    }
-    // json & jsonArg are only used from toJSON()
-    toJS({ json, jsonArg, mapAsMap, maxAliasCount, onAnchor, reviver } = {}) {
-        const ctx = {
-            anchors: new Map(),
-            doc: this,
-            keep: !json,
-            mapAsMap: mapAsMap === true,
-            mapKeyWarned: false,
-            maxAliasCount: typeof maxAliasCount === 'number' ? maxAliasCount : 100
-        };
-        const res = toJS.toJS(this.contents, jsonArg ?? '', ctx);
-        if (typeof onAnchor === 'function')
-            for (const { count, res } of ctx.anchors.values())
-                onAnchor(res, count);
-        return typeof reviver === 'function'
-            ? applyReviver.applyReviver(reviver, { '': res }, '', res)
-            : res;
-    }
-    /**
-     * A JSON representation of the document `contents`.
-     *
-     * @param jsonArg Used by `JSON.stringify` to indicate the array index or
-     *   property name.
-     */
-    toJSON(jsonArg, onAnchor) {
-        return this.toJS({ json: true, jsonArg, mapAsMap: false, onAnchor });
-    }
-    /** A YAML representation of the document. */
-    toString(options = {}) {
-        if (this.errors.length > 0)
-            throw new Error('Document with errors cannot be stringified');
-        if ('indent' in options &&
-            (!Number.isInteger(options.indent) || Number(options.indent) <= 0)) {
-            const s = JSON.stringify(options.indent);
-            throw new Error(`"indent" option must be a positive integer, not ${s}`);
-        }
-        return stringifyDocument.stringifyDocument(this, options);
-    }
-}
-function assertCollection(contents) {
-    if (identity.isCollection(contents))
-        return true;
-    throw new Error('Expected a YAML collection as document contents');
-}
-
-exports.Document = Document;
-
-
-/***/ }),
-
-/***/ 8459:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var identity = __nccwpck_require__(5589);
-var visit = __nccwpck_require__(6796);
-
-/**
- * Verify that the input string is a valid anchor.
- *
- * Will throw on errors.
- */
-function anchorIsValid(anchor) {
-    if (/[\x00-\x19\s,[\]{}]/.test(anchor)) {
-        const sa = JSON.stringify(anchor);
-        const msg = `Anchor must not contain whitespace or control characters: ${sa}`;
-        throw new Error(msg);
-    }
-    return true;
-}
-function anchorNames(root) {
-    const anchors = new Set();
-    visit.visit(root, {
-        Value(_key, node) {
-            if (node.anchor)
-                anchors.add(node.anchor);
-        }
-    });
-    return anchors;
-}
-/** Find a new anchor name with the given `prefix` and a one-indexed suffix. */
-function findNewAnchor(prefix, exclude) {
-    for (let i = 1; true; ++i) {
-        const name = `${prefix}${i}`;
-        if (!exclude.has(name))
-            return name;
-    }
-}
-function createNodeAnchors(doc, prefix) {
-    const aliasObjects = [];
-    const sourceObjects = new Map();
-    let prevAnchors = null;
-    return {
-        onAnchor: (source) => {
-            aliasObjects.push(source);
-            prevAnchors ?? (prevAnchors = anchorNames(doc));
-            const anchor = findNewAnchor(prefix, prevAnchors);
-            prevAnchors.add(anchor);
-            return anchor;
-        },
-        /**
-         * With circular references, the source node is only resolved after all
-         * of its child nodes are. This is why anchors are set only after all of
-         * the nodes have been created.
-         */
-        setAnchors: () => {
-            for (const source of aliasObjects) {
-                const ref = sourceObjects.get(source);
-                if (typeof ref === 'object' &&
-                    ref.anchor &&
-                    (identity.isScalar(ref.node) || identity.isCollection(ref.node))) {
-                    ref.node.anchor = ref.anchor;
-                }
-                else {
-                    const error = new Error('Failed to resolve repeated object (this should not happen)');
-                    error.source = source;
-                    throw error;
-                }
-            }
-        },
-        sourceObjects
-    };
-}
-
-exports.anchorIsValid = anchorIsValid;
-exports.anchorNames = anchorNames;
-exports.createNodeAnchors = createNodeAnchors;
-exports.findNewAnchor = findNewAnchor;
-
-
-/***/ }),
-
-/***/ 3412:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-
-/**
- * Applies the JSON.parse reviver algorithm as defined in the ECMA-262 spec,
- * in section 24.5.1.1 "Runtime Semantics: InternalizeJSONProperty" of the
- * 2021 edition: https://tc39.es/ecma262/#sec-json.parse
- *
- * Includes extensions for handling Map and Set objects.
- */
-function applyReviver(reviver, obj, key, val) {
-    if (val && typeof val === 'object') {
-        if (Array.isArray(val)) {
-            for (let i = 0, len = val.length; i < len; ++i) {
-                const v0 = val[i];
-                const v1 = applyReviver(reviver, val, String(i), v0);
-                // eslint-disable-next-line @typescript-eslint/no-array-delete
-                if (v1 === undefined)
-                    delete val[i];
-                else if (v1 !== v0)
-                    val[i] = v1;
-            }
-        }
-        else if (val instanceof Map) {
-            for (const k of Array.from(val.keys())) {
-                const v0 = val.get(k);
-                const v1 = applyReviver(reviver, val, k, v0);
-                if (v1 === undefined)
-                    val.delete(k);
-                else if (v1 !== v0)
-                    val.set(k, v1);
-            }
-        }
-        else if (val instanceof Set) {
-            for (const v0 of Array.from(val)) {
-                const v1 = applyReviver(reviver, val, v0, v0);
-                if (v1 === undefined)
-                    val.delete(v0);
-                else if (v1 !== v0) {
-                    val.delete(v0);
-                    val.add(v1);
-                }
-            }
-        }
-        else {
-            for (const [k, v0] of Object.entries(val)) {
-                const v1 = applyReviver(reviver, val, k, v0);
-                if (v1 === undefined)
-                    delete val[k];
-                else if (v1 !== v0)
-                    val[k] = v1;
-            }
-        }
-    }
-    return reviver.call(obj, key, val);
-}
-
-exports.applyReviver = applyReviver;
-
-
-/***/ }),
-
-/***/ 9652:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var Alias = __nccwpck_require__(5639);
-var identity = __nccwpck_require__(5589);
-var Scalar = __nccwpck_require__(9338);
-
-const defaultTagPrefix = 'tag:yaml.org,2002:';
-function findTagObject(value, tagName, tags) {
-    if (tagName) {
-        const match = tags.filter(t => t.tag === tagName);
-        const tagObj = match.find(t => !t.format) ?? match[0];
-        if (!tagObj)
-            throw new Error(`Tag ${tagName} not found`);
-        return tagObj;
-    }
-    return tags.find(t => t.identify?.(value) && !t.format);
-}
-function createNode(value, tagName, ctx) {
-    if (identity.isDocument(value))
-        value = value.contents;
-    if (identity.isNode(value))
-        return value;
-    if (identity.isPair(value)) {
-        const map = ctx.schema[identity.MAP].createNode?.(ctx.schema, null, ctx);
-        map.items.push(value);
-        return map;
-    }
-    if (value instanceof String ||
-        value instanceof Number ||
-        value instanceof Boolean ||
-        (typeof BigInt !== 'undefined' && value instanceof BigInt) // not supported everywhere
-    ) {
-        // https://tc39.es/ecma262/#sec-serializejsonproperty
-        value = value.valueOf();
-    }
-    const { aliasDuplicateObjects, onAnchor, onTagObj, schema, sourceObjects } = ctx;
-    // Detect duplicate references to the same object & use Alias nodes for all
-    // after first. The `ref` wrapper allows for circular references to resolve.
-    let ref = undefined;
-    if (aliasDuplicateObjects && value && typeof value === 'object') {
-        ref = sourceObjects.get(value);
-        if (ref) {
-            ref.anchor ?? (ref.anchor = onAnchor(value));
-            return new Alias.Alias(ref.anchor);
-        }
-        else {
-            ref = { anchor: null, node: null };
-            sourceObjects.set(value, ref);
-        }
-    }
-    if (tagName?.startsWith('!!'))
-        tagName = defaultTagPrefix + tagName.slice(2);
-    let tagObj = findTagObject(value, tagName, schema.tags);
-    if (!tagObj) {
-        if (value && typeof value.toJSON === 'function') {
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-call
-            value = value.toJSON();
-        }
-        if (!value || typeof value !== 'object') {
-            const node = new Scalar.Scalar(value);
-            if (ref)
-                ref.node = node;
-            return node;
-        }
-        tagObj =
-            value instanceof Map
-                ? schema[identity.MAP]
-                : Symbol.iterator in Object(value)
-                    ? schema[identity.SEQ]
-                    : schema[identity.MAP];
-    }
-    if (onTagObj) {
-        onTagObj(tagObj);
-        delete ctx.onTagObj;
-    }
-    const node = tagObj?.createNode
-        ? tagObj.createNode(ctx.schema, value, ctx)
-        : typeof tagObj?.nodeClass?.from === 'function'
-            ? tagObj.nodeClass.from(ctx.schema, value, ctx)
-            : new Scalar.Scalar(value);
-    if (tagName)
-        node.tag = tagName;
-    else if (!tagObj.default)
-        node.tag = tagObj.tag;
-    if (ref)
-        ref.node = node;
-    return node;
-}
-
-exports.createNode = createNode;
-
-
-/***/ }),
-
-/***/ 5400:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var identity = __nccwpck_require__(5589);
-var visit = __nccwpck_require__(6796);
-
-const escapeChars = {
-    '!': '%21',
-    ',': '%2C',
-    '[': '%5B',
-    ']': '%5D',
-    '{': '%7B',
-    '}': '%7D'
-};
-const escapeTagName = (tn) => tn.replace(/[!,[\]{}]/g, ch => escapeChars[ch]);
-class Directives {
-    constructor(yaml, tags) {
-        /**
-         * The directives-end/doc-start marker `---`. If `null`, a marker may still be
-         * included in the document's stringified representation.
-         */
-        this.docStart = null;
-        /** The doc-end marker `...`.  */
-        this.docEnd = false;
-        this.yaml = Object.assign({}, Directives.defaultYaml, yaml);
-        this.tags = Object.assign({}, Directives.defaultTags, tags);
-    }
-    clone() {
-        const copy = new Directives(this.yaml, this.tags);
-        copy.docStart = this.docStart;
-        return copy;
-    }
-    /**
-     * During parsing, get a Directives instance for the current document and
-     * update the stream state according to the current version's spec.
-     */
-    atDocument() {
-        const res = new Directives(this.yaml, this.tags);
-        switch (this.yaml.version) {
-            case '1.1':
-                this.atNextDocument = true;
-                break;
-            case '1.2':
-                this.atNextDocument = false;
-                this.yaml = {
-                    explicit: Directives.defaultYaml.explicit,
-                    version: '1.2'
-                };
-                this.tags = Object.assign({}, Directives.defaultTags);
-                break;
-        }
-        return res;
-    }
-    /**
-     * @param onError - May be called even if the action was successful
-     * @returns `true` on success
-     */
-    add(line, onError) {
-        if (this.atNextDocument) {
-            this.yaml = { explicit: Directives.defaultYaml.explicit, version: '1.1' };
-            this.tags = Object.assign({}, Directives.defaultTags);
-            this.atNextDocument = false;
-        }
-        const parts = line.trim().split(/[ \t]+/);
-        const name = parts.shift();
-        switch (name) {
-            case '%TAG': {
-                if (parts.length !== 2) {
-                    onError(0, '%TAG directive should contain exactly two parts');
-                    if (parts.length < 2)
-                        return false;
-                }
-                const [handle, prefix] = parts;
-                this.tags[handle] = prefix;
-                return true;
-            }
-            case '%YAML': {
-                this.yaml.explicit = true;
-                if (parts.length !== 1) {
-                    onError(0, '%YAML directive should contain exactly one part');
-                    return false;
-                }
-                const [version] = parts;
-                if (version === '1.1' || version === '1.2') {
-                    this.yaml.version = version;
-                    return true;
-                }
-                else {
-                    const isValid = /^\d+\.\d+$/.test(version);
-                    onError(6, `Unsupported YAML version ${version}`, isValid);
-                    return false;
-                }
-            }
-            default:
-                onError(0, `Unknown directive ${name}`, true);
-                return false;
-        }
-    }
-    /**
-     * Resolves a tag, matching handles to those defined in %TAG directives.
-     *
-     * @returns Resolved tag, which may also be the non-specific tag `'!'` or a
-     *   `'!local'` tag, or `null` if unresolvable.
-     */
-    tagName(source, onError) {
-        if (source === '!')
-            return '!'; // non-specific tag
-        if (source[0] !== '!') {
-            onError(`Not a valid tag: ${source}`);
-            return null;
-        }
-        if (source[1] === '<') {
-            const verbatim = source.slice(2, -1);
-            if (verbatim === '!' || verbatim === '!!') {
-                onError(`Verbatim tags aren't resolved, so ${source} is invalid.`);
-                return null;
-            }
-            if (source[source.length - 1] !== '>')
-                onError('Verbatim tags must end with a >');
-            return verbatim;
-        }
-        const [, handle, suffix] = source.match(/^(.*!)([^!]*)$/s);
-        if (!suffix)
-            onError(`The ${source} tag has no suffix`);
-        const prefix = this.tags[handle];
-        if (prefix) {
-            try {
-                return prefix + decodeURIComponent(suffix);
-            }
-            catch (error) {
-                onError(String(error));
-                return null;
-            }
-        }
-        if (handle === '!')
-            return source; // local tag
-        onError(`Could not resolve tag: ${source}`);
-        return null;
-    }
-    /**
-     * Given a fully resolved tag, returns its printable string form,
-     * taking into account current tag prefixes and defaults.
-     */
-    tagString(tag) {
-        for (const [handle, prefix] of Object.entries(this.tags)) {
-            if (tag.startsWith(prefix))
-                return handle + escapeTagName(tag.substring(prefix.length));
-        }
-        return tag[0] === '!' ? tag : `!<${tag}>`;
-    }
-    toString(doc) {
-        const lines = this.yaml.explicit
-            ? [`%YAML ${this.yaml.version || '1.2'}`]
-            : [];
-        const tagEntries = Object.entries(this.tags);
-        let tagNames;
-        if (doc && tagEntries.length > 0 && identity.isNode(doc.contents)) {
-            const tags = {};
-            visit.visit(doc.contents, (_key, node) => {
-                if (identity.isNode(node) && node.tag)
-                    tags[node.tag] = true;
-            });
-            tagNames = Object.keys(tags);
-        }
-        else
-            tagNames = [];
-        for (const [handle, prefix] of tagEntries) {
-            if (handle === '!!' && prefix === 'tag:yaml.org,2002:')
-                continue;
-            if (!doc || tagNames.some(tn => tn.startsWith(prefix)))
-                lines.push(`%TAG ${handle} ${prefix}`);
-        }
-        return lines.join('\n');
-    }
-}
-Directives.defaultYaml = { explicit: false, version: '1.2' };
-Directives.defaultTags = { '!!': 'tag:yaml.org,2002:' };
-
-exports.Directives = Directives;
-
-
-/***/ }),
-
-/***/ 4236:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-
-class YAMLError extends Error {
-    constructor(name, pos, code, message) {
-        super();
-        this.name = name;
-        this.code = code;
-        this.message = message;
-        this.pos = pos;
-    }
-}
-class YAMLParseError extends YAMLError {
-    constructor(pos, code, message) {
-        super('YAMLParseError', pos, code, message);
-    }
-}
-class YAMLWarning extends YAMLError {
-    constructor(pos, code, message) {
-        super('YAMLWarning', pos, code, message);
-    }
-}
-const prettifyError = (src, lc) => (error) => {
-    if (error.pos[0] === -1)
-        return;
-    error.linePos = error.pos.map(pos => lc.linePos(pos));
-    const { line, col } = error.linePos[0];
-    error.message += ` at line ${line}, column ${col}`;
-    let ci = col - 1;
-    let lineStr = src
-        .substring(lc.lineStarts[line - 1], lc.lineStarts[line])
-        .replace(/[\n\r]+$/, '');
-    // Trim to max 80 chars, keeping col position near the middle
-    if (ci >= 60 && lineStr.length > 80) {
-        const trimStart = Math.min(ci - 39, lineStr.length - 79);
-        lineStr = '…' + lineStr.substring(trimStart);
-        ci -= trimStart - 1;
-    }
-    if (lineStr.length > 80)
-        lineStr = lineStr.substring(0, 79) + '…';
-    // Include previous line in context if pointing at line start
-    if (line > 1 && /^ *$/.test(lineStr.substring(0, ci))) {
-        // Regexp won't match if start is trimmed
-        let prev = src.substring(lc.lineStarts[line - 2], lc.lineStarts[line - 1]);
-        if (prev.length > 80)
-            prev = prev.substring(0, 79) + '…\n';
-        lineStr = prev + lineStr;
-    }
-    if (/[^ ]/.test(lineStr)) {
-        let count = 1;
-        const end = error.linePos[1];
-        if (end?.line === line && end.col > col) {
-            count = Math.max(1, Math.min(end.col - col, 80 - ci));
-        }
-        const pointer = ' '.repeat(ci) + '^'.repeat(count);
-        error.message += `:\n\n${lineStr}\n${pointer}\n`;
-    }
-};
-
-exports.YAMLError = YAMLError;
-exports.YAMLParseError = YAMLParseError;
-exports.YAMLWarning = YAMLWarning;
-exports.prettifyError = prettifyError;
-
-
-/***/ }),
-
-/***/ 4083:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var composer = __nccwpck_require__(9493);
-var Document = __nccwpck_require__(42);
-var Schema = __nccwpck_require__(6831);
-var errors = __nccwpck_require__(4236);
-var Alias = __nccwpck_require__(5639);
-var identity = __nccwpck_require__(5589);
-var Pair = __nccwpck_require__(246);
-var Scalar = __nccwpck_require__(9338);
-var YAMLMap = __nccwpck_require__(6011);
-var YAMLSeq = __nccwpck_require__(5161);
-var cst = __nccwpck_require__(9169);
-var lexer = __nccwpck_require__(5976);
-var lineCounter = __nccwpck_require__(1929);
-var parser = __nccwpck_require__(3328);
-var publicApi = __nccwpck_require__(8649);
-var visit = __nccwpck_require__(6796);
-
-
-
-exports.Composer = composer.Composer;
-exports.Document = Document.Document;
-exports.Schema = Schema.Schema;
-exports.YAMLError = errors.YAMLError;
-exports.YAMLParseError = errors.YAMLParseError;
-exports.YAMLWarning = errors.YAMLWarning;
-exports.Alias = Alias.Alias;
-exports.isAlias = identity.isAlias;
-exports.isCollection = identity.isCollection;
-exports.isDocument = identity.isDocument;
-exports.isMap = identity.isMap;
-exports.isNode = identity.isNode;
-exports.isPair = identity.isPair;
-exports.isScalar = identity.isScalar;
-exports.isSeq = identity.isSeq;
-exports.Pair = Pair.Pair;
-exports.Scalar = Scalar.Scalar;
-exports.YAMLMap = YAMLMap.YAMLMap;
-exports.YAMLSeq = YAMLSeq.YAMLSeq;
-exports.CST = cst;
-exports.Lexer = lexer.Lexer;
-exports.LineCounter = lineCounter.LineCounter;
-exports.Parser = parser.Parser;
-exports.parse = publicApi.parse;
-exports.parseAllDocuments = publicApi.parseAllDocuments;
-exports.parseDocument = publicApi.parseDocument;
-exports.stringify = publicApi.stringify;
-exports.visit = visit.visit;
-exports.visitAsync = visit.visitAsync;
-
-
-/***/ }),
-
-/***/ 6909:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var node_process = __nccwpck_require__(7282);
-
-function debug(logLevel, ...messages) {
-    if (logLevel === 'debug')
-        console.log(...messages);
-}
-function warn(logLevel, warning) {
-    if (logLevel === 'debug' || logLevel === 'warn') {
-        if (typeof node_process.emitWarning === 'function')
-            node_process.emitWarning(warning);
-        else
-            console.warn(warning);
-    }
-}
-
-exports.debug = debug;
-exports.warn = warn;
-
-
-/***/ }),
-
-/***/ 5639:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var anchors = __nccwpck_require__(8459);
-var visit = __nccwpck_require__(6796);
-var identity = __nccwpck_require__(5589);
-var Node = __nccwpck_require__(1399);
-var toJS = __nccwpck_require__(2463);
-
-class Alias extends Node.NodeBase {
-    constructor(source) {
-        super(identity.ALIAS);
-        this.source = source;
-        Object.defineProperty(this, 'tag', {
-            set() {
-                throw new Error('Alias nodes cannot have tags');
-            }
-        });
-    }
-    /**
-     * Resolve the value of this alias within `doc`, finding the last
-     * instance of the `source` anchor before this node.
-     */
-    resolve(doc, ctx) {
-        if (ctx?.maxAliasCount === 0)
-            throw new ReferenceError('Alias resolution is disabled');
-        let nodes;
-        if (ctx?.aliasResolveCache) {
-            nodes = ctx.aliasResolveCache;
-        }
-        else {
-            nodes = [];
-            visit.visit(doc, {
-                Node: (_key, node) => {
-                    if (identity.isAlias(node) || identity.hasAnchor(node))
-                        nodes.push(node);
-                }
-            });
-            if (ctx)
-                ctx.aliasResolveCache = nodes;
-        }
-        let found = undefined;
-        for (const node of nodes) {
-            if (node === this)
-                break;
-            if (node.anchor === this.source)
-                found = node;
-        }
-        return found;
-    }
-    toJSON(_arg, ctx) {
-        if (!ctx)
-            return { source: this.source };
-        const { anchors, doc, maxAliasCount } = ctx;
-        const source = this.resolve(doc, ctx);
-        if (!source) {
-            const msg = `Unresolved alias (the anchor must be set before the alias): ${this.source}`;
-            throw new ReferenceError(msg);
-        }
-        let data = anchors.get(source);
-        if (!data) {
-            // Resolve anchors for Node.prototype.toJS()
-            toJS.toJS(source, null, ctx);
-            data = anchors.get(source);
-        }
-        /* istanbul ignore if */
-        if (data?.res === undefined) {
-            const msg = 'This should not happen: Alias anchor was not resolved?';
-            throw new ReferenceError(msg);
-        }
-        if (maxAliasCount >= 0) {
-            data.count += 1;
-            if (data.aliasCount === 0)
-                data.aliasCount = getAliasCount(doc, source, anchors);
-            if (data.count * data.aliasCount > maxAliasCount) {
-                const msg = 'Excessive alias count indicates a resource exhaustion attack';
-                throw new ReferenceError(msg);
-            }
-        }
-        return data.res;
-    }
-    toString(ctx, _onComment, _onChompKeep) {
-        const src = `*${this.source}`;
-        if (ctx) {
-            anchors.anchorIsValid(this.source);
-            if (ctx.options.verifyAliasOrder && !ctx.anchors.has(this.source)) {
-                const msg = `Unresolved alias (the anchor must be set before the alias): ${this.source}`;
-                throw new Error(msg);
-            }
-            if (ctx.implicitKey)
-                return `${src} `;
-        }
-        return src;
-    }
-}
-function getAliasCount(doc, node, anchors) {
-    if (identity.isAlias(node)) {
-        const source = node.resolve(doc);
-        const anchor = anchors && source && anchors.get(source);
-        return anchor ? anchor.count * anchor.aliasCount : 0;
-    }
-    else if (identity.isCollection(node)) {
-        let count = 0;
-        for (const item of node.items) {
-            const c = getAliasCount(doc, item, anchors);
-            if (c > count)
-                count = c;
-        }
-        return count;
-    }
-    else if (identity.isPair(node)) {
-        const kc = getAliasCount(doc, node.key, anchors);
-        const vc = getAliasCount(doc, node.value, anchors);
-        return Math.max(kc, vc);
-    }
-    return 1;
-}
-
-exports.Alias = Alias;
-
-
-/***/ }),
-
-/***/ 3466:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var createNode = __nccwpck_require__(9652);
-var identity = __nccwpck_require__(5589);
-var Node = __nccwpck_require__(1399);
-
-function collectionFromPath(schema, path, value) {
-    let v = value;
-    for (let i = path.length - 1; i >= 0; --i) {
-        const k = path[i];
-        if (typeof k === 'number' && Number.isInteger(k) && k >= 0) {
-            const a = [];
-            a[k] = v;
-            v = a;
-        }
-        else {
-            v = new Map([[k, v]]);
-        }
-    }
-    return createNode.createNode(v, undefined, {
-        aliasDuplicateObjects: false,
-        keepUndefined: false,
-        onAnchor: () => {
-            throw new Error('This should not happen, please report a bug.');
-        },
-        schema,
-        sourceObjects: new Map()
-    });
-}
-// Type guard is intentionally a little wrong so as to be more useful,
-// as it does not cover untypable empty non-string iterables (e.g. []).
-const isEmptyPath = (path) => path == null ||
-    (typeof path === 'object' && !!path[Symbol.iterator]().next().done);
-class Collection extends Node.NodeBase {
-    constructor(type, schema) {
-        super(type);
-        Object.defineProperty(this, 'schema', {
-            value: schema,
-            configurable: true,
-            enumerable: false,
-            writable: true
-        });
-    }
-    /**
-     * Create a copy of this collection.
-     *
-     * @param schema - If defined, overwrites the original's schema
-     */
-    clone(schema) {
-        const copy = Object.create(Object.getPrototypeOf(this), Object.getOwnPropertyDescriptors(this));
-        if (schema)
-            copy.schema = schema;
-        copy.items = copy.items.map(it => identity.isNode(it) || identity.isPair(it) ? it.clone(schema) : it);
-        if (this.range)
-            copy.range = this.range.slice();
-        return copy;
-    }
-    /**
-     * Adds a value to the collection. For `!!map` and `!!omap` the value must
-     * be a Pair instance or a `{ key, value }` object, which may not have a key
-     * that already exists in the map.
-     */
-    addIn(path, value) {
-        if (isEmptyPath(path))
-            this.add(value);
-        else {
-            const [key, ...rest] = path;
-            const node = this.get(key, true);
-            if (identity.isCollection(node))
-                node.addIn(rest, value);
-            else if (node === undefined && this.schema)
-                this.set(key, collectionFromPath(this.schema, rest, value));
-            else
-                throw new Error(`Expected YAML collection at ${key}. Remaining path: ${rest}`);
-        }
-    }
-    /**
-     * Removes a value from the collection.
-     * @returns `true` if the item was found and removed.
-     */
-    deleteIn(path) {
-        const [key, ...rest] = path;
-        if (rest.length === 0)
-            return this.delete(key);
-        const node = this.get(key, true);
-        if (identity.isCollection(node))
-            return node.deleteIn(rest);
-        else
-            throw new Error(`Expected YAML collection at ${key}. Remaining path: ${rest}`);
-    }
-    /**
-     * Returns item at `key`, or `undefined` if not found. By default unwraps
-     * scalar values from their surrounding node; to disable set `keepScalar` to
-     * `true` (collections are always returned intact).
-     */
-    getIn(path, keepScalar) {
-        const [key, ...rest] = path;
-        const node = this.get(key, true);
-        if (rest.length === 0)
-            return !keepScalar && identity.isScalar(node) ? node.value : node;
-        else
-            return identity.isCollection(node) ? node.getIn(rest, keepScalar) : undefined;
-    }
-    hasAllNullValues(allowScalar) {
-        return this.items.every(node => {
-            if (!identity.isPair(node))
-                return false;
-            const n = node.value;
-            return (n == null ||
-                (allowScalar &&
-                    identity.isScalar(n) &&
-                    n.value == null &&
-                    !n.commentBefore &&
-                    !n.comment &&
-                    !n.tag));
-        });
-    }
-    /**
-     * Checks if the collection includes a value with the key `key`.
-     */
-    hasIn(path) {
-        const [key, ...rest] = path;
-        if (rest.length === 0)
-            return this.has(key);
-        const node = this.get(key, true);
-        return identity.isCollection(node) ? node.hasIn(rest) : false;
-    }
-    /**
-     * Sets a value in this collection. For `!!set`, `value` needs to be a
-     * boolean to add/remove the item from the set.
-     */
-    setIn(path, value) {
-        const [key, ...rest] = path;
-        if (rest.length === 0) {
-            this.set(key, value);
-        }
-        else {
-            const node = this.get(key, true);
-            if (identity.isCollection(node))
-                node.setIn(rest, value);
-            else if (node === undefined && this.schema)
-                this.set(key, collectionFromPath(this.schema, rest, value));
-            else
-                throw new Error(`Expected YAML collection at ${key}. Remaining path: ${rest}`);
-        }
-    }
-}
-
-exports.Collection = Collection;
-exports.collectionFromPath = collectionFromPath;
-exports.isEmptyPath = isEmptyPath;
-
-
-/***/ }),
-
-/***/ 1399:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var applyReviver = __nccwpck_require__(3412);
-var identity = __nccwpck_require__(5589);
-var toJS = __nccwpck_require__(2463);
-
-class NodeBase {
-    constructor(type) {
-        Object.defineProperty(this, identity.NODE_TYPE, { value: type });
-    }
-    /** Create a copy of this node.  */
-    clone() {
-        const copy = Object.create(Object.getPrototypeOf(this), Object.getOwnPropertyDescriptors(this));
-        if (this.range)
-            copy.range = this.range.slice();
-        return copy;
-    }
-    /** A plain JavaScript representation of this node. */
-    toJS(doc, { mapAsMap, maxAliasCount, onAnchor, reviver } = {}) {
-        if (!identity.isDocument(doc))
-            throw new TypeError('A document argument is required');
-        const ctx = {
-            anchors: new Map(),
-            doc,
-            keep: true,
-            mapAsMap: mapAsMap === true,
-            mapKeyWarned: false,
-            maxAliasCount: typeof maxAliasCount === 'number' ? maxAliasCount : 100
-        };
-        const res = toJS.toJS(this, '', ctx);
-        if (typeof onAnchor === 'function')
-            for (const { count, res } of ctx.anchors.values())
-                onAnchor(res, count);
-        return typeof reviver === 'function'
-            ? applyReviver.applyReviver(reviver, { '': res }, '', res)
-            : res;
-    }
-}
-
-exports.NodeBase = NodeBase;
-
-
-/***/ }),
-
-/***/ 246:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var createNode = __nccwpck_require__(9652);
-var stringifyPair = __nccwpck_require__(4875);
-var addPairToJSMap = __nccwpck_require__(4676);
-var identity = __nccwpck_require__(5589);
-
-function createPair(key, value, ctx) {
-    const k = createNode.createNode(key, undefined, ctx);
-    const v = createNode.createNode(value, undefined, ctx);
-    return new Pair(k, v);
-}
-class Pair {
-    constructor(key, value = null) {
-        Object.defineProperty(this, identity.NODE_TYPE, { value: identity.PAIR });
-        this.key = key;
-        this.value = value;
-    }
-    clone(schema) {
-        let { key, value } = this;
-        if (identity.isNode(key))
-            key = key.clone(schema);
-        if (identity.isNode(value))
-            value = value.clone(schema);
-        return new Pair(key, value);
-    }
-    toJSON(_, ctx) {
-        const pair = ctx?.mapAsMap ? new Map() : {};
-        return addPairToJSMap.addPairToJSMap(ctx, pair, this);
-    }
-    toString(ctx, onComment, onChompKeep) {
-        return ctx?.doc
-            ? stringifyPair.stringifyPair(this, ctx, onComment, onChompKeep)
-            : JSON.stringify(this);
-    }
-}
-
-exports.Pair = Pair;
-exports.createPair = createPair;
-
-
-/***/ }),
-
-/***/ 9338:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var identity = __nccwpck_require__(5589);
-var Node = __nccwpck_require__(1399);
-var toJS = __nccwpck_require__(2463);
-
-const isScalarValue = (value) => !value || (typeof value !== 'function' && typeof value !== 'object');
-class Scalar extends Node.NodeBase {
-    constructor(value) {
-        super(identity.SCALAR);
-        this.value = value;
-    }
-    toJSON(arg, ctx) {
-        return ctx?.keep ? this.value : toJS.toJS(this.value, arg, ctx);
-    }
-    toString() {
-        return String(this.value);
-    }
-}
-Scalar.BLOCK_FOLDED = 'BLOCK_FOLDED';
-Scalar.BLOCK_LITERAL = 'BLOCK_LITERAL';
-Scalar.PLAIN = 'PLAIN';
-Scalar.QUOTE_DOUBLE = 'QUOTE_DOUBLE';
-Scalar.QUOTE_SINGLE = 'QUOTE_SINGLE';
-
-exports.Scalar = Scalar;
-exports.isScalarValue = isScalarValue;
-
-
-/***/ }),
-
-/***/ 6011:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var stringifyCollection = __nccwpck_require__(2466);
-var addPairToJSMap = __nccwpck_require__(4676);
-var Collection = __nccwpck_require__(3466);
-var identity = __nccwpck_require__(5589);
-var Pair = __nccwpck_require__(246);
-var Scalar = __nccwpck_require__(9338);
-
-function findPair(items, key) {
-    const k = identity.isScalar(key) ? key.value : key;
-    for (const it of items) {
-        if (identity.isPair(it)) {
-            if (it.key === key || it.key === k)
-                return it;
-            if (identity.isScalar(it.key) && it.key.value === k)
-                return it;
-        }
-    }
-    return undefined;
-}
-class YAMLMap extends Collection.Collection {
-    static get tagName() {
-        return 'tag:yaml.org,2002:map';
-    }
-    constructor(schema) {
-        super(identity.MAP, schema);
-        this.items = [];
-    }
-    /**
-     * A generic collection parsing method that can be extended
-     * to other node classes that inherit from YAMLMap
-     */
-    static from(schema, obj, ctx) {
-        const { keepUndefined, replacer } = ctx;
-        const map = new this(schema);
-        const add = (key, value) => {
-            if (typeof replacer === 'function')
-                value = replacer.call(obj, key, value);
-            else if (Array.isArray(replacer) && !replacer.includes(key))
-                return;
-            if (value !== undefined || keepUndefined)
-                map.items.push(Pair.createPair(key, value, ctx));
-        };
-        if (obj instanceof Map) {
-            for (const [key, value] of obj)
-                add(key, value);
-        }
-        else if (obj && typeof obj === 'object') {
-            for (const key of Object.keys(obj))
-                add(key, obj[key]);
-        }
-        if (typeof schema.sortMapEntries === 'function') {
-            map.items.sort(schema.sortMapEntries);
-        }
-        return map;
-    }
-    /**
-     * Adds a value to the collection.
-     *
-     * @param overwrite - If not set `true`, using a key that is already in the
-     *   collection will throw. Otherwise, overwrites the previous value.
-     */
-    add(pair, overwrite) {
-        let _pair;
-        if (identity.isPair(pair))
-            _pair = pair;
-        else if (!pair || typeof pair !== 'object' || !('key' in pair)) {
-            // In TypeScript, this never happens.
-            _pair = new Pair.Pair(pair, pair?.value);
-        }
-        else
-            _pair = new Pair.Pair(pair.key, pair.value);
-        const prev = findPair(this.items, _pair.key);
-        const sortEntries = this.schema?.sortMapEntries;
-        if (prev) {
-            if (!overwrite)
-                throw new Error(`Key ${_pair.key} already set`);
-            // For scalars, keep the old node & its comments and anchors
-            if (identity.isScalar(prev.value) && Scalar.isScalarValue(_pair.value))
-                prev.value.value = _pair.value;
-            else
-                prev.value = _pair.value;
-        }
-        else if (sortEntries) {
-            const i = this.items.findIndex(item => sortEntries(_pair, item) < 0);
-            if (i === -1)
-                this.items.push(_pair);
-            else
-                this.items.splice(i, 0, _pair);
-        }
-        else {
-            this.items.push(_pair);
-        }
-    }
-    delete(key) {
-        const it = findPair(this.items, key);
-        if (!it)
-            return false;
-        const del = this.items.splice(this.items.indexOf(it), 1);
-        return del.length > 0;
-    }
-    get(key, keepScalar) {
-        const it = findPair(this.items, key);
-        const node = it?.value;
-        return (!keepScalar && identity.isScalar(node) ? node.value : node) ?? undefined;
-    }
-    has(key) {
-        return !!findPair(this.items, key);
-    }
-    set(key, value) {
-        this.add(new Pair.Pair(key, value), true);
-    }
-    /**
-     * @param ctx - Conversion context, originally set in Document#toJS()
-     * @param {Class} Type - If set, forces the returned collection type
-     * @returns Instance of Type, Map, or Object
-     */
-    toJSON(_, ctx, Type) {
-        const map = Type ? new Type() : ctx?.mapAsMap ? new Map() : {};
-        if (ctx?.onCreate)
-            ctx.onCreate(map);
-        for (const item of this.items)
-            addPairToJSMap.addPairToJSMap(ctx, map, item);
-        return map;
-    }
-    toString(ctx, onComment, onChompKeep) {
-        if (!ctx)
-            return JSON.stringify(this);
-        for (const item of this.items) {
-            if (!identity.isPair(item))
-                throw new Error(`Map items must all be pairs; found ${JSON.stringify(item)} instead`);
-        }
-        if (!ctx.allNullValues && this.hasAllNullValues(false))
-            ctx = Object.assign({}, ctx, { allNullValues: true });
-        return stringifyCollection.stringifyCollection(this, ctx, {
-            blockItemPrefix: '',
-            flowChars: { start: '{', end: '}' },
-            itemIndent: ctx.indent || '',
-            onChompKeep,
-            onComment
-        });
-    }
-}
-
-exports.YAMLMap = YAMLMap;
-exports.findPair = findPair;
-
-
-/***/ }),
-
-/***/ 5161:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var createNode = __nccwpck_require__(9652);
-var stringifyCollection = __nccwpck_require__(2466);
-var Collection = __nccwpck_require__(3466);
-var identity = __nccwpck_require__(5589);
-var Scalar = __nccwpck_require__(9338);
-var toJS = __nccwpck_require__(2463);
-
-class YAMLSeq extends Collection.Collection {
-    static get tagName() {
-        return 'tag:yaml.org,2002:seq';
-    }
-    constructor(schema) {
-        super(identity.SEQ, schema);
-        this.items = [];
-    }
-    add(value) {
-        this.items.push(value);
-    }
-    /**
-     * Removes a value from the collection.
-     *
-     * `key` must contain a representation of an integer for this to succeed.
-     * It may be wrapped in a `Scalar`.
-     *
-     * @returns `true` if the item was found and removed.
-     */
-    delete(key) {
-        const idx = asItemIndex(key);
-        if (typeof idx !== 'number')
-            return false;
-        const del = this.items.splice(idx, 1);
-        return del.length > 0;
-    }
-    get(key, keepScalar) {
-        const idx = asItemIndex(key);
-        if (typeof idx !== 'number')
-            return undefined;
-        const it = this.items[idx];
-        return !keepScalar && identity.isScalar(it) ? it.value : it;
-    }
-    /**
-     * Checks if the collection includes a value with the key `key`.
-     *
-     * `key` must contain a representation of an integer for this to succeed.
-     * It may be wrapped in a `Scalar`.
-     */
-    has(key) {
-        const idx = asItemIndex(key);
-        return typeof idx === 'number' && idx < this.items.length;
-    }
-    /**
-     * Sets a value in this collection. For `!!set`, `value` needs to be a
-     * boolean to add/remove the item from the set.
-     *
-     * If `key` does not contain a representation of an integer, this will throw.
-     * It may be wrapped in a `Scalar`.
-     */
-    set(key, value) {
-        const idx = asItemIndex(key);
-        if (typeof idx !== 'number')
-            throw new Error(`Expected a valid index, not ${key}.`);
-        const prev = this.items[idx];
-        if (identity.isScalar(prev) && Scalar.isScalarValue(value))
-            prev.value = value;
-        else
-            this.items[idx] = value;
-    }
-    toJSON(_, ctx) {
-        const seq = [];
-        if (ctx?.onCreate)
-            ctx.onCreate(seq);
-        let i = 0;
-        for (const item of this.items)
-            seq.push(toJS.toJS(item, String(i++), ctx));
-        return seq;
-    }
-    toString(ctx, onComment, onChompKeep) {
-        if (!ctx)
-            return JSON.stringify(this);
-        return stringifyCollection.stringifyCollection(this, ctx, {
-            blockItemPrefix: '- ',
-            flowChars: { start: '[', end: ']' },
-            itemIndent: (ctx.indent || '') + '  ',
-            onChompKeep,
-            onComment
-        });
-    }
-    static from(schema, obj, ctx) {
-        const { replacer } = ctx;
-        const seq = new this(schema);
-        if (obj && Symbol.iterator in Object(obj)) {
-            let i = 0;
-            for (let it of obj) {
-                if (typeof replacer === 'function') {
-                    const key = obj instanceof Set ? it : String(i++);
-                    it = replacer.call(obj, key, it);
-                }
-                seq.items.push(createNode.createNode(it, undefined, ctx));
-            }
-        }
-        return seq;
-    }
-}
-function asItemIndex(key) {
-    let idx = identity.isScalar(key) ? key.value : key;
-    if (idx && typeof idx === 'string')
-        idx = Number(idx);
-    return typeof idx === 'number' && Number.isInteger(idx) && idx >= 0
-        ? idx
-        : null;
-}
-
-exports.YAMLSeq = YAMLSeq;
-
-
-/***/ }),
-
-/***/ 4676:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var log = __nccwpck_require__(6909);
-var merge = __nccwpck_require__(9614);
-var stringify = __nccwpck_require__(8409);
-var identity = __nccwpck_require__(5589);
-var toJS = __nccwpck_require__(2463);
-
-function addPairToJSMap(ctx, map, { key, value }) {
-    if (identity.isNode(key) && key.addToJSMap)
-        key.addToJSMap(ctx, map, value);
-    // TODO: Should drop this special case for bare << handling
-    else if (merge.isMergeKey(ctx, key))
-        merge.addMergeToJSMap(ctx, map, value);
-    else {
-        const jsKey = toJS.toJS(key, '', ctx);
-        if (map instanceof Map) {
-            map.set(jsKey, toJS.toJS(value, jsKey, ctx));
-        }
-        else if (map instanceof Set) {
-            map.add(jsKey);
-        }
-        else {
-            const stringKey = stringifyKey(key, jsKey, ctx);
-            const jsValue = toJS.toJS(value, stringKey, ctx);
-            if (stringKey in map)
-                Object.defineProperty(map, stringKey, {
-                    value: jsValue,
-                    writable: true,
-                    enumerable: true,
-                    configurable: true
-                });
-            else
-                map[stringKey] = jsValue;
-        }
-    }
-    return map;
-}
-function stringifyKey(key, jsKey, ctx) {
-    if (jsKey === null)
-        return '';
-    // eslint-disable-next-line @typescript-eslint/no-base-to-string
-    if (typeof jsKey !== 'object')
-        return String(jsKey);
-    if (identity.isNode(key) && ctx?.doc) {
-        const strCtx = stringify.createStringifyContext(ctx.doc, {});
-        strCtx.anchors = new Set();
-        for (const node of ctx.anchors.keys())
-            strCtx.anchors.add(node.anchor);
-        strCtx.inFlow = true;
-        strCtx.inStringifyKey = true;
-        const strKey = key.toString(strCtx);
-        if (!ctx.mapKeyWarned) {
-            let jsonStr = JSON.stringify(strKey);
-            if (jsonStr.length > 40)
-                jsonStr = jsonStr.substring(0, 36) + '..."';
-            log.warn(ctx.doc.options.logLevel, `Keys with collection values will be stringified due to JS Object restrictions: ${jsonStr}. Set mapAsMap: true to use object keys.`);
-            ctx.mapKeyWarned = true;
-        }
-        return strKey;
-    }
-    return JSON.stringify(jsKey);
-}
-
-exports.addPairToJSMap = addPairToJSMap;
-
-
-/***/ }),
-
-/***/ 5589:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-
-const ALIAS = Symbol.for('yaml.alias');
-const DOC = Symbol.for('yaml.document');
-const MAP = Symbol.for('yaml.map');
-const PAIR = Symbol.for('yaml.pair');
-const SCALAR = Symbol.for('yaml.scalar');
-const SEQ = Symbol.for('yaml.seq');
-const NODE_TYPE = Symbol.for('yaml.node.type');
-const isAlias = (node) => !!node && typeof node === 'object' && node[NODE_TYPE] === ALIAS;
-const isDocument = (node) => !!node && typeof node === 'object' && node[NODE_TYPE] === DOC;
-const isMap = (node) => !!node && typeof node === 'object' && node[NODE_TYPE] === MAP;
-const isPair = (node) => !!node && typeof node === 'object' && node[NODE_TYPE] === PAIR;
-const isScalar = (node) => !!node && typeof node === 'object' && node[NODE_TYPE] === SCALAR;
-const isSeq = (node) => !!node && typeof node === 'object' && node[NODE_TYPE] === SEQ;
-function isCollection(node) {
-    if (node && typeof node === 'object')
-        switch (node[NODE_TYPE]) {
-            case MAP:
-            case SEQ:
-                return true;
-        }
-    return false;
-}
-function isNode(node) {
-    if (node && typeof node === 'object')
-        switch (node[NODE_TYPE]) {
-            case ALIAS:
-            case MAP:
-            case SCALAR:
-            case SEQ:
-                return true;
-        }
-    return false;
-}
-const hasAnchor = (node) => (isScalar(node) || isCollection(node)) && !!node.anchor;
-
-exports.ALIAS = ALIAS;
-exports.DOC = DOC;
-exports.MAP = MAP;
-exports.NODE_TYPE = NODE_TYPE;
-exports.PAIR = PAIR;
-exports.SCALAR = SCALAR;
-exports.SEQ = SEQ;
-exports.hasAnchor = hasAnchor;
-exports.isAlias = isAlias;
-exports.isCollection = isCollection;
-exports.isDocument = isDocument;
-exports.isMap = isMap;
-exports.isNode = isNode;
-exports.isPair = isPair;
-exports.isScalar = isScalar;
-exports.isSeq = isSeq;
-
-
-/***/ }),
-
-/***/ 2463:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var identity = __nccwpck_require__(5589);
-
-/**
- * Recursively convert any node or its contents to native JavaScript
- *
- * @param value - The input value
- * @param arg - If `value` defines a `toJSON()` method, use this
- *   as its first argument
- * @param ctx - Conversion context, originally set in Document#toJS(). If
- *   `{ keep: true }` is not set, output should be suitable for JSON
- *   stringification.
- */
-function toJS(value, arg, ctx) {
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-return
-    if (Array.isArray(value))
-        return value.map((v, i) => toJS(v, String(i), ctx));
-    if (value && typeof value.toJSON === 'function') {
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-call
-        if (!ctx || !identity.hasAnchor(value))
-            return value.toJSON(arg, ctx);
-        const data = { aliasCount: 0, count: 1, res: undefined };
-        ctx.anchors.set(value, data);
-        ctx.onCreate = res => {
-            data.res = res;
-            delete ctx.onCreate;
-        };
-        const res = value.toJSON(arg, ctx);
-        if (ctx.onCreate)
-            ctx.onCreate(res);
-        return res;
-    }
-    if (typeof value === 'bigint' && !ctx?.keep)
-        return Number(value);
-    return value;
-}
-
-exports.toJS = toJS;
-
-
-/***/ }),
-
-/***/ 9027:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var resolveBlockScalar = __nccwpck_require__(9485);
-var resolveFlowScalar = __nccwpck_require__(7578);
-var errors = __nccwpck_require__(4236);
-var stringifyString = __nccwpck_require__(6226);
-
-function resolveAsScalar(token, strict = true, onError) {
-    if (token) {
-        const _onError = (pos, code, message) => {
-            const offset = typeof pos === 'number' ? pos : Array.isArray(pos) ? pos[0] : pos.offset;
-            if (onError)
-                onError(offset, code, message);
-            else
-                throw new errors.YAMLParseError([offset, offset + 1], code, message);
-        };
-        switch (token.type) {
-            case 'scalar':
-            case 'single-quoted-scalar':
-            case 'double-quoted-scalar':
-                return resolveFlowScalar.resolveFlowScalar(token, strict, _onError);
-            case 'block-scalar':
-                return resolveBlockScalar.resolveBlockScalar({ options: { strict } }, token, _onError);
-        }
-    }
-    return null;
-}
-/**
- * Create a new scalar token with `value`
- *
- * Values that represent an actual string but may be parsed as a different type should use a `type` other than `'PLAIN'`,
- * as this function does not support any schema operations and won't check for such conflicts.
- *
- * @param value The string representation of the value, which will have its content properly indented.
- * @param context.end Comments and whitespace after the end of the value, or after the block scalar header. If undefined, a newline will be added.
- * @param context.implicitKey Being within an implicit key may affect the resolved type of the token's value.
- * @param context.indent The indent level of the token.
- * @param context.inFlow Is this scalar within a flow collection? This may affect the resolved type of the token's value.
- * @param context.offset The offset position of the token.
- * @param context.type The preferred type of the scalar token. If undefined, the previous type of the `token` will be used, defaulting to `'PLAIN'`.
- */
-function createScalarToken(value, context) {
-    const { implicitKey = false, indent, inFlow = false, offset = -1, type = 'PLAIN' } = context;
-    const source = stringifyString.stringifyString({ type, value }, {
-        implicitKey,
-        indent: indent > 0 ? ' '.repeat(indent) : '',
-        inFlow,
-        options: { blockQuote: true, lineWidth: -1 }
-    });
-    const end = context.end ?? [
-        { type: 'newline', offset: -1, indent, source: '\n' }
-    ];
-    switch (source[0]) {
-        case '|':
-        case '>': {
-            const he = source.indexOf('\n');
-            const head = source.substring(0, he);
-            const body = source.substring(he + 1) + '\n';
-            const props = [
-                { type: 'block-scalar-header', offset, indent, source: head }
-            ];
-            if (!addEndtoBlockProps(props, end))
-                props.push({ type: 'newline', offset: -1, indent, source: '\n' });
-            return { type: 'block-scalar', offset, indent, props, source: body };
-        }
-        case '"':
-            return { type: 'double-quoted-scalar', offset, indent, source, end };
-        case "'":
-            return { type: 'single-quoted-scalar', offset, indent, source, end };
-        default:
-            return { type: 'scalar', offset, indent, source, end };
-    }
-}
-/**
- * Set the value of `token` to the given string `value`, overwriting any previous contents and type that it may have.
- *
- * Best efforts are made to retain any comments previously associated with the `token`,
- * though all contents within a collection's `items` will be overwritten.
- *
- * Values that represent an actual string but may be parsed as a different type should use a `type` other than `'PLAIN'`,
- * as this function does not support any schema operations and won't check for such conflicts.
- *
- * @param token Any token. If it does not include an `indent` value, the value will be stringified as if it were an implicit key.
- * @param value The string representation of the value, which will have its content properly indented.
- * @param context.afterKey In most cases, values after a key should have an additional level of indentation.
- * @param context.implicitKey Being within an implicit key may affect the resolved type of the token's value.
- * @param context.inFlow Being within a flow collection may affect the resolved type of the token's value.
- * @param context.type The preferred type of the scalar token. If undefined, the previous type of the `token` will be used, defaulting to `'PLAIN'`.
- */
-function setScalarValue(token, value, context = {}) {
-    let { afterKey = false, implicitKey = false, inFlow = false, type } = context;
-    let indent = 'indent' in token ? token.indent : null;
-    if (afterKey && typeof indent === 'number')
-        indent += 2;
-    if (!type)
-        switch (token.type) {
-            case 'single-quoted-scalar':
-                type = 'QUOTE_SINGLE';
-                break;
-            case 'double-quoted-scalar':
-                type = 'QUOTE_DOUBLE';
-                break;
-            case 'block-scalar': {
-                const header = token.props[0];
-                if (header.type !== 'block-scalar-header')
-                    throw new Error('Invalid block scalar header');
-                type = header.source[0] === '>' ? 'BLOCK_FOLDED' : 'BLOCK_LITERAL';
-                break;
-            }
-            default:
-                type = 'PLAIN';
-        }
-    const source = stringifyString.stringifyString({ type, value }, {
-        implicitKey: implicitKey || indent === null,
-        indent: indent !== null && indent > 0 ? ' '.repeat(indent) : '',
-        inFlow,
-        options: { blockQuote: true, lineWidth: -1 }
-    });
-    switch (source[0]) {
-        case '|':
-        case '>':
-            setBlockScalarValue(token, source);
-            break;
-        case '"':
-            setFlowScalarValue(token, source, 'double-quoted-scalar');
-            break;
-        case "'":
-            setFlowScalarValue(token, source, 'single-quoted-scalar');
-            break;
-        default:
-            setFlowScalarValue(token, source, 'scalar');
-    }
-}
-function setBlockScalarValue(token, source) {
-    const he = source.indexOf('\n');
-    const head = source.substring(0, he);
-    const body = source.substring(he + 1) + '\n';
-    if (token.type === 'block-scalar') {
-        const header = token.props[0];
-        if (header.type !== 'block-scalar-header')
-            throw new Error('Invalid block scalar header');
-        header.source = head;
-        token.source = body;
-    }
-    else {
-        const { offset } = token;
-        const indent = 'indent' in token ? token.indent : -1;
-        const props = [
-            { type: 'block-scalar-header', offset, indent, source: head }
-        ];
-        if (!addEndtoBlockProps(props, 'end' in token ? token.end : undefined))
-            props.push({ type: 'newline', offset: -1, indent, source: '\n' });
-        for (const key of Object.keys(token))
-            if (key !== 'type' && key !== 'offset')
-                delete token[key];
-        Object.assign(token, { type: 'block-scalar', indent, props, source: body });
-    }
-}
-/** @returns `true` if last token is a newline */
-function addEndtoBlockProps(props, end) {
-    if (end)
-        for (const st of end)
-            switch (st.type) {
-                case 'space':
-                case 'comment':
-                    props.push(st);
-                    break;
-                case 'newline':
-                    props.push(st);
-                    return true;
-            }
-    return false;
-}
-function setFlowScalarValue(token, source, type) {
-    switch (token.type) {
-        case 'scalar':
-        case 'double-quoted-scalar':
-        case 'single-quoted-scalar':
-            token.type = type;
-            token.source = source;
-            break;
-        case 'block-scalar': {
-            const end = token.props.slice(1);
-            let oa = source.length;
-            if (token.props[0].type === 'block-scalar-header')
-                oa -= token.props[0].source.length;
-            for (const tok of end)
-                tok.offset += oa;
-            delete token.props;
-            Object.assign(token, { type, source, end });
-            break;
-        }
-        case 'block-map':
-        case 'block-seq': {
-            const offset = token.offset + source.length;
-            const nl = { type: 'newline', offset, indent: token.indent, source: '\n' };
-            delete token.items;
-            Object.assign(token, { type, source, end: [nl] });
-            break;
-        }
-        default: {
-            const indent = 'indent' in token ? token.indent : -1;
-            const end = 'end' in token && Array.isArray(token.end)
-                ? token.end.filter(st => st.type === 'space' ||
-                    st.type === 'comment' ||
-                    st.type === 'newline')
-                : [];
-            for (const key of Object.keys(token))
-                if (key !== 'type' && key !== 'offset')
-                    delete token[key];
-            Object.assign(token, { type, indent, source, end });
-        }
-    }
-}
-
-exports.createScalarToken = createScalarToken;
-exports.resolveAsScalar = resolveAsScalar;
-exports.setScalarValue = setScalarValue;
-
-
-/***/ }),
-
-/***/ 6307:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-
-/**
- * Stringify a CST document, token, or collection item
- *
- * Fair warning: This applies no validation whatsoever, and
- * simply concatenates the sources in their logical order.
- */
-const stringify = (cst) => 'type' in cst ? stringifyToken(cst) : stringifyItem(cst);
-function stringifyToken(token) {
-    switch (token.type) {
-        case 'block-scalar': {
-            let res = '';
-            for (const tok of token.props)
-                res += stringifyToken(tok);
-            return res + token.source;
-        }
-        case 'block-map':
-        case 'block-seq': {
-            let res = '';
-            for (const item of token.items)
-                res += stringifyItem(item);
-            return res;
-        }
-        case 'flow-collection': {
-            let res = token.start.source;
-            for (const item of token.items)
-                res += stringifyItem(item);
-            for (const st of token.end)
-                res += st.source;
-            return res;
-        }
-        case 'document': {
-            let res = stringifyItem(token);
-            if (token.end)
-                for (const st of token.end)
-                    res += st.source;
-            return res;
-        }
-        default: {
-            let res = token.source;
-            if ('end' in token && token.end)
-                for (const st of token.end)
-                    res += st.source;
-            return res;
-        }
-    }
-}
-function stringifyItem({ start, key, sep, value }) {
-    let res = '';
-    for (const st of start)
-        res += st.source;
-    if (key)
-        res += stringifyToken(key);
-    if (sep)
-        for (const st of sep)
-            res += st.source;
-    if (value)
-        res += stringifyToken(value);
-    return res;
-}
-
-exports.stringify = stringify;
-
-
-/***/ }),
-
-/***/ 8497:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-
-const BREAK = Symbol('break visit');
-const SKIP = Symbol('skip children');
-const REMOVE = Symbol('remove item');
-/**
- * Apply a visitor to a CST document or item.
- *
- * Walks through the tree (depth-first) starting from the root, calling a
- * `visitor` function with two arguments when entering each item:
- *   - `item`: The current item, which included the following members:
- *     - `start: SourceToken[]` – Source tokens before the key or value,
- *       possibly including its anchor or tag.
- *     - `key?: Token | null` – Set for pair values. May then be `null`, if
- *       the key before the `:` separator is empty.
- *     - `sep?: SourceToken[]` – Source tokens between the key and the value,
- *       which should include the `:` map value indicator if `value` is set.
- *     - `value?: Token` – The value of a sequence item, or of a map pair.
- *   - `path`: The steps from the root to the current node, as an array of
- *     `['key' | 'value', number]` tuples.
- *
- * The return value of the visitor may be used to control the traversal:
- *   - `undefined` (default): Do nothing and continue
- *   - `visit.SKIP`: Do not visit the children of this token, continue with
- *      next sibling
- *   - `visit.BREAK`: Terminate traversal completely
- *   - `visit.REMOVE`: Remove the current item, then continue with the next one
- *   - `number`: Set the index of the next step. This is useful especially if
- *     the index of the current token has changed.
- *   - `function`: Define the next visitor for this item. After the original
- *     visitor is called on item entry, next visitors are called after handling
- *     a non-empty `key` and when exiting the item.
- */
-function visit(cst, visitor) {
-    if ('type' in cst && cst.type === 'document')
-        cst = { start: cst.start, value: cst.value };
-    _visit(Object.freeze([]), cst, visitor);
-}
-// Without the `as symbol` casts, TS declares these in the `visit`
-// namespace using `var`, but then complains about that because
-// `unique symbol` must be `const`.
-/** Terminate visit traversal completely */
-visit.BREAK = BREAK;
-/** Do not visit the children of the current item */
-visit.SKIP = SKIP;
-/** Remove the current item */
-visit.REMOVE = REMOVE;
-/** Find the item at `path` from `cst` as the root */
-visit.itemAtPath = (cst, path) => {
-    let item = cst;
-    for (const [field, index] of path) {
-        const tok = item?.[field];
-        if (tok && 'items' in tok) {
-            item = tok.items[index];
-        }
-        else
-            return undefined;
-    }
-    return item;
-};
-/**
- * Get the immediate parent collection of the item at `path` from `cst` as the root.
- *
- * Throws an error if the collection is not found, which should never happen if the item itself exists.
- */
-visit.parentCollection = (cst, path) => {
-    const parent = visit.itemAtPath(cst, path.slice(0, -1));
-    const field = path[path.length - 1][0];
-    const coll = parent?.[field];
-    if (coll && 'items' in coll)
-        return coll;
-    throw new Error('Parent collection not found');
-};
-function _visit(path, item, visitor) {
-    let ctrl = visitor(item, path);
-    if (typeof ctrl === 'symbol')
-        return ctrl;
-    for (const field of ['key', 'value']) {
-        const token = item[field];
-        if (token && 'items' in token) {
-            for (let i = 0; i < token.items.length; ++i) {
-                const ci = _visit(Object.freeze(path.concat([[field, i]])), token.items[i], visitor);
-                if (typeof ci === 'number')
-                    i = ci - 1;
-                else if (ci === BREAK)
-                    return BREAK;
-                else if (ci === REMOVE) {
-                    token.items.splice(i, 1);
-                    i -= 1;
-                }
-            }
-            if (typeof ctrl === 'function' && field === 'key')
-                ctrl = ctrl(item, path);
-        }
-    }
-    return typeof ctrl === 'function' ? ctrl(item, path) : ctrl;
-}
-
-exports.visit = visit;
-
-
-/***/ }),
-
-/***/ 9169:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var cstScalar = __nccwpck_require__(9027);
-var cstStringify = __nccwpck_require__(6307);
-var cstVisit = __nccwpck_require__(8497);
-
-/** The byte order mark */
-const BOM = '\u{FEFF}';
-/** Start of doc-mode */
-const DOCUMENT = '\x02'; // C0: Start of Text
-/** Unexpected end of flow-mode */
-const FLOW_END = '\x18'; // C0: Cancel
-/** Next token is a scalar value */
-const SCALAR = '\x1f'; // C0: Unit Separator
-/** @returns `true` if `token` is a flow or block collection */
-const isCollection = (token) => !!token && 'items' in token;
-/** @returns `true` if `token` is a flow or block scalar; not an alias */
-const isScalar = (token) => !!token &&
-    (token.type === 'scalar' ||
-        token.type === 'single-quoted-scalar' ||
-        token.type === 'double-quoted-scalar' ||
-        token.type === 'block-scalar');
-/* istanbul ignore next */
-/** Get a printable representation of a lexer token */
-function prettyToken(token) {
-    switch (token) {
-        case BOM:
-            return '<BOM>';
-        case DOCUMENT:
-            return '<DOC>';
-        case FLOW_END:
-            return '<FLOW_END>';
-        case SCALAR:
-            return '<SCALAR>';
-        default:
-            return JSON.stringify(token);
-    }
-}
-/** Identify the type of a lexer token. May return `null` for unknown tokens. */
-function tokenType(source) {
-    switch (source) {
-        case BOM:
-            return 'byte-order-mark';
-        case DOCUMENT:
-            return 'doc-mode';
-        case FLOW_END:
-            return 'flow-error-end';
-        case SCALAR:
-            return 'scalar';
-        case '---':
-            return 'doc-start';
-        case '...':
-            return 'doc-end';
-        case '':
-        case '\n':
-        case '\r\n':
-            return 'newline';
-        case '-':
-            return 'seq-item-ind';
-        case '?':
-            return 'explicit-key-ind';
-        case ':':
-            return 'map-value-ind';
-        case '{':
-            return 'flow-map-start';
-        case '}':
-            return 'flow-map-end';
-        case '[':
-            return 'flow-seq-start';
-        case ']':
-            return 'flow-seq-end';
-        case ',':
-            return 'comma';
-    }
-    switch (source[0]) {
-        case ' ':
-        case '\t':
-            return 'space';
-        case '#':
-            return 'comment';
-        case '%':
-            return 'directive-line';
-        case '*':
-            return 'alias';
-        case '&':
-            return 'anchor';
-        case '!':
-            return 'tag';
-        case "'":
-            return 'single-quoted-scalar';
-        case '"':
-            return 'double-quoted-scalar';
-        case '|':
-        case '>':
-            return 'block-scalar-header';
-    }
-    return null;
-}
-
-exports.createScalarToken = cstScalar.createScalarToken;
-exports.resolveAsScalar = cstScalar.resolveAsScalar;
-exports.setScalarValue = cstScalar.setScalarValue;
-exports.stringify = cstStringify.stringify;
-exports.visit = cstVisit.visit;
-exports.BOM = BOM;
-exports.DOCUMENT = DOCUMENT;
-exports.FLOW_END = FLOW_END;
-exports.SCALAR = SCALAR;
-exports.isCollection = isCollection;
-exports.isScalar = isScalar;
-exports.prettyToken = prettyToken;
-exports.tokenType = tokenType;
-
-
-/***/ }),
-
-/***/ 5976:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var cst = __nccwpck_require__(9169);
-
-/*
-START -> stream
-
-stream
-  directive -> line-end -> stream
-  indent + line-end -> stream
-  [else] -> line-start
-
-line-end
-  comment -> line-end
-  newline -> .
-  input-end -> END
-
-line-start
-  doc-start -> doc
-  doc-end -> stream
-  [else] -> indent -> block-start
-
-block-start
-  seq-item-start -> block-start
-  explicit-key-start -> block-start
-  map-value-start -> block-start
-  [else] -> doc
-
-doc
-  line-end -> line-start
-  spaces -> doc
-  anchor -> doc
-  tag -> doc
-  flow-start -> flow -> doc
-  flow-end -> error -> doc
-  seq-item-start -> error -> doc
-  explicit-key-start -> error -> doc
-  map-value-start -> doc
-  alias -> doc
-  quote-start -> quoted-scalar -> doc
-  block-scalar-header -> line-end -> block-scalar(min) -> line-start
-  [else] -> plain-scalar(false, min) -> doc
-
-flow
-  line-end -> flow
-  spaces -> flow
-  anchor -> flow
-  tag -> flow
-  flow-start -> flow -> flow
-  flow-end -> .
-  seq-item-start -> error -> flow
-  explicit-key-start -> flow
-  map-value-start -> flow
-  alias -> flow
-  quote-start -> quoted-scalar -> flow
-  comma -> flow
-  [else] -> plain-scalar(true, 0) -> flow
-
-quoted-scalar
-  quote-end -> .
-  [else] -> quoted-scalar
-
-block-scalar(min)
-  newline + peek(indent < min) -> .
-  [else] -> block-scalar(min)
-
-plain-scalar(is-flow, min)
-  scalar-end(is-flow) -> .
-  peek(newline + (indent < min)) -> .
-  [else] -> plain-scalar(min)
-*/
-function isEmpty(ch) {
-    switch (ch) {
-        case undefined:
-        case ' ':
-        case '\n':
-        case '\r':
-        case '\t':
-            return true;
-        default:
-            return false;
-    }
-}
-const hexDigits = new Set('0123456789ABCDEFabcdef');
-const tagChars = new Set("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-#;/?:@&=+$_.!~*'()");
-const flowIndicatorChars = new Set(',[]{}');
-const invalidAnchorChars = new Set(' ,[]{}\n\r\t');
-const isNotAnchorChar = (ch) => !ch || invalidAnchorChars.has(ch);
-/**
- * Splits an input string into lexical tokens, i.e. smaller strings that are
- * easily identifiable by `tokens.tokenType()`.
- *
- * Lexing starts always in a "stream" context. Incomplete input may be buffered
- * until a complete token can be emitted.
- *
- * In addition to slices of the original input, the following control characters
- * may also be emitted:
- *
- * - `\x02` (Start of Text): A document starts with the next token
- * - `\x18` (Cancel): Unexpected end of flow-mode (indicates an error)
- * - `\x1f` (Unit Separator): Next token is a scalar value
- * - `\u{FEFF}` (Byte order mark): Emitted separately outside documents
- */
-class Lexer {
-    constructor() {
-        /**
-         * Flag indicating whether the end of the current buffer marks the end of
-         * all input
-         */
-        this.atEnd = false;
-        /**
-         * Explicit indent set in block scalar header, as an offset from the current
-         * minimum indent, so e.g. set to 1 from a header `|2+`. Set to -1 if not
-         * explicitly set.
-         */
-        this.blockScalarIndent = -1;
-        /**
-         * Block scalars that include a + (keep) chomping indicator in their header
-         * include trailing empty lines, which are otherwise excluded from the
-         * scalar's contents.
-         */
-        this.blockScalarKeep = false;
-        /** Current input */
-        this.buffer = '';
-        /**
-         * Flag noting whether the map value indicator : can immediately follow this
-         * node within a flow context.
-         */
-        this.flowKey = false;
-        /** Count of surrounding flow collection levels. */
-        this.flowLevel = 0;
-        /**
-         * Minimum level of indentation required for next lines to be parsed as a
-         * part of the current scalar value.
-         */
-        this.indentNext = 0;
-        /** Indentation level of the current line. */
-        this.indentValue = 0;
-        /** Position of the next \n character. */
-        this.lineEndPos = null;
-        /** Stores the state of the lexer if reaching the end of incpomplete input */
-        this.next = null;
-        /** A pointer to `buffer`; the current position of the lexer. */
-        this.pos = 0;
-    }
-    /**
-     * Generate YAML tokens from the `source` string. If `incomplete`,
-     * a part of the last line may be left as a buffer for the next call.
-     *
-     * @returns A generator of lexical tokens
-     */
-    *lex(source, incomplete = false) {
-        if (source) {
-            if (typeof source !== 'string')
-                throw TypeError('source is not a string');
-            this.buffer = this.buffer ? this.buffer + source : source;
-            this.lineEndPos = null;
-        }
-        this.atEnd = !incomplete;
-        let next = this.next ?? 'stream';
-        while (next && (incomplete || this.hasChars(1)))
-            next = yield* this.parseNext(next);
-    }
-    atLineEnd() {
-        let i = this.pos;
-        let ch = this.buffer[i];
-        while (ch === ' ' || ch === '\t')
-            ch = this.buffer[++i];
-        if (!ch || ch === '#' || ch === '\n')
-            return true;
-        if (ch === '\r')
-            return this.buffer[i + 1] === '\n';
-        return false;
-    }
-    charAt(n) {
-        return this.buffer[this.pos + n];
-    }
-    continueScalar(offset) {
-        let ch = this.buffer[offset];
-        if (this.indentNext > 0) {
-            let indent = 0;
-            while (ch === ' ')
-                ch = this.buffer[++indent + offset];
-            if (ch === '\r') {
-                const next = this.buffer[indent + offset + 1];
-                if (next === '\n' || (!next && !this.atEnd))
-                    return offset + indent + 1;
-            }
-            return ch === '\n' || indent >= this.indentNext || (!ch && !this.atEnd)
-                ? offset + indent
-                : -1;
-        }
-        if (ch === '-' || ch === '.') {
-            const dt = this.buffer.substr(offset, 3);
-            if ((dt === '---' || dt === '...') && isEmpty(this.buffer[offset + 3]))
-                return -1;
-        }
-        return offset;
-    }
-    getLine() {
-        let end = this.lineEndPos;
-        if (typeof end !== 'number' || (end !== -1 && end < this.pos)) {
-            end = this.buffer.indexOf('\n', this.pos);
-            this.lineEndPos = end;
-        }
-        if (end === -1)
-            return this.atEnd ? this.buffer.substring(this.pos) : null;
-        if (this.buffer[end - 1] === '\r')
-            end -= 1;
-        return this.buffer.substring(this.pos, end);
-    }
-    hasChars(n) {
-        return this.pos + n <= this.buffer.length;
-    }
-    setNext(state) {
-        this.buffer = this.buffer.substring(this.pos);
-        this.pos = 0;
-        this.lineEndPos = null;
-        this.next = state;
-        return null;
-    }
-    peek(n) {
-        return this.buffer.substr(this.pos, n);
-    }
-    *parseNext(next) {
-        switch (next) {
-            case 'stream':
-                return yield* this.parseStream();
-            case 'line-start':
-                return yield* this.parseLineStart();
-            case 'block-start':
-                return yield* this.parseBlockStart();
-            case 'doc':
-                return yield* this.parseDocument();
-            case 'flow':
-                return yield* this.parseFlowCollection();
-            case 'quoted-scalar':
-                return yield* this.parseQuotedScalar();
-            case 'block-scalar':
-                return yield* this.parseBlockScalar();
-            case 'plain-scalar':
-                return yield* this.parsePlainScalar();
-        }
-    }
-    *parseStream() {
-        let line = this.getLine();
-        if (line === null)
-            return this.setNext('stream');
-        if (line[0] === cst.BOM) {
-            yield* this.pushCount(1);
-            line = line.substring(1);
-        }
-        if (line[0] === '%') {
-            let dirEnd = line.length;
-            let cs = line.indexOf('#');
-            while (cs !== -1) {
-                const ch = line[cs - 1];
-                if (ch === ' ' || ch === '\t') {
-                    dirEnd = cs - 1;
-                    break;
-                }
-                else {
-                    cs = line.indexOf('#', cs + 1);
-                }
-            }
-            while (true) {
-                const ch = line[dirEnd - 1];
-                if (ch === ' ' || ch === '\t')
-                    dirEnd -= 1;
-                else
-                    break;
-            }
-            const n = (yield* this.pushCount(dirEnd)) + (yield* this.pushSpaces(true));
-            yield* this.pushCount(line.length - n); // possible comment
-            this.pushNewline();
-            return 'stream';
-        }
-        if (this.atLineEnd()) {
-            const sp = yield* this.pushSpaces(true);
-            yield* this.pushCount(line.length - sp);
-            yield* this.pushNewline();
-            return 'stream';
-        }
-        yield cst.DOCUMENT;
-        return yield* this.parseLineStart();
-    }
-    *parseLineStart() {
-        const ch = this.charAt(0);
-        if (!ch && !this.atEnd)
-            return this.setNext('line-start');
-        if (ch === '-' || ch === '.') {
-            if (!this.atEnd && !this.hasChars(4))
-                return this.setNext('line-start');
-            const s = this.peek(3);
-            if ((s === '---' || s === '...') && isEmpty(this.charAt(3))) {
-                yield* this.pushCount(3);
-                this.indentValue = 0;
-                this.indentNext = 0;
-                return s === '---' ? 'doc' : 'stream';
-            }
-        }
-        this.indentValue = yield* this.pushSpaces(false);
-        if (this.indentNext > this.indentValue && !isEmpty(this.charAt(1)))
-            this.indentNext = this.indentValue;
-        return yield* this.parseBlockStart();
-    }
-    *parseBlockStart() {
-        const [ch0, ch1] = this.peek(2);
-        if (!ch1 && !this.atEnd)
-            return this.setNext('block-start');
-        if ((ch0 === '-' || ch0 === '?' || ch0 === ':') && isEmpty(ch1)) {
-            const n = (yield* this.pushCount(1)) + (yield* this.pushSpaces(true));
-            this.indentNext = this.indentValue + 1;
-            this.indentValue += n;
-            return 'block-start';
-        }
-        return 'doc';
-    }
-    *parseDocument() {
-        yield* this.pushSpaces(true);
-        const line = this.getLine();
-        if (line === null)
-            return this.setNext('doc');
-        let n = yield* this.pushIndicators();
-        switch (line[n]) {
-            case '#':
-                yield* this.pushCount(line.length - n);
-            // fallthrough
-            case undefined:
-                yield* this.pushNewline();
-                return yield* this.parseLineStart();
-            case '{':
-            case '[':
-                yield* this.pushCount(1);
-                this.flowKey = false;
-                this.flowLevel = 1;
-                return 'flow';
-            case '}':
-            case ']':
-                // this is an error
-                yield* this.pushCount(1);
-                return 'doc';
-            case '*':
-                yield* this.pushUntil(isNotAnchorChar);
-                return 'doc';
-            case '"':
-            case "'":
-                return yield* this.parseQuotedScalar();
-            case '|':
-            case '>':
-                n += yield* this.parseBlockScalarHeader();
-                n += yield* this.pushSpaces(true);
-                yield* this.pushCount(line.length - n);
-                yield* this.pushNewline();
-                return yield* this.parseBlockScalar();
-            default:
-                return yield* this.parsePlainScalar();
-        }
-    }
-    *parseFlowCollection() {
-        let nl, sp;
-        let indent = -1;
-        do {
-            nl = yield* this.pushNewline();
-            if (nl > 0) {
-                sp = yield* this.pushSpaces(false);
-                this.indentValue = indent = sp;
-            }
-            else {
-                sp = 0;
-            }
-            sp += yield* this.pushSpaces(true);
-        } while (nl + sp > 0);
-        const line = this.getLine();
-        if (line === null)
-            return this.setNext('flow');
-        if ((indent !== -1 && indent < this.indentNext && line[0] !== '#') ||
-            (indent === 0 &&
-                (line.startsWith('---') || line.startsWith('...')) &&
-                isEmpty(line[3]))) {
-            // Allowing for the terminal ] or } at the same (rather than greater)
-            // indent level as the initial [ or { is technically invalid, but
-            // failing here would be surprising to users.
-            const atFlowEndMarker = indent === this.indentNext - 1 &&
-                this.flowLevel === 1 &&
-                (line[0] === ']' || line[0] === '}');
-            if (!atFlowEndMarker) {
-                // this is an error
-                this.flowLevel = 0;
-                yield cst.FLOW_END;
-                return yield* this.parseLineStart();
-            }
-        }
-        let n = 0;
-        while (line[n] === ',') {
-            n += yield* this.pushCount(1);
-            n += yield* this.pushSpaces(true);
-            this.flowKey = false;
-        }
-        n += yield* this.pushIndicators();
-        switch (line[n]) {
-            case undefined:
-                return 'flow';
-            case '#':
-                yield* this.pushCount(line.length - n);
-                return 'flow';
-            case '{':
-            case '[':
-                yield* this.pushCount(1);
-                this.flowKey = false;
-                this.flowLevel += 1;
-                return 'flow';
-            case '}':
-            case ']':
-                yield* this.pushCount(1);
-                this.flowKey = true;
-                this.flowLevel -= 1;
-                return this.flowLevel ? 'flow' : 'doc';
-            case '*':
-                yield* this.pushUntil(isNotAnchorChar);
-                return 'flow';
-            case '"':
-            case "'":
-                this.flowKey = true;
-                return yield* this.parseQuotedScalar();
-            case ':': {
-                const next = this.charAt(1);
-                if (this.flowKey || isEmpty(next) || next === ',') {
-                    this.flowKey = false;
-                    yield* this.pushCount(1);
-                    yield* this.pushSpaces(true);
-                    return 'flow';
-                }
-            }
-            // fallthrough
-            default:
-                this.flowKey = false;
-                return yield* this.parsePlainScalar();
-        }
-    }
-    *parseQuotedScalar() {
-        const quote = this.charAt(0);
-        let end = this.buffer.indexOf(quote, this.pos + 1);
-        if (quote === "'") {
-            while (end !== -1 && this.buffer[end + 1] === "'")
-                end = this.buffer.indexOf("'", end + 2);
-        }
-        else {
-            // double-quote
-            while (end !== -1) {
-                let n = 0;
-                while (this.buffer[end - 1 - n] === '\\')
-                    n += 1;
-                if (n % 2 === 0)
-                    break;
-                end = this.buffer.indexOf('"', end + 1);
-            }
-        }
-        // Only looking for newlines within the quotes
-        const qb = this.buffer.substring(0, end);
-        let nl = qb.indexOf('\n', this.pos);
-        if (nl !== -1) {
-            while (nl !== -1) {
-                const cs = this.continueScalar(nl + 1);
-                if (cs === -1)
-                    break;
-                nl = qb.indexOf('\n', cs);
-            }
-            if (nl !== -1) {
-                // this is an error caused by an unexpected unindent
-                end = nl - (qb[nl - 1] === '\r' ? 2 : 1);
-            }
-        }
-        if (end === -1) {
-            if (!this.atEnd)
-                return this.setNext('quoted-scalar');
-            end = this.buffer.length;
-        }
-        yield* this.pushToIndex(end + 1, false);
-        return this.flowLevel ? 'flow' : 'doc';
-    }
-    *parseBlockScalarHeader() {
-        this.blockScalarIndent = -1;
-        this.blockScalarKeep = false;
-        let i = this.pos;
-        while (true) {
-            const ch = this.buffer[++i];
-            if (ch === '+')
-                this.blockScalarKeep = true;
-            else if (ch > '0' && ch <= '9')
-                this.blockScalarIndent = Number(ch) - 1;
-            else if (ch !== '-')
-                break;
-        }
-        return yield* this.pushUntil(ch => isEmpty(ch) || ch === '#');
-    }
-    *parseBlockScalar() {
-        let nl = this.pos - 1; // may be -1 if this.pos === 0
-        let indent = 0;
-        let ch;
-        loop: for (let i = this.pos; (ch = this.buffer[i]); ++i) {
-            switch (ch) {
-                case ' ':
-                    indent += 1;
-                    break;
-                case '\n':
-                    nl = i;
-                    indent = 0;
-                    break;
-                case '\r': {
-                    const next = this.buffer[i + 1];
-                    if (!next && !this.atEnd)
-                        return this.setNext('block-scalar');
-                    if (next === '\n')
-                        break;
-                } // fallthrough
-                default:
-                    break loop;
-            }
-        }
-        if (!ch && !this.atEnd)
-            return this.setNext('block-scalar');
-        if (indent >= this.indentNext) {
-            if (this.blockScalarIndent === -1)
-                this.indentNext = indent;
-            else {
-                this.indentNext =
-                    this.blockScalarIndent + (this.indentNext === 0 ? 1 : this.indentNext);
-            }
-            do {
-                const cs = this.continueScalar(nl + 1);
-                if (cs === -1)
-                    break;
-                nl = this.buffer.indexOf('\n', cs);
-            } while (nl !== -1);
-            if (nl === -1) {
-                if (!this.atEnd)
-                    return this.setNext('block-scalar');
-                nl = this.buffer.length;
-            }
-        }
-        // Trailing insufficiently indented tabs are invalid.
-        // To catch that during parsing, we include them in the block scalar value.
-        let i = nl + 1;
-        ch = this.buffer[i];
-        while (ch === ' ')
-            ch = this.buffer[++i];
-        if (ch === '\t') {
-            while (ch === '\t' || ch === ' ' || ch === '\r' || ch === '\n')
-                ch = this.buffer[++i];
-            nl = i - 1;
-        }
-        else if (!this.blockScalarKeep) {
-            do {
-                let i = nl - 1;
-                let ch = this.buffer[i];
-                if (ch === '\r')
-                    ch = this.buffer[--i];
-                const lastChar = i; // Drop the line if last char not more indented
-                while (ch === ' ')
-                    ch = this.buffer[--i];
-                if (ch === '\n' && i >= this.pos && i + 1 + indent > lastChar)
-                    nl = i;
-                else
-                    break;
-            } while (true);
-        }
-        yield cst.SCALAR;
-        yield* this.pushToIndex(nl + 1, true);
-        return yield* this.parseLineStart();
-    }
-    *parsePlainScalar() {
-        const inFlow = this.flowLevel > 0;
-        let end = this.pos - 1;
-        let i = this.pos - 1;
-        let ch;
-        while ((ch = this.buffer[++i])) {
-            if (ch === ':') {
-                const next = this.buffer[i + 1];
-                if (isEmpty(next) || (inFlow && flowIndicatorChars.has(next)))
-                    break;
-                end = i;
-            }
-            else if (isEmpty(ch)) {
-                let next = this.buffer[i + 1];
-                if (ch === '\r') {
-                    if (next === '\n') {
-                        i += 1;
-                        ch = '\n';
-                        next = this.buffer[i + 1];
-                    }
-                    else
-                        end = i;
-                }
-                if (next === '#' || (inFlow && flowIndicatorChars.has(next)))
-                    break;
-                if (ch === '\n') {
-                    const cs = this.continueScalar(i + 1);
-                    if (cs === -1)
-                        break;
-                    i = Math.max(i, cs - 2); // to advance, but still account for ' #'
-                }
-            }
-            else {
-                if (inFlow && flowIndicatorChars.has(ch))
-                    break;
-                end = i;
-            }
-        }
-        if (!ch && !this.atEnd)
-            return this.setNext('plain-scalar');
-        yield cst.SCALAR;
-        yield* this.pushToIndex(end + 1, true);
-        return inFlow ? 'flow' : 'doc';
-    }
-    *pushCount(n) {
-        if (n > 0) {
-            yield this.buffer.substr(this.pos, n);
-            this.pos += n;
-            return n;
-        }
-        return 0;
-    }
-    *pushToIndex(i, allowEmpty) {
-        const s = this.buffer.slice(this.pos, i);
-        if (s) {
-            yield s;
-            this.pos += s.length;
-            return s.length;
-        }
-        else if (allowEmpty)
-            yield '';
-        return 0;
-    }
-    *pushIndicators() {
-        let n = 0;
-        loop: while (true) {
-            switch (this.charAt(0)) {
-                case '!':
-                    n += yield* this.pushTag();
-                    n += yield* this.pushSpaces(true);
-                    continue loop;
-                case '&':
-                    n += yield* this.pushUntil(isNotAnchorChar);
-                    n += yield* this.pushSpaces(true);
-                    continue loop;
-                case '-': // this is an error
-                case '?': // this is an error outside flow collections
-                case ':': {
-                    const inFlow = this.flowLevel > 0;
-                    const ch1 = this.charAt(1);
-                    if (isEmpty(ch1) || (inFlow && flowIndicatorChars.has(ch1))) {
-                        if (!inFlow)
-                            this.indentNext = this.indentValue + 1;
-                        else if (this.flowKey)
-                            this.flowKey = false;
-                        n += yield* this.pushCount(1);
-                        n += yield* this.pushSpaces(true);
-                        continue loop;
-                    }
-                }
-            }
-            break loop;
-        }
-        return n;
-    }
-    *pushTag() {
-        if (this.charAt(1) === '<') {
-            let i = this.pos + 2;
-            let ch = this.buffer[i];
-            while (!isEmpty(ch) && ch !== '>')
-                ch = this.buffer[++i];
-            return yield* this.pushToIndex(ch === '>' ? i + 1 : i, false);
-        }
-        else {
-            let i = this.pos + 1;
-            let ch = this.buffer[i];
-            while (ch) {
-                if (tagChars.has(ch))
-                    ch = this.buffer[++i];
-                else if (ch === '%' &&
-                    hexDigits.has(this.buffer[i + 1]) &&
-                    hexDigits.has(this.buffer[i + 2])) {
-                    ch = this.buffer[(i += 3)];
-                }
-                else
-                    break;
-            }
-            return yield* this.pushToIndex(i, false);
-        }
-    }
-    *pushNewline() {
-        const ch = this.buffer[this.pos];
-        if (ch === '\n')
-            return yield* this.pushCount(1);
-        else if (ch === '\r' && this.charAt(1) === '\n')
-            return yield* this.pushCount(2);
-        else
-            return 0;
-    }
-    *pushSpaces(allowTabs) {
-        let i = this.pos - 1;
-        let ch;
-        do {
-            ch = this.buffer[++i];
-        } while (ch === ' ' || (allowTabs && ch === '\t'));
-        const n = i - this.pos;
-        if (n > 0) {
-            yield this.buffer.substr(this.pos, n);
-            this.pos = i;
-        }
-        return n;
-    }
-    *pushUntil(test) {
-        let i = this.pos;
-        let ch = this.buffer[i];
-        while (!test(ch))
-            ch = this.buffer[++i];
-        return yield* this.pushToIndex(i, false);
-    }
-}
-
-exports.Lexer = Lexer;
-
-
-/***/ }),
-
-/***/ 1929:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-
-/**
- * Tracks newlines during parsing in order to provide an efficient API for
- * determining the one-indexed `{ line, col }` position for any offset
- * within the input.
- */
-class LineCounter {
-    constructor() {
-        this.lineStarts = [];
-        /**
-         * Should be called in ascending order. Otherwise, call
-         * `lineCounter.lineStarts.sort()` before calling `linePos()`.
-         */
-        this.addNewLine = (offset) => this.lineStarts.push(offset);
-        /**
-         * Performs a binary search and returns the 1-indexed { line, col }
-         * position of `offset`. If `line === 0`, `addNewLine` has never been
-         * called or `offset` is before the first known newline.
-         */
-        this.linePos = (offset) => {
-            let low = 0;
-            let high = this.lineStarts.length;
-            while (low < high) {
-                const mid = (low + high) >> 1; // Math.floor((low + high) / 2)
-                if (this.lineStarts[mid] < offset)
-                    low = mid + 1;
-                else
-                    high = mid;
-            }
-            if (this.lineStarts[low] === offset)
-                return { line: low + 1, col: 1 };
-            if (low === 0)
-                return { line: 0, col: offset };
-            const start = this.lineStarts[low - 1];
-            return { line: low, col: offset - start + 1 };
-        };
-    }
-}
-
-exports.LineCounter = LineCounter;
-
-
-/***/ }),
-
-/***/ 3328:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var node_process = __nccwpck_require__(7282);
-var cst = __nccwpck_require__(9169);
-var lexer = __nccwpck_require__(5976);
-
-function includesToken(list, type) {
-    for (let i = 0; i < list.length; ++i)
-        if (list[i].type === type)
-            return true;
-    return false;
-}
-function findNonEmptyIndex(list) {
-    for (let i = 0; i < list.length; ++i) {
-        switch (list[i].type) {
-            case 'space':
-            case 'comment':
-            case 'newline':
-                break;
-            default:
-                return i;
-        }
-    }
-    return -1;
-}
-function isFlowToken(token) {
-    switch (token?.type) {
-        case 'alias':
-        case 'scalar':
-        case 'single-quoted-scalar':
-        case 'double-quoted-scalar':
-        case 'flow-collection':
-            return true;
-        default:
-            return false;
-    }
-}
-function getPrevProps(parent) {
-    switch (parent.type) {
-        case 'document':
-            return parent.start;
-        case 'block-map': {
-            const it = parent.items[parent.items.length - 1];
-            return it.sep ?? it.start;
-        }
-        case 'block-seq':
-            return parent.items[parent.items.length - 1].start;
-        /* istanbul ignore next should not happen */
-        default:
-            return [];
-    }
-}
-/** Note: May modify input array */
-function getFirstKeyStartProps(prev) {
-    if (prev.length === 0)
-        return [];
-    let i = prev.length;
-    loop: while (--i >= 0) {
-        switch (prev[i].type) {
-            case 'doc-start':
-            case 'explicit-key-ind':
-            case 'map-value-ind':
-            case 'seq-item-ind':
-            case 'newline':
-                break loop;
-        }
-    }
-    while (prev[++i]?.type === 'space') {
-        /* loop */
-    }
-    return prev.splice(i, prev.length);
-}
-function arrayPushArray(target, source) {
-    // May exhaust call stack with large `source` array
-    if (source.length < 1e5)
-        Array.prototype.push.apply(target, source);
-    else
-        for (let i = 0; i < source.length; ++i)
-            target.push(source[i]);
-}
-function fixFlowSeqItems(fc) {
-    if (fc.start.type === 'flow-seq-start') {
-        for (const it of fc.items) {
-            if (it.sep &&
-                !it.value &&
-                !includesToken(it.start, 'explicit-key-ind') &&
-                !includesToken(it.sep, 'map-value-ind')) {
-                if (it.key)
-                    it.value = it.key;
-                delete it.key;
-                if (isFlowToken(it.value)) {
-                    if (it.value.end)
-                        arrayPushArray(it.value.end, it.sep);
-                    else
-                        it.value.end = it.sep;
-                }
-                else
-                    arrayPushArray(it.start, it.sep);
-                delete it.sep;
-            }
-        }
-    }
-}
-/**
- * A YAML concrete syntax tree (CST) parser
- *
- * ```ts
- * const src: string = ...
- * for (const token of new Parser().parse(src)) {
- *   // token: Token
- * }
- * ```
- *
- * To use the parser with a user-provided lexer:
- *
- * ```ts
- * function* parse(source: string, lexer: Lexer) {
- *   const parser = new Parser()
- *   for (const lexeme of lexer.lex(source))
- *     yield* parser.next(lexeme)
- *   yield* parser.end()
- * }
- *
- * const src: string = ...
- * const lexer = new Lexer()
- * for (const token of parse(src, lexer)) {
- *   // token: Token
- * }
- * ```
- */
-class Parser {
-    /**
-     * @param onNewLine - If defined, called separately with the start position of
-     *   each new line (in `parse()`, including the start of input).
-     */
-    constructor(onNewLine) {
-        /** If true, space and sequence indicators count as indentation */
-        this.atNewLine = true;
-        /** If true, next token is a scalar value */
-        this.atScalar = false;
-        /** Current indentation level */
-        this.indent = 0;
-        /** Current offset since the start of parsing */
-        this.offset = 0;
-        /** On the same line with a block map key */
-        this.onKeyLine = false;
-        /** Top indicates the node that's currently being built */
-        this.stack = [];
-        /** The source of the current token, set in parse() */
-        this.source = '';
-        /** The type of the current token, set in parse() */
-        this.type = '';
-        // Must be defined after `next()`
-        this.lexer = new lexer.Lexer();
-        this.onNewLine = onNewLine;
-    }
-    /**
-     * Parse `source` as a YAML stream.
-     * If `incomplete`, a part of the last line may be left as a buffer for the next call.
-     *
-     * Errors are not thrown, but yielded as `{ type: 'error', message }` tokens.
-     *
-     * @returns A generator of tokens representing each directive, document, and other structure.
-     */
-    *parse(source, incomplete = false) {
-        if (this.onNewLine && this.offset === 0)
-            this.onNewLine(0);
-        for (const lexeme of this.lexer.lex(source, incomplete))
-            yield* this.next(lexeme);
-        if (!incomplete)
-            yield* this.end();
-    }
-    /**
-     * Advance the parser by the `source` of one lexical token.
-     */
-    *next(source) {
-        this.source = source;
-        if (node_process.env.LOG_TOKENS)
-            console.log('|', cst.prettyToken(source));
-        if (this.atScalar) {
-            this.atScalar = false;
-            yield* this.step();
-            this.offset += source.length;
-            return;
-        }
-        const type = cst.tokenType(source);
-        if (!type) {
-            const message = `Not a YAML token: ${source}`;
-            yield* this.pop({ type: 'error', offset: this.offset, message, source });
-            this.offset += source.length;
-        }
-        else if (type === 'scalar') {
-            this.atNewLine = false;
-            this.atScalar = true;
-            this.type = 'scalar';
-        }
-        else {
-            this.type = type;
-            yield* this.step();
-            switch (type) {
-                case 'newline':
-                    this.atNewLine = true;
-                    this.indent = 0;
-                    if (this.onNewLine)
-                        this.onNewLine(this.offset + source.length);
-                    break;
-                case 'space':
-                    if (this.atNewLine && source[0] === ' ')
-                        this.indent += source.length;
-                    break;
-                case 'explicit-key-ind':
-                case 'map-value-ind':
-                case 'seq-item-ind':
-                    if (this.atNewLine)
-                        this.indent += source.length;
-                    break;
-                case 'doc-mode':
-                case 'flow-error-end':
-                    return;
-                default:
-                    this.atNewLine = false;
-            }
-            this.offset += source.length;
-        }
-    }
-    /** Call at end of input to push out any remaining constructions */
-    *end() {
-        while (this.stack.length > 0)
-            yield* this.pop();
-    }
-    get sourceToken() {
-        const st = {
-            type: this.type,
-            offset: this.offset,
-            indent: this.indent,
-            source: this.source
-        };
-        return st;
-    }
-    *step() {
-        const top = this.peek(1);
-        if (this.type === 'doc-end' && top?.type !== 'doc-end') {
-            while (this.stack.length > 0)
-                yield* this.pop();
-            this.stack.push({
-                type: 'doc-end',
-                offset: this.offset,
-                source: this.source
-            });
-            return;
-        }
-        if (!top)
-            return yield* this.stream();
-        switch (top.type) {
-            case 'document':
-                return yield* this.document(top);
-            case 'alias':
-            case 'scalar':
-            case 'single-quoted-scalar':
-            case 'double-quoted-scalar':
-                return yield* this.scalar(top);
-            case 'block-scalar':
-                return yield* this.blockScalar(top);
-            case 'block-map':
-                return yield* this.blockMap(top);
-            case 'block-seq':
-                return yield* this.blockSequence(top);
-            case 'flow-collection':
-                return yield* this.flowCollection(top);
-            case 'doc-end':
-                return yield* this.documentEnd(top);
-        }
-        /* istanbul ignore next should not happen */
-        yield* this.pop();
-    }
-    peek(n) {
-        return this.stack[this.stack.length - n];
-    }
-    *pop(error) {
-        const token = error ?? this.stack.pop();
-        /* istanbul ignore if should not happen */
-        if (!token) {
-            const message = 'Tried to pop an empty stack';
-            yield { type: 'error', offset: this.offset, source: '', message };
-        }
-        else if (this.stack.length === 0) {
-            yield token;
-        }
-        else {
-            const top = this.peek(1);
-            if (token.type === 'block-scalar') {
-                // Block scalars use their parent rather than header indent
-                token.indent = 'indent' in top ? top.indent : 0;
-            }
-            else if (token.type === 'flow-collection' && top.type === 'document') {
-                // Ignore all indent for top-level flow collections
-                token.indent = 0;
-            }
-            if (token.type === 'flow-collection')
-                fixFlowSeqItems(token);
-            switch (top.type) {
-                case 'document':
-                    top.value = token;
-                    break;
-                case 'block-scalar':
-                    top.props.push(token); // error
-                    break;
-                case 'block-map': {
-                    const it = top.items[top.items.length - 1];
-                    if (it.value) {
-                        top.items.push({ start: [], key: token, sep: [] });
-                        this.onKeyLine = true;
-                        return;
-                    }
-                    else if (it.sep) {
-                        it.value = token;
-                    }
-                    else {
-                        Object.assign(it, { key: token, sep: [] });
-                        this.onKeyLine = !it.explicitKey;
-                        return;
-                    }
-                    break;
-                }
-                case 'block-seq': {
-                    const it = top.items[top.items.length - 1];
-                    if (it.value)
-                        top.items.push({ start: [], value: token });
-                    else
-                        it.value = token;
-                    break;
-                }
-                case 'flow-collection': {
-                    const it = top.items[top.items.length - 1];
-                    if (!it || it.value)
-                        top.items.push({ start: [], key: token, sep: [] });
-                    else if (it.sep)
-                        it.value = token;
-                    else
-                        Object.assign(it, { key: token, sep: [] });
-                    return;
-                }
-                /* istanbul ignore next should not happen */
-                default:
-                    yield* this.pop();
-                    yield* this.pop(token);
-            }
-            if ((top.type === 'document' ||
-                top.type === 'block-map' ||
-                top.type === 'block-seq') &&
-                (token.type === 'block-map' || token.type === 'block-seq')) {
-                const last = token.items[token.items.length - 1];
-                if (last &&
-                    !last.sep &&
-                    !last.value &&
-                    last.start.length > 0 &&
-                    findNonEmptyIndex(last.start) === -1 &&
-                    (token.indent === 0 ||
-                        last.start.every(st => st.type !== 'comment' || st.indent < token.indent))) {
-                    if (top.type === 'document')
-                        top.end = last.start;
-                    else
-                        top.items.push({ start: last.start });
-                    token.items.splice(-1, 1);
-                }
-            }
-        }
-    }
-    *stream() {
-        switch (this.type) {
-            case 'directive-line':
-                yield { type: 'directive', offset: this.offset, source: this.source };
-                return;
-            case 'byte-order-mark':
-            case 'space':
-            case 'comment':
-            case 'newline':
-                yield this.sourceToken;
-                return;
-            case 'doc-mode':
-            case 'doc-start': {
-                const doc = {
-                    type: 'document',
-                    offset: this.offset,
-                    start: []
-                };
-                if (this.type === 'doc-start')
-                    doc.start.push(this.sourceToken);
-                this.stack.push(doc);
-                return;
-            }
-        }
-        yield {
-            type: 'error',
-            offset: this.offset,
-            message: `Unexpected ${this.type} token in YAML stream`,
-            source: this.source
-        };
-    }
-    *document(doc) {
-        if (doc.value)
-            return yield* this.lineEnd(doc);
-        switch (this.type) {
-            case 'doc-start': {
-                if (findNonEmptyIndex(doc.start) !== -1) {
-                    yield* this.pop();
-                    yield* this.step();
-                }
-                else
-                    doc.start.push(this.sourceToken);
-                return;
-            }
-            case 'anchor':
-            case 'tag':
-            case 'space':
-            case 'comment':
-            case 'newline':
-                doc.start.push(this.sourceToken);
-                return;
-        }
-        const bv = this.startBlockValue(doc);
-        if (bv)
-            this.stack.push(bv);
-        else {
-            yield {
-                type: 'error',
-                offset: this.offset,
-                message: `Unexpected ${this.type} token in YAML document`,
-                source: this.source
-            };
-        }
-    }
-    *scalar(scalar) {
-        if (this.type === 'map-value-ind') {
-            const prev = getPrevProps(this.peek(2));
-            const start = getFirstKeyStartProps(prev);
-            let sep;
-            if (scalar.end) {
-                sep = scalar.end;
-                sep.push(this.sourceToken);
-                delete scalar.end;
-            }
-            else
-                sep = [this.sourceToken];
-            const map = {
-                type: 'block-map',
-                offset: scalar.offset,
-                indent: scalar.indent,
-                items: [{ start, key: scalar, sep }]
-            };
-            this.onKeyLine = true;
-            this.stack[this.stack.length - 1] = map;
-        }
-        else
-            yield* this.lineEnd(scalar);
-    }
-    *blockScalar(scalar) {
-        switch (this.type) {
-            case 'space':
-            case 'comment':
-            case 'newline':
-                scalar.props.push(this.sourceToken);
-                return;
-            case 'scalar':
-                scalar.source = this.source;
-                // block-scalar source includes trailing newline
-                this.atNewLine = true;
-                this.indent = 0;
-                if (this.onNewLine) {
-                    let nl = this.source.indexOf('\n') + 1;
-                    while (nl !== 0) {
-                        this.onNewLine(this.offset + nl);
-                        nl = this.source.indexOf('\n', nl) + 1;
-                    }
-                }
-                yield* this.pop();
-                break;
-            /* istanbul ignore next should not happen */
-            default:
-                yield* this.pop();
-                yield* this.step();
-        }
-    }
-    *blockMap(map) {
-        const it = map.items[map.items.length - 1];
-        // it.sep is true-ish if pair already has key or : separator
-        switch (this.type) {
-            case 'newline':
-                this.onKeyLine = false;
-                if (it.value) {
-                    const end = 'end' in it.value ? it.value.end : undefined;
-                    const last = Array.isArray(end) ? end[end.length - 1] : undefined;
-                    if (last?.type === 'comment')
-                        end?.push(this.sourceToken);
-                    else
-                        map.items.push({ start: [this.sourceToken] });
-                }
-                else if (it.sep) {
-                    it.sep.push(this.sourceToken);
-                }
-                else {
-                    it.start.push(this.sourceToken);
-                }
-                return;
-            case 'space':
-            case 'comment':
-                if (it.value) {
-                    map.items.push({ start: [this.sourceToken] });
-                }
-                else if (it.sep) {
-                    it.sep.push(this.sourceToken);
-                }
-                else {
-                    if (this.atIndentedComment(it.start, map.indent)) {
-                        const prev = map.items[map.items.length - 2];
-                        const end = prev?.value?.end;
-                        if (Array.isArray(end)) {
-                            arrayPushArray(end, it.start);
-                            end.push(this.sourceToken);
-                            map.items.pop();
-                            return;
-                        }
-                    }
-                    it.start.push(this.sourceToken);
-                }
-                return;
-        }
-        if (this.indent >= map.indent) {
-            const atMapIndent = !this.onKeyLine && this.indent === map.indent;
-            const atNextItem = atMapIndent &&
-                (it.sep || it.explicitKey) &&
-                this.type !== 'seq-item-ind';
-            // For empty nodes, assign newline-separated not indented empty tokens to following node
-            let start = [];
-            if (atNextItem && it.sep && !it.value) {
-                const nl = [];
-                for (let i = 0; i < it.sep.length; ++i) {
-                    const st = it.sep[i];
-                    switch (st.type) {
-                        case 'newline':
-                            nl.push(i);
-                            break;
-                        case 'space':
-                            break;
-                        case 'comment':
-                            if (st.indent > map.indent)
-                                nl.length = 0;
-                            break;
-                        default:
-                            nl.length = 0;
-                    }
-                }
-                if (nl.length >= 2)
-                    start = it.sep.splice(nl[1]);
-            }
-            switch (this.type) {
-                case 'anchor':
-                case 'tag':
-                    if (atNextItem || it.value) {
-                        start.push(this.sourceToken);
-                        map.items.push({ start });
-                        this.onKeyLine = true;
-                    }
-                    else if (it.sep) {
-                        it.sep.push(this.sourceToken);
-                    }
-                    else {
-                        it.start.push(this.sourceToken);
-                    }
-                    return;
-                case 'explicit-key-ind':
-                    if (!it.sep && !it.explicitKey) {
-                        it.start.push(this.sourceToken);
-                        it.explicitKey = true;
-                    }
-                    else if (atNextItem || it.value) {
-                        start.push(this.sourceToken);
-                        map.items.push({ start, explicitKey: true });
-                    }
-                    else {
-                        this.stack.push({
-                            type: 'block-map',
-                            offset: this.offset,
-                            indent: this.indent,
-                            items: [{ start: [this.sourceToken], explicitKey: true }]
-                        });
-                    }
-                    this.onKeyLine = true;
-                    return;
-                case 'map-value-ind':
-                    if (it.explicitKey) {
-                        if (!it.sep) {
-                            if (includesToken(it.start, 'newline')) {
-                                Object.assign(it, { key: null, sep: [this.sourceToken] });
-                            }
-                            else {
-                                const start = getFirstKeyStartProps(it.start);
-                                this.stack.push({
-                                    type: 'block-map',
-                                    offset: this.offset,
-                                    indent: this.indent,
-                                    items: [{ start, key: null, sep: [this.sourceToken] }]
-                                });
-                            }
-                        }
-                        else if (it.value) {
-                            map.items.push({ start: [], key: null, sep: [this.sourceToken] });
-                        }
-                        else if (includesToken(it.sep, 'map-value-ind')) {
-                            this.stack.push({
-                                type: 'block-map',
-                                offset: this.offset,
-                                indent: this.indent,
-                                items: [{ start, key: null, sep: [this.sourceToken] }]
-                            });
-                        }
-                        else if (isFlowToken(it.key) &&
-                            !includesToken(it.sep, 'newline')) {
-                            const start = getFirstKeyStartProps(it.start);
-                            const key = it.key;
-                            const sep = it.sep;
-                            sep.push(this.sourceToken);
-                            // @ts-expect-error type guard is wrong here
-                            delete it.key;
-                            // @ts-expect-error type guard is wrong here
-                            delete it.sep;
-                            this.stack.push({
-                                type: 'block-map',
-                                offset: this.offset,
-                                indent: this.indent,
-                                items: [{ start, key, sep }]
-                            });
-                        }
-                        else if (start.length > 0) {
-                            // Not actually at next item
-                            it.sep = it.sep.concat(start, this.sourceToken);
-                        }
-                        else {
-                            it.sep.push(this.sourceToken);
-                        }
-                    }
-                    else {
-                        if (!it.sep) {
-                            Object.assign(it, { key: null, sep: [this.sourceToken] });
-                        }
-                        else if (it.value || atNextItem) {
-                            map.items.push({ start, key: null, sep: [this.sourceToken] });
-                        }
-                        else if (includesToken(it.sep, 'map-value-ind')) {
-                            this.stack.push({
-                                type: 'block-map',
-                                offset: this.offset,
-                                indent: this.indent,
-                                items: [{ start: [], key: null, sep: [this.sourceToken] }]
-                            });
-                        }
-                        else {
-                            it.sep.push(this.sourceToken);
-                        }
-                    }
-                    this.onKeyLine = true;
-                    return;
-                case 'alias':
-                case 'scalar':
-                case 'single-quoted-scalar':
-                case 'double-quoted-scalar': {
-                    const fs = this.flowScalar(this.type);
-                    if (atNextItem || it.value) {
-                        map.items.push({ start, key: fs, sep: [] });
-                        this.onKeyLine = true;
-                    }
-                    else if (it.sep) {
-                        this.stack.push(fs);
-                    }
-                    else {
-                        Object.assign(it, { key: fs, sep: [] });
-                        this.onKeyLine = true;
-                    }
-                    return;
-                }
-                default: {
-                    const bv = this.startBlockValue(map);
-                    if (bv) {
-                        if (bv.type === 'block-seq') {
-                            if (!it.explicitKey &&
-                                it.sep &&
-                                !includesToken(it.sep, 'newline')) {
-                                yield* this.pop({
-                                    type: 'error',
-                                    offset: this.offset,
-                                    message: 'Unexpected block-seq-ind on same line with key',
-                                    source: this.source
-                                });
-                                return;
-                            }
-                        }
-                        else if (atMapIndent) {
-                            map.items.push({ start });
-                        }
-                        this.stack.push(bv);
-                        return;
-                    }
-                }
-            }
-        }
-        yield* this.pop();
-        yield* this.step();
-    }
-    *blockSequence(seq) {
-        const it = seq.items[seq.items.length - 1];
-        switch (this.type) {
-            case 'newline':
-                if (it.value) {
-                    const end = 'end' in it.value ? it.value.end : undefined;
-                    const last = Array.isArray(end) ? end[end.length - 1] : undefined;
-                    if (last?.type === 'comment')
-                        end?.push(this.sourceToken);
-                    else
-                        seq.items.push({ start: [this.sourceToken] });
-                }
-                else
-                    it.start.push(this.sourceToken);
-                return;
-            case 'space':
-            case 'comment':
-                if (it.value)
-                    seq.items.push({ start: [this.sourceToken] });
-                else {
-                    if (this.atIndentedComment(it.start, seq.indent)) {
-                        const prev = seq.items[seq.items.length - 2];
-                        const end = prev?.value?.end;
-                        if (Array.isArray(end)) {
-                            arrayPushArray(end, it.start);
-                            end.push(this.sourceToken);
-                            seq.items.pop();
-                            return;
-                        }
-                    }
-                    it.start.push(this.sourceToken);
-                }
-                return;
-            case 'anchor':
-            case 'tag':
-                if (it.value || this.indent <= seq.indent)
-                    break;
-                it.start.push(this.sourceToken);
-                return;
-            case 'seq-item-ind':
-                if (this.indent !== seq.indent)
-                    break;
-                if (it.value || includesToken(it.start, 'seq-item-ind'))
-                    seq.items.push({ start: [this.sourceToken] });
-                else
-                    it.start.push(this.sourceToken);
-                return;
-        }
-        if (this.indent > seq.indent) {
-            const bv = this.startBlockValue(seq);
-            if (bv) {
-                this.stack.push(bv);
-                return;
-            }
-        }
-        yield* this.pop();
-        yield* this.step();
-    }
-    *flowCollection(fc) {
-        const it = fc.items[fc.items.length - 1];
-        if (this.type === 'flow-error-end') {
-            let top;
-            do {
-                yield* this.pop();
-                top = this.peek(1);
-            } while (top?.type === 'flow-collection');
-        }
-        else if (fc.end.length === 0) {
-            switch (this.type) {
-                case 'comma':
-                case 'explicit-key-ind':
-                    if (!it || it.sep)
-                        fc.items.push({ start: [this.sourceToken] });
-                    else
-                        it.start.push(this.sourceToken);
-                    return;
-                case 'map-value-ind':
-                    if (!it || it.value)
-                        fc.items.push({ start: [], key: null, sep: [this.sourceToken] });
-                    else if (it.sep)
-                        it.sep.push(this.sourceToken);
-                    else
-                        Object.assign(it, { key: null, sep: [this.sourceToken] });
-                    return;
-                case 'space':
-                case 'comment':
-                case 'newline':
-                case 'anchor':
-                case 'tag':
-                    if (!it || it.value)
-                        fc.items.push({ start: [this.sourceToken] });
-                    else if (it.sep)
-                        it.sep.push(this.sourceToken);
-                    else
-                        it.start.push(this.sourceToken);
-                    return;
-                case 'alias':
-                case 'scalar':
-                case 'single-quoted-scalar':
-                case 'double-quoted-scalar': {
-                    const fs = this.flowScalar(this.type);
-                    if (!it || it.value)
-                        fc.items.push({ start: [], key: fs, sep: [] });
-                    else if (it.sep)
-                        this.stack.push(fs);
-                    else
-                        Object.assign(it, { key: fs, sep: [] });
-                    return;
-                }
-                case 'flow-map-end':
-                case 'flow-seq-end':
-                    fc.end.push(this.sourceToken);
-                    return;
-            }
-            const bv = this.startBlockValue(fc);
-            /* istanbul ignore else should not happen */
-            if (bv)
-                this.stack.push(bv);
-            else {
-                yield* this.pop();
-                yield* this.step();
-            }
-        }
-        else {
-            const parent = this.peek(2);
-            if (parent.type === 'block-map' &&
-                ((this.type === 'map-value-ind' && parent.indent === fc.indent) ||
-                    (this.type === 'newline' &&
-                        !parent.items[parent.items.length - 1].sep))) {
-                yield* this.pop();
-                yield* this.step();
-            }
-            else if (this.type === 'map-value-ind' &&
-                parent.type !== 'flow-collection') {
-                const prev = getPrevProps(parent);
-                const start = getFirstKeyStartProps(prev);
-                fixFlowSeqItems(fc);
-                const sep = fc.end.splice(1, fc.end.length);
-                sep.push(this.sourceToken);
-                const map = {
-                    type: 'block-map',
-                    offset: fc.offset,
-                    indent: fc.indent,
-                    items: [{ start, key: fc, sep }]
-                };
-                this.onKeyLine = true;
-                this.stack[this.stack.length - 1] = map;
-            }
-            else {
-                yield* this.lineEnd(fc);
-            }
-        }
-    }
-    flowScalar(type) {
-        if (this.onNewLine) {
-            let nl = this.source.indexOf('\n') + 1;
-            while (nl !== 0) {
-                this.onNewLine(this.offset + nl);
-                nl = this.source.indexOf('\n', nl) + 1;
-            }
-        }
-        return {
-            type,
-            offset: this.offset,
-            indent: this.indent,
-            source: this.source
-        };
-    }
-    startBlockValue(parent) {
-        switch (this.type) {
-            case 'alias':
-            case 'scalar':
-            case 'single-quoted-scalar':
-            case 'double-quoted-scalar':
-                return this.flowScalar(this.type);
-            case 'block-scalar-header':
-                return {
-                    type: 'block-scalar',
-                    offset: this.offset,
-                    indent: this.indent,
-                    props: [this.sourceToken],
-                    source: ''
-                };
-            case 'flow-map-start':
-            case 'flow-seq-start':
-                return {
-                    type: 'flow-collection',
-                    offset: this.offset,
-                    indent: this.indent,
-                    start: this.sourceToken,
-                    items: [],
-                    end: []
-                };
-            case 'seq-item-ind':
-                return {
-                    type: 'block-seq',
-                    offset: this.offset,
-                    indent: this.indent,
-                    items: [{ start: [this.sourceToken] }]
-                };
-            case 'explicit-key-ind': {
-                this.onKeyLine = true;
-                const prev = getPrevProps(parent);
-                const start = getFirstKeyStartProps(prev);
-                start.push(this.sourceToken);
-                return {
-                    type: 'block-map',
-                    offset: this.offset,
-                    indent: this.indent,
-                    items: [{ start, explicitKey: true }]
-                };
-            }
-            case 'map-value-ind': {
-                this.onKeyLine = true;
-                const prev = getPrevProps(parent);
-                const start = getFirstKeyStartProps(prev);
-                return {
-                    type: 'block-map',
-                    offset: this.offset,
-                    indent: this.indent,
-                    items: [{ start, key: null, sep: [this.sourceToken] }]
-                };
-            }
-        }
-        return null;
-    }
-    atIndentedComment(start, indent) {
-        if (this.type !== 'comment')
-            return false;
-        if (this.indent <= indent)
-            return false;
-        return start.every(st => st.type === 'newline' || st.type === 'space');
-    }
-    *documentEnd(docEnd) {
-        if (this.type !== 'doc-mode') {
-            if (docEnd.end)
-                docEnd.end.push(this.sourceToken);
-            else
-                docEnd.end = [this.sourceToken];
-            if (this.type === 'newline')
-                yield* this.pop();
-        }
-    }
-    *lineEnd(token) {
-        switch (this.type) {
-            case 'comma':
-            case 'doc-start':
-            case 'doc-end':
-            case 'flow-seq-end':
-            case 'flow-map-end':
-            case 'map-value-ind':
-                yield* this.pop();
-                yield* this.step();
-                break;
-            case 'newline':
-                this.onKeyLine = false;
-            // fallthrough
-            case 'space':
-            case 'comment':
-            default:
-                // all other values are errors
-                if (token.end)
-                    token.end.push(this.sourceToken);
-                else
-                    token.end = [this.sourceToken];
-                if (this.type === 'newline')
-                    yield* this.pop();
-        }
-    }
-}
-
-exports.Parser = Parser;
-
-
-/***/ }),
-
-/***/ 8649:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var composer = __nccwpck_require__(9493);
-var Document = __nccwpck_require__(42);
-var errors = __nccwpck_require__(4236);
-var log = __nccwpck_require__(6909);
-var identity = __nccwpck_require__(5589);
-var lineCounter = __nccwpck_require__(1929);
-var parser = __nccwpck_require__(3328);
-
-function parseOptions(options) {
-    const prettyErrors = options.prettyErrors !== false;
-    const lineCounter$1 = options.lineCounter || (prettyErrors && new lineCounter.LineCounter()) || null;
-    return { lineCounter: lineCounter$1, prettyErrors };
-}
-/**
- * Parse the input as a stream of YAML documents.
- *
- * Documents should be separated from each other by `...` or `---` marker lines.
- *
- * @returns If an empty `docs` array is returned, it will be of type
- *   EmptyStream and contain additional stream information. In
- *   TypeScript, you should use `'empty' in docs` as a type guard for it.
- */
-function parseAllDocuments(source, options = {}) {
-    const { lineCounter, prettyErrors } = parseOptions(options);
-    const parser$1 = new parser.Parser(lineCounter?.addNewLine);
-    const composer$1 = new composer.Composer(options);
-    const docs = Array.from(composer$1.compose(parser$1.parse(source)));
-    if (prettyErrors && lineCounter)
-        for (const doc of docs) {
-            doc.errors.forEach(errors.prettifyError(source, lineCounter));
-            doc.warnings.forEach(errors.prettifyError(source, lineCounter));
-        }
-    if (docs.length > 0)
-        return docs;
-    return Object.assign([], { empty: true }, composer$1.streamInfo());
-}
-/** Parse an input string into a single YAML.Document */
-function parseDocument(source, options = {}) {
-    const { lineCounter, prettyErrors } = parseOptions(options);
-    const parser$1 = new parser.Parser(lineCounter?.addNewLine);
-    const composer$1 = new composer.Composer(options);
-    // `doc` is always set by compose.end(true) at the very latest
-    let doc = null;
-    for (const _doc of composer$1.compose(parser$1.parse(source), true, source.length)) {
-        if (!doc)
-            doc = _doc;
-        else if (doc.options.logLevel !== 'silent') {
-            doc.errors.push(new errors.YAMLParseError(_doc.range.slice(0, 2), 'MULTIPLE_DOCS', 'Source contains multiple documents; please use YAML.parseAllDocuments()'));
-            break;
-        }
-    }
-    if (prettyErrors && lineCounter) {
-        doc.errors.forEach(errors.prettifyError(source, lineCounter));
-        doc.warnings.forEach(errors.prettifyError(source, lineCounter));
-    }
-    return doc;
-}
-function parse(src, reviver, options) {
-    let _reviver = undefined;
-    if (typeof reviver === 'function') {
-        _reviver = reviver;
-    }
-    else if (options === undefined && reviver && typeof reviver === 'object') {
-        options = reviver;
-    }
-    const doc = parseDocument(src, options);
-    if (!doc)
-        return null;
-    doc.warnings.forEach(warning => log.warn(doc.options.logLevel, warning));
-    if (doc.errors.length > 0) {
-        if (doc.options.logLevel !== 'silent')
-            throw doc.errors[0];
-        else
-            doc.errors = [];
-    }
-    return doc.toJS(Object.assign({ reviver: _reviver }, options));
-}
-function stringify(value, replacer, options) {
-    let _replacer = null;
-    if (typeof replacer === 'function' || Array.isArray(replacer)) {
-        _replacer = replacer;
-    }
-    else if (options === undefined && replacer) {
-        options = replacer;
-    }
-    if (typeof options === 'string')
-        options = options.length;
-    if (typeof options === 'number') {
-        const indent = Math.round(options);
-        options = indent < 1 ? undefined : indent > 8 ? { indent: 8 } : { indent };
-    }
-    if (value === undefined) {
-        const { keepUndefined } = options ?? replacer ?? {};
-        if (!keepUndefined)
-            return undefined;
-    }
-    if (identity.isDocument(value) && !_replacer)
-        return value.toString(options);
-    return new Document.Document(value, _replacer, options).toString(options);
-}
-
-exports.parse = parse;
-exports.parseAllDocuments = parseAllDocuments;
-exports.parseDocument = parseDocument;
-exports.stringify = stringify;
-
-
-/***/ }),
-
-/***/ 6831:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var identity = __nccwpck_require__(5589);
-var map = __nccwpck_require__(83);
-var seq = __nccwpck_require__(1693);
-var string = __nccwpck_require__(2201);
-var tags = __nccwpck_require__(4138);
-
-const sortMapEntriesByKey = (a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
-class Schema {
-    constructor({ compat, customTags, merge, resolveKnownTags, schema, sortMapEntries, toStringDefaults }) {
-        this.compat = Array.isArray(compat)
-            ? tags.getTags(compat, 'compat')
-            : compat
-                ? tags.getTags(null, compat)
-                : null;
-        this.name = (typeof schema === 'string' && schema) || 'core';
-        this.knownTags = resolveKnownTags ? tags.coreKnownTags : {};
-        this.tags = tags.getTags(customTags, this.name, merge);
-        this.toStringOptions = toStringDefaults ?? null;
-        Object.defineProperty(this, identity.MAP, { value: map.map });
-        Object.defineProperty(this, identity.SCALAR, { value: string.string });
-        Object.defineProperty(this, identity.SEQ, { value: seq.seq });
-        // Used by createMap()
-        this.sortMapEntries =
-            typeof sortMapEntries === 'function'
-                ? sortMapEntries
-                : sortMapEntries === true
-                    ? sortMapEntriesByKey
-                    : null;
-    }
-    clone() {
-        const copy = Object.create(Schema.prototype, Object.getOwnPropertyDescriptors(this));
-        copy.tags = this.tags.slice();
-        return copy;
-    }
-}
-
-exports.Schema = Schema;
-
-
-/***/ }),
-
-/***/ 83:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var identity = __nccwpck_require__(5589);
-var YAMLMap = __nccwpck_require__(6011);
-
-const map = {
-    collection: 'map',
-    default: true,
-    nodeClass: YAMLMap.YAMLMap,
-    tag: 'tag:yaml.org,2002:map',
-    resolve(map, onError) {
-        if (!identity.isMap(map))
-            onError('Expected a mapping for this tag');
-        return map;
-    },
-    createNode: (schema, obj, ctx) => YAMLMap.YAMLMap.from(schema, obj, ctx)
-};
-
-exports.map = map;
-
-
-/***/ }),
-
-/***/ 6703:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var Scalar = __nccwpck_require__(9338);
-
-const nullTag = {
-    identify: value => value == null,
-    createNode: () => new Scalar.Scalar(null),
-    default: true,
-    tag: 'tag:yaml.org,2002:null',
-    test: /^(?:~|[Nn]ull|NULL)?$/,
-    resolve: () => new Scalar.Scalar(null),
-    stringify: ({ source }, ctx) => typeof source === 'string' && nullTag.test.test(source)
-        ? source
-        : ctx.options.nullStr
-};
-
-exports.nullTag = nullTag;
-
-
-/***/ }),
-
-/***/ 1693:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var identity = __nccwpck_require__(5589);
-var YAMLSeq = __nccwpck_require__(5161);
-
-const seq = {
-    collection: 'seq',
-    default: true,
-    nodeClass: YAMLSeq.YAMLSeq,
-    tag: 'tag:yaml.org,2002:seq',
-    resolve(seq, onError) {
-        if (!identity.isSeq(seq))
-            onError('Expected a sequence for this tag');
-        return seq;
-    },
-    createNode: (schema, obj, ctx) => YAMLSeq.YAMLSeq.from(schema, obj, ctx)
-};
-
-exports.seq = seq;
-
-
-/***/ }),
-
-/***/ 2201:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var stringifyString = __nccwpck_require__(6226);
-
-const string = {
-    identify: value => typeof value === 'string',
-    default: true,
-    tag: 'tag:yaml.org,2002:str',
-    resolve: str => str,
-    stringify(item, ctx, onComment, onChompKeep) {
-        ctx = Object.assign({ actualString: true }, ctx);
-        return stringifyString.stringifyString(item, ctx, onComment, onChompKeep);
-    }
-};
-
-exports.string = string;
-
-
-/***/ }),
-
-/***/ 2045:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var Scalar = __nccwpck_require__(9338);
-
-const boolTag = {
-    identify: value => typeof value === 'boolean',
-    default: true,
-    tag: 'tag:yaml.org,2002:bool',
-    test: /^(?:[Tt]rue|TRUE|[Ff]alse|FALSE)$/,
-    resolve: str => new Scalar.Scalar(str[0] === 't' || str[0] === 'T'),
-    stringify({ source, value }, ctx) {
-        if (source && boolTag.test.test(source)) {
-            const sv = source[0] === 't' || source[0] === 'T';
-            if (value === sv)
-                return source;
-        }
-        return value ? ctx.options.trueStr : ctx.options.falseStr;
-    }
-};
-
-exports.boolTag = boolTag;
-
-
-/***/ }),
-
-/***/ 6810:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var Scalar = __nccwpck_require__(9338);
-var stringifyNumber = __nccwpck_require__(4174);
-
-const floatNaN = {
-    identify: value => typeof value === 'number',
-    default: true,
-    tag: 'tag:yaml.org,2002:float',
-    test: /^(?:[-+]?\.(?:inf|Inf|INF)|\.nan|\.NaN|\.NAN)$/,
-    resolve: str => str.slice(-3).toLowerCase() === 'nan'
-        ? NaN
-        : str[0] === '-'
-            ? Number.NEGATIVE_INFINITY
-            : Number.POSITIVE_INFINITY,
-    stringify: stringifyNumber.stringifyNumber
-};
-const floatExp = {
-    identify: value => typeof value === 'number',
-    default: true,
-    tag: 'tag:yaml.org,2002:float',
-    format: 'EXP',
-    test: /^[-+]?(?:\.[0-9]+|[0-9]+(?:\.[0-9]*)?)[eE][-+]?[0-9]+$/,
-    resolve: str => parseFloat(str),
-    stringify(node) {
-        const num = Number(node.value);
-        return isFinite(num) ? num.toExponential() : stringifyNumber.stringifyNumber(node);
-    }
-};
-const float = {
-    identify: value => typeof value === 'number',
-    default: true,
-    tag: 'tag:yaml.org,2002:float',
-    test: /^[-+]?(?:\.[0-9]+|[0-9]+\.[0-9]*)$/,
-    resolve(str) {
-        const node = new Scalar.Scalar(parseFloat(str));
-        const dot = str.indexOf('.');
-        if (dot !== -1 && str[str.length - 1] === '0')
-            node.minFractionDigits = str.length - dot - 1;
-        return node;
-    },
-    stringify: stringifyNumber.stringifyNumber
-};
-
-exports.float = float;
-exports.floatExp = floatExp;
-exports.floatNaN = floatNaN;
-
-
-/***/ }),
-
-/***/ 3019:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var stringifyNumber = __nccwpck_require__(4174);
-
-const intIdentify = (value) => typeof value === 'bigint' || Number.isInteger(value);
-const intResolve = (str, offset, radix, { intAsBigInt }) => (intAsBigInt ? BigInt(str) : parseInt(str.substring(offset), radix));
-function intStringify(node, radix, prefix) {
-    const { value } = node;
-    if (intIdentify(value) && value >= 0)
-        return prefix + value.toString(radix);
-    return stringifyNumber.stringifyNumber(node);
-}
-const intOct = {
-    identify: value => intIdentify(value) && value >= 0,
-    default: true,
-    tag: 'tag:yaml.org,2002:int',
-    format: 'OCT',
-    test: /^0o[0-7]+$/,
-    resolve: (str, _onError, opt) => intResolve(str, 2, 8, opt),
-    stringify: node => intStringify(node, 8, '0o')
-};
-const int = {
-    identify: intIdentify,
-    default: true,
-    tag: 'tag:yaml.org,2002:int',
-    test: /^[-+]?[0-9]+$/,
-    resolve: (str, _onError, opt) => intResolve(str, 0, 10, opt),
-    stringify: stringifyNumber.stringifyNumber
-};
-const intHex = {
-    identify: value => intIdentify(value) && value >= 0,
-    default: true,
-    tag: 'tag:yaml.org,2002:int',
-    format: 'HEX',
-    test: /^0x[0-9a-fA-F]+$/,
-    resolve: (str, _onError, opt) => intResolve(str, 2, 16, opt),
-    stringify: node => intStringify(node, 16, '0x')
-};
-
-exports.int = int;
-exports.intHex = intHex;
-exports.intOct = intOct;
-
-
-/***/ }),
-
-/***/ 4114:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var map = __nccwpck_require__(83);
-var _null = __nccwpck_require__(6703);
-var seq = __nccwpck_require__(1693);
-var string = __nccwpck_require__(2201);
-var bool = __nccwpck_require__(2045);
-var float = __nccwpck_require__(6810);
-var int = __nccwpck_require__(3019);
-
-const schema = [
-    map.map,
-    seq.seq,
-    string.string,
-    _null.nullTag,
-    bool.boolTag,
-    int.intOct,
-    int.int,
-    int.intHex,
-    float.floatNaN,
-    float.floatExp,
-    float.float
-];
-
-exports.schema = schema;
-
-
-/***/ }),
-
-/***/ 4545:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var Scalar = __nccwpck_require__(9338);
-var map = __nccwpck_require__(83);
-var seq = __nccwpck_require__(1693);
-
-function intIdentify(value) {
-    return typeof value === 'bigint' || Number.isInteger(value);
-}
-const stringifyJSON = ({ value }) => JSON.stringify(value);
-const jsonScalars = [
-    {
-        identify: value => typeof value === 'string',
-        default: true,
-        tag: 'tag:yaml.org,2002:str',
-        resolve: str => str,
-        stringify: stringifyJSON
-    },
-    {
-        identify: value => value == null,
-        createNode: () => new Scalar.Scalar(null),
-        default: true,
-        tag: 'tag:yaml.org,2002:null',
-        test: /^null$/,
-        resolve: () => null,
-        stringify: stringifyJSON
-    },
-    {
-        identify: value => typeof value === 'boolean',
-        default: true,
-        tag: 'tag:yaml.org,2002:bool',
-        test: /^true$|^false$/,
-        resolve: str => str === 'true',
-        stringify: stringifyJSON
-    },
-    {
-        identify: intIdentify,
-        default: true,
-        tag: 'tag:yaml.org,2002:int',
-        test: /^-?(?:0|[1-9][0-9]*)$/,
-        resolve: (str, _onError, { intAsBigInt }) => intAsBigInt ? BigInt(str) : parseInt(str, 10),
-        stringify: ({ value }) => intIdentify(value) ? value.toString() : JSON.stringify(value)
-    },
-    {
-        identify: value => typeof value === 'number',
-        default: true,
-        tag: 'tag:yaml.org,2002:float',
-        test: /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]*)?(?:[eE][-+]?[0-9]+)?$/,
-        resolve: str => parseFloat(str),
-        stringify: stringifyJSON
-    }
-];
-const jsonError = {
-    default: true,
-    tag: '',
-    test: /^/,
-    resolve(str, onError) {
-        onError(`Unresolved plain scalar ${JSON.stringify(str)}`);
-        return str;
-    }
-};
-const schema = [map.map, seq.seq].concat(jsonScalars, jsonError);
-
-exports.schema = schema;
-
-
-/***/ }),
-
-/***/ 4138:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var map = __nccwpck_require__(83);
-var _null = __nccwpck_require__(6703);
-var seq = __nccwpck_require__(1693);
-var string = __nccwpck_require__(2201);
-var bool = __nccwpck_require__(2045);
-var float = __nccwpck_require__(6810);
-var int = __nccwpck_require__(3019);
-var schema = __nccwpck_require__(4114);
-var schema$1 = __nccwpck_require__(4545);
-var binary = __nccwpck_require__(5724);
-var merge = __nccwpck_require__(9614);
-var omap = __nccwpck_require__(8974);
-var pairs = __nccwpck_require__(9841);
-var schema$2 = __nccwpck_require__(5389);
-var set = __nccwpck_require__(7847);
-var timestamp = __nccwpck_require__(1156);
-
-const schemas = new Map([
-    ['core', schema.schema],
-    ['failsafe', [map.map, seq.seq, string.string]],
-    ['json', schema$1.schema],
-    ['yaml11', schema$2.schema],
-    ['yaml-1.1', schema$2.schema]
-]);
-const tagsByName = {
-    binary: binary.binary,
-    bool: bool.boolTag,
-    float: float.float,
-    floatExp: float.floatExp,
-    floatNaN: float.floatNaN,
-    floatTime: timestamp.floatTime,
-    int: int.int,
-    intHex: int.intHex,
-    intOct: int.intOct,
-    intTime: timestamp.intTime,
-    map: map.map,
-    merge: merge.merge,
-    null: _null.nullTag,
-    omap: omap.omap,
-    pairs: pairs.pairs,
-    seq: seq.seq,
-    set: set.set,
-    timestamp: timestamp.timestamp
-};
-const coreKnownTags = {
-    'tag:yaml.org,2002:binary': binary.binary,
-    'tag:yaml.org,2002:merge': merge.merge,
-    'tag:yaml.org,2002:omap': omap.omap,
-    'tag:yaml.org,2002:pairs': pairs.pairs,
-    'tag:yaml.org,2002:set': set.set,
-    'tag:yaml.org,2002:timestamp': timestamp.timestamp
-};
-function getTags(customTags, schemaName, addMergeTag) {
-    const schemaTags = schemas.get(schemaName);
-    if (schemaTags && !customTags) {
-        return addMergeTag && !schemaTags.includes(merge.merge)
-            ? schemaTags.concat(merge.merge)
-            : schemaTags.slice();
-    }
-    let tags = schemaTags;
-    if (!tags) {
-        if (Array.isArray(customTags))
-            tags = [];
-        else {
-            const keys = Array.from(schemas.keys())
-                .filter(key => key !== 'yaml11')
-                .map(key => JSON.stringify(key))
-                .join(', ');
-            throw new Error(`Unknown schema "${schemaName}"; use one of ${keys} or define customTags array`);
-        }
-    }
-    if (Array.isArray(customTags)) {
-        for (const tag of customTags)
-            tags = tags.concat(tag);
-    }
-    else if (typeof customTags === 'function') {
-        tags = customTags(tags.slice());
-    }
-    if (addMergeTag)
-        tags = tags.concat(merge.merge);
-    return tags.reduce((tags, tag) => {
-        const tagObj = typeof tag === 'string' ? tagsByName[tag] : tag;
-        if (!tagObj) {
-            const tagName = JSON.stringify(tag);
-            const keys = Object.keys(tagsByName)
-                .map(key => JSON.stringify(key))
-                .join(', ');
-            throw new Error(`Unknown custom tag ${tagName}; use one of ${keys}`);
-        }
-        if (!tags.includes(tagObj))
-            tags.push(tagObj);
-        return tags;
-    }, []);
-}
-
-exports.coreKnownTags = coreKnownTags;
-exports.getTags = getTags;
-
-
-/***/ }),
-
-/***/ 5724:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var node_buffer = __nccwpck_require__(4300);
-var Scalar = __nccwpck_require__(9338);
-var stringifyString = __nccwpck_require__(6226);
-
-const binary = {
-    identify: value => value instanceof Uint8Array, // Buffer inherits from Uint8Array
-    default: false,
-    tag: 'tag:yaml.org,2002:binary',
-    /**
-     * Returns a Buffer in node and an Uint8Array in browsers
-     *
-     * To use the resulting buffer as an image, you'll want to do something like:
-     *
-     *   const blob = new Blob([buffer], { type: 'image/jpeg' })
-     *   document.querySelector('#photo').src = URL.createObjectURL(blob)
-     */
-    resolve(src, onError) {
-        if (typeof node_buffer.Buffer === 'function') {
-            return node_buffer.Buffer.from(src, 'base64');
-        }
-        else if (typeof atob === 'function') {
-            // On IE 11, atob() can't handle newlines
-            const str = atob(src.replace(/[\n\r]/g, ''));
-            const buffer = new Uint8Array(str.length);
-            for (let i = 0; i < str.length; ++i)
-                buffer[i] = str.charCodeAt(i);
-            return buffer;
-        }
-        else {
-            onError('This environment does not support reading binary tags; either Buffer or atob is required');
-            return src;
-        }
-    },
-    stringify({ comment, type, value }, ctx, onComment, onChompKeep) {
-        if (!value)
-            return '';
-        const buf = value; // checked earlier by binary.identify()
-        let str;
-        if (typeof node_buffer.Buffer === 'function') {
-            str =
-                buf instanceof node_buffer.Buffer
-                    ? buf.toString('base64')
-                    : node_buffer.Buffer.from(buf.buffer).toString('base64');
-        }
-        else if (typeof btoa === 'function') {
-            let s = '';
-            for (let i = 0; i < buf.length; ++i)
-                s += String.fromCharCode(buf[i]);
-            str = btoa(s);
-        }
-        else {
-            throw new Error('This environment does not support writing binary tags; either Buffer or btoa is required');
-        }
-        type ?? (type = Scalar.Scalar.BLOCK_LITERAL);
-        if (type !== Scalar.Scalar.QUOTE_DOUBLE) {
-            const lineWidth = Math.max(ctx.options.lineWidth - ctx.indent.length, ctx.options.minContentWidth);
-            const n = Math.ceil(str.length / lineWidth);
-            const lines = new Array(n);
-            for (let i = 0, o = 0; i < n; ++i, o += lineWidth) {
-                lines[i] = str.substr(o, lineWidth);
-            }
-            str = lines.join(type === Scalar.Scalar.BLOCK_LITERAL ? '\n' : ' ');
-        }
-        return stringifyString.stringifyString({ comment, type, value: str }, ctx, onComment, onChompKeep);
-    }
-};
-
-exports.binary = binary;
-
-
-/***/ }),
-
-/***/ 2631:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var Scalar = __nccwpck_require__(9338);
-
-function boolStringify({ value, source }, ctx) {
-    const boolObj = value ? trueTag : falseTag;
-    if (source && boolObj.test.test(source))
-        return source;
-    return value ? ctx.options.trueStr : ctx.options.falseStr;
-}
-const trueTag = {
-    identify: value => value === true,
-    default: true,
-    tag: 'tag:yaml.org,2002:bool',
-    test: /^(?:Y|y|[Yy]es|YES|[Tt]rue|TRUE|[Oo]n|ON)$/,
-    resolve: () => new Scalar.Scalar(true),
-    stringify: boolStringify
-};
-const falseTag = {
-    identify: value => value === false,
-    default: true,
-    tag: 'tag:yaml.org,2002:bool',
-    test: /^(?:N|n|[Nn]o|NO|[Ff]alse|FALSE|[Oo]ff|OFF)$/,
-    resolve: () => new Scalar.Scalar(false),
-    stringify: boolStringify
-};
-
-exports.falseTag = falseTag;
-exports.trueTag = trueTag;
-
-
-/***/ }),
-
-/***/ 8035:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var Scalar = __nccwpck_require__(9338);
-var stringifyNumber = __nccwpck_require__(4174);
-
-const floatNaN = {
-    identify: value => typeof value === 'number',
-    default: true,
-    tag: 'tag:yaml.org,2002:float',
-    test: /^(?:[-+]?\.(?:inf|Inf|INF)|\.nan|\.NaN|\.NAN)$/,
-    resolve: (str) => str.slice(-3).toLowerCase() === 'nan'
-        ? NaN
-        : str[0] === '-'
-            ? Number.NEGATIVE_INFINITY
-            : Number.POSITIVE_INFINITY,
-    stringify: stringifyNumber.stringifyNumber
-};
-const floatExp = {
-    identify: value => typeof value === 'number',
-    default: true,
-    tag: 'tag:yaml.org,2002:float',
-    format: 'EXP',
-    test: /^[-+]?(?:[0-9][0-9_]*)?(?:\.[0-9_]*)?[eE][-+]?[0-9]+$/,
-    resolve: (str) => parseFloat(str.replace(/_/g, '')),
-    stringify(node) {
-        const num = Number(node.value);
-        return isFinite(num) ? num.toExponential() : stringifyNumber.stringifyNumber(node);
-    }
-};
-const float = {
-    identify: value => typeof value === 'number',
-    default: true,
-    tag: 'tag:yaml.org,2002:float',
-    test: /^[-+]?(?:[0-9][0-9_]*)?\.[0-9_]*$/,
-    resolve(str) {
-        const node = new Scalar.Scalar(parseFloat(str.replace(/_/g, '')));
-        const dot = str.indexOf('.');
-        if (dot !== -1) {
-            const f = str.substring(dot + 1).replace(/_/g, '');
-            if (f[f.length - 1] === '0')
-                node.minFractionDigits = f.length;
-        }
-        return node;
-    },
-    stringify: stringifyNumber.stringifyNumber
-};
-
-exports.float = float;
-exports.floatExp = floatExp;
-exports.floatNaN = floatNaN;
-
-
-/***/ }),
-
-/***/ 9503:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var stringifyNumber = __nccwpck_require__(4174);
-
-const intIdentify = (value) => typeof value === 'bigint' || Number.isInteger(value);
-function intResolve(str, offset, radix, { intAsBigInt }) {
-    const sign = str[0];
-    if (sign === '-' || sign === '+')
-        offset += 1;
-    str = str.substring(offset).replace(/_/g, '');
-    if (intAsBigInt) {
-        switch (radix) {
-            case 2:
-                str = `0b${str}`;
-                break;
-            case 8:
-                str = `0o${str}`;
-                break;
-            case 16:
-                str = `0x${str}`;
-                break;
-        }
-        const n = BigInt(str);
-        return sign === '-' ? BigInt(-1) * n : n;
-    }
-    const n = parseInt(str, radix);
-    return sign === '-' ? -1 * n : n;
-}
-function intStringify(node, radix, prefix) {
-    const { value } = node;
-    if (intIdentify(value)) {
-        const str = value.toString(radix);
-        return value < 0 ? '-' + prefix + str.substr(1) : prefix + str;
-    }
-    return stringifyNumber.stringifyNumber(node);
-}
-const intBin = {
-    identify: intIdentify,
-    default: true,
-    tag: 'tag:yaml.org,2002:int',
-    format: 'BIN',
-    test: /^[-+]?0b[0-1_]+$/,
-    resolve: (str, _onError, opt) => intResolve(str, 2, 2, opt),
-    stringify: node => intStringify(node, 2, '0b')
-};
-const intOct = {
-    identify: intIdentify,
-    default: true,
-    tag: 'tag:yaml.org,2002:int',
-    format: 'OCT',
-    test: /^[-+]?0[0-7_]+$/,
-    resolve: (str, _onError, opt) => intResolve(str, 1, 8, opt),
-    stringify: node => intStringify(node, 8, '0')
-};
-const int = {
-    identify: intIdentify,
-    default: true,
-    tag: 'tag:yaml.org,2002:int',
-    test: /^[-+]?[0-9][0-9_]*$/,
-    resolve: (str, _onError, opt) => intResolve(str, 0, 10, opt),
-    stringify: stringifyNumber.stringifyNumber
-};
-const intHex = {
-    identify: intIdentify,
-    default: true,
-    tag: 'tag:yaml.org,2002:int',
-    format: 'HEX',
-    test: /^[-+]?0x[0-9a-fA-F_]+$/,
-    resolve: (str, _onError, opt) => intResolve(str, 2, 16, opt),
-    stringify: node => intStringify(node, 16, '0x')
-};
-
-exports.int = int;
-exports.intBin = intBin;
-exports.intHex = intHex;
-exports.intOct = intOct;
-
-
-/***/ }),
-
-/***/ 9614:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var identity = __nccwpck_require__(5589);
-var Scalar = __nccwpck_require__(9338);
-
-// If the value associated with a merge key is a single mapping node, each of
-// its key/value pairs is inserted into the current mapping, unless the key
-// already exists in it. If the value associated with the merge key is a
-// sequence, then this sequence is expected to contain mapping nodes and each
-// of these nodes is merged in turn according to its order in the sequence.
-// Keys in mapping nodes earlier in the sequence override keys specified in
-// later mapping nodes. -- http://yaml.org/type/merge.html
-const MERGE_KEY = '<<';
-const merge = {
-    identify: value => value === MERGE_KEY ||
-        (typeof value === 'symbol' && value.description === MERGE_KEY),
-    default: 'key',
-    tag: 'tag:yaml.org,2002:merge',
-    test: /^<<$/,
-    resolve: () => Object.assign(new Scalar.Scalar(Symbol(MERGE_KEY)), {
-        addToJSMap: addMergeToJSMap
-    }),
-    stringify: () => MERGE_KEY
-};
-const isMergeKey = (ctx, key) => (merge.identify(key) ||
-    (identity.isScalar(key) &&
-        (!key.type || key.type === Scalar.Scalar.PLAIN) &&
-        merge.identify(key.value))) &&
-    ctx?.doc.schema.tags.some(tag => tag.tag === merge.tag && tag.default);
-function addMergeToJSMap(ctx, map, value) {
-    const source = resolveAliasValue(ctx, value);
-    if (identity.isSeq(source))
-        for (const it of source.items)
-            mergeValue(ctx, map, it);
-    else if (Array.isArray(source))
-        for (const it of source)
-            mergeValue(ctx, map, it);
-    else
-        mergeValue(ctx, map, source);
-}
-function mergeValue(ctx, map, value) {
-    const source = resolveAliasValue(ctx, value);
-    if (!identity.isMap(source))
-        throw new Error('Merge sources must be maps or map aliases');
-    const srcMap = source.toJSON(null, ctx, Map);
-    for (const [key, value] of srcMap) {
-        if (map instanceof Map) {
-            if (!map.has(key))
-                map.set(key, value);
-        }
-        else if (map instanceof Set) {
-            map.add(key);
-        }
-        else if (!Object.prototype.hasOwnProperty.call(map, key)) {
-            Object.defineProperty(map, key, {
-                value,
-                writable: true,
-                enumerable: true,
-                configurable: true
-            });
-        }
-    }
-    return map;
-}
-function resolveAliasValue(ctx, value) {
-    return ctx && identity.isAlias(value) ? value.resolve(ctx.doc, ctx) : value;
-}
-
-exports.addMergeToJSMap = addMergeToJSMap;
-exports.isMergeKey = isMergeKey;
-exports.merge = merge;
-
-
-/***/ }),
-
-/***/ 8974:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var identity = __nccwpck_require__(5589);
-var toJS = __nccwpck_require__(2463);
-var YAMLMap = __nccwpck_require__(6011);
-var YAMLSeq = __nccwpck_require__(5161);
-var pairs = __nccwpck_require__(9841);
-
-class YAMLOMap extends YAMLSeq.YAMLSeq {
-    constructor() {
-        super();
-        this.add = YAMLMap.YAMLMap.prototype.add.bind(this);
-        this.delete = YAMLMap.YAMLMap.prototype.delete.bind(this);
-        this.get = YAMLMap.YAMLMap.prototype.get.bind(this);
-        this.has = YAMLMap.YAMLMap.prototype.has.bind(this);
-        this.set = YAMLMap.YAMLMap.prototype.set.bind(this);
-        this.tag = YAMLOMap.tag;
-    }
-    /**
-     * If `ctx` is given, the return type is actually `Map<unknown, unknown>`,
-     * but TypeScript won't allow widening the signature of a child method.
-     */
-    toJSON(_, ctx) {
-        if (!ctx)
-            return super.toJSON(_);
-        const map = new Map();
-        if (ctx?.onCreate)
-            ctx.onCreate(map);
-        for (const pair of this.items) {
-            let key, value;
-            if (identity.isPair(pair)) {
-                key = toJS.toJS(pair.key, '', ctx);
-                value = toJS.toJS(pair.value, key, ctx);
-            }
-            else {
-                key = toJS.toJS(pair, '', ctx);
-            }
-            if (map.has(key))
-                throw new Error('Ordered maps must not include duplicate keys');
-            map.set(key, value);
-        }
-        return map;
-    }
-    static from(schema, iterable, ctx) {
-        const pairs$1 = pairs.createPairs(schema, iterable, ctx);
-        const omap = new this();
-        omap.items = pairs$1.items;
-        return omap;
-    }
-}
-YAMLOMap.tag = 'tag:yaml.org,2002:omap';
-const omap = {
-    collection: 'seq',
-    identify: value => value instanceof Map,
-    nodeClass: YAMLOMap,
-    default: false,
-    tag: 'tag:yaml.org,2002:omap',
-    resolve(seq, onError) {
-        const pairs$1 = pairs.resolvePairs(seq, onError);
-        const seenKeys = [];
-        for (const { key } of pairs$1.items) {
-            if (identity.isScalar(key)) {
-                if (seenKeys.includes(key.value)) {
-                    onError(`Ordered maps must not include duplicate keys: ${key.value}`);
-                }
-                else {
-                    seenKeys.push(key.value);
-                }
-            }
-        }
-        return Object.assign(new YAMLOMap(), pairs$1);
-    },
-    createNode: (schema, iterable, ctx) => YAMLOMap.from(schema, iterable, ctx)
-};
-
-exports.YAMLOMap = YAMLOMap;
-exports.omap = omap;
-
-
-/***/ }),
-
-/***/ 9841:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var identity = __nccwpck_require__(5589);
-var Pair = __nccwpck_require__(246);
-var Scalar = __nccwpck_require__(9338);
-var YAMLSeq = __nccwpck_require__(5161);
-
-function resolvePairs(seq, onError) {
-    if (identity.isSeq(seq)) {
-        for (let i = 0; i < seq.items.length; ++i) {
-            let item = seq.items[i];
-            if (identity.isPair(item))
-                continue;
-            else if (identity.isMap(item)) {
-                if (item.items.length > 1)
-                    onError('Each pair must have its own sequence indicator');
-                const pair = item.items[0] || new Pair.Pair(new Scalar.Scalar(null));
-                if (item.commentBefore)
-                    pair.key.commentBefore = pair.key.commentBefore
-                        ? `${item.commentBefore}\n${pair.key.commentBefore}`
-                        : item.commentBefore;
-                if (item.comment) {
-                    const cn = pair.value ?? pair.key;
-                    cn.comment = cn.comment
-                        ? `${item.comment}\n${cn.comment}`
-                        : item.comment;
-                }
-                item = pair;
-            }
-            seq.items[i] = identity.isPair(item) ? item : new Pair.Pair(item);
-        }
-    }
-    else
-        onError('Expected a sequence for this tag');
-    return seq;
-}
-function createPairs(schema, iterable, ctx) {
-    const { replacer } = ctx;
-    const pairs = new YAMLSeq.YAMLSeq(schema);
-    pairs.tag = 'tag:yaml.org,2002:pairs';
-    let i = 0;
-    if (iterable && Symbol.iterator in Object(iterable))
-        for (let it of iterable) {
-            if (typeof replacer === 'function')
-                it = replacer.call(iterable, String(i++), it);
-            let key, value;
-            if (Array.isArray(it)) {
-                if (it.length === 2) {
-                    key = it[0];
-                    value = it[1];
-                }
-                else
-                    throw new TypeError(`Expected [key, value] tuple: ${it}`);
-            }
-            else if (it && it instanceof Object) {
-                const keys = Object.keys(it);
-                if (keys.length === 1) {
-                    key = keys[0];
-                    value = it[key];
-                }
-                else {
-                    throw new TypeError(`Expected tuple with one key, not ${keys.length} keys`);
-                }
-            }
-            else {
-                key = it;
-            }
-            pairs.items.push(Pair.createPair(key, value, ctx));
-        }
-    return pairs;
-}
-const pairs = {
-    collection: 'seq',
-    default: false,
-    tag: 'tag:yaml.org,2002:pairs',
-    resolve: resolvePairs,
-    createNode: createPairs
-};
-
-exports.createPairs = createPairs;
-exports.pairs = pairs;
-exports.resolvePairs = resolvePairs;
-
-
-/***/ }),
-
-/***/ 5389:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var map = __nccwpck_require__(83);
-var _null = __nccwpck_require__(6703);
-var seq = __nccwpck_require__(1693);
-var string = __nccwpck_require__(2201);
-var binary = __nccwpck_require__(5724);
-var bool = __nccwpck_require__(2631);
-var float = __nccwpck_require__(8035);
-var int = __nccwpck_require__(9503);
-var merge = __nccwpck_require__(9614);
-var omap = __nccwpck_require__(8974);
-var pairs = __nccwpck_require__(9841);
-var set = __nccwpck_require__(7847);
-var timestamp = __nccwpck_require__(1156);
-
-const schema = [
-    map.map,
-    seq.seq,
-    string.string,
-    _null.nullTag,
-    bool.trueTag,
-    bool.falseTag,
-    int.intBin,
-    int.intOct,
-    int.int,
-    int.intHex,
-    float.floatNaN,
-    float.floatExp,
-    float.float,
-    binary.binary,
-    merge.merge,
-    omap.omap,
-    pairs.pairs,
-    set.set,
-    timestamp.intTime,
-    timestamp.floatTime,
-    timestamp.timestamp
-];
-
-exports.schema = schema;
-
-
-/***/ }),
-
-/***/ 7847:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var identity = __nccwpck_require__(5589);
-var Pair = __nccwpck_require__(246);
-var YAMLMap = __nccwpck_require__(6011);
-
-class YAMLSet extends YAMLMap.YAMLMap {
-    constructor(schema) {
-        super(schema);
-        this.tag = YAMLSet.tag;
-    }
-    add(key) {
-        let pair;
-        if (identity.isPair(key))
-            pair = key;
-        else if (key &&
-            typeof key === 'object' &&
-            'key' in key &&
-            'value' in key &&
-            key.value === null)
-            pair = new Pair.Pair(key.key, null);
-        else
-            pair = new Pair.Pair(key, null);
-        const prev = YAMLMap.findPair(this.items, pair.key);
-        if (!prev)
-            this.items.push(pair);
-    }
-    /**
-     * If `keepPair` is `true`, returns the Pair matching `key`.
-     * Otherwise, returns the value of that Pair's key.
-     */
-    get(key, keepPair) {
-        const pair = YAMLMap.findPair(this.items, key);
-        return !keepPair && identity.isPair(pair)
-            ? identity.isScalar(pair.key)
-                ? pair.key.value
-                : pair.key
-            : pair;
-    }
-    set(key, value) {
-        if (typeof value !== 'boolean')
-            throw new Error(`Expected boolean value for set(key, value) in a YAML set, not ${typeof value}`);
-        const prev = YAMLMap.findPair(this.items, key);
-        if (prev && !value) {
-            this.items.splice(this.items.indexOf(prev), 1);
-        }
-        else if (!prev && value) {
-            this.items.push(new Pair.Pair(key));
-        }
-    }
-    toJSON(_, ctx) {
-        return super.toJSON(_, ctx, Set);
-    }
-    toString(ctx, onComment, onChompKeep) {
-        if (!ctx)
-            return JSON.stringify(this);
-        if (this.hasAllNullValues(true))
-            return super.toString(Object.assign({}, ctx, { allNullValues: true }), onComment, onChompKeep);
-        else
-            throw new Error('Set items must all have null values');
-    }
-    static from(schema, iterable, ctx) {
-        const { replacer } = ctx;
-        const set = new this(schema);
-        if (iterable && Symbol.iterator in Object(iterable))
-            for (let value of iterable) {
-                if (typeof replacer === 'function')
-                    value = replacer.call(iterable, value, value);
-                set.items.push(Pair.createPair(value, null, ctx));
-            }
-        return set;
-    }
-}
-YAMLSet.tag = 'tag:yaml.org,2002:set';
-const set = {
-    collection: 'map',
-    identify: value => value instanceof Set,
-    nodeClass: YAMLSet,
-    default: false,
-    tag: 'tag:yaml.org,2002:set',
-    createNode: (schema, iterable, ctx) => YAMLSet.from(schema, iterable, ctx),
-    resolve(map, onError) {
-        if (identity.isMap(map)) {
-            if (map.hasAllNullValues(true))
-                return Object.assign(new YAMLSet(), map);
-            else
-                onError('Set items must all have null values');
-        }
-        else
-            onError('Expected a mapping for this tag');
-        return map;
-    }
-};
-
-exports.YAMLSet = YAMLSet;
-exports.set = set;
-
-
-/***/ }),
-
-/***/ 1156:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var stringifyNumber = __nccwpck_require__(4174);
-
-/** Internal types handle bigint as number, because TS can't figure it out. */
-function parseSexagesimal(str, asBigInt) {
-    const sign = str[0];
-    const parts = sign === '-' || sign === '+' ? str.substring(1) : str;
-    const num = (n) => asBigInt ? BigInt(n) : Number(n);
-    const res = parts
-        .replace(/_/g, '')
-        .split(':')
-        .reduce((res, p) => res * num(60) + num(p), num(0));
-    return (sign === '-' ? num(-1) * res : res);
-}
-/**
- * hhhh:mm:ss.sss
- *
- * Internal types handle bigint as number, because TS can't figure it out.
- */
-function stringifySexagesimal(node) {
-    let { value } = node;
-    let num = (n) => n;
-    if (typeof value === 'bigint')
-        num = n => BigInt(n);
-    else if (isNaN(value) || !isFinite(value))
-        return stringifyNumber.stringifyNumber(node);
-    let sign = '';
-    if (value < 0) {
-        sign = '-';
-        value *= num(-1);
-    }
-    const _60 = num(60);
-    const parts = [value % _60]; // seconds, including ms
-    if (value < 60) {
-        parts.unshift(0); // at least one : is required
-    }
-    else {
-        value = (value - parts[0]) / _60;
-        parts.unshift(value % _60); // minutes
-        if (value >= 60) {
-            value = (value - parts[0]) / _60;
-            parts.unshift(value); // hours
-        }
-    }
-    return (sign +
-        parts
-            .map(n => String(n).padStart(2, '0'))
-            .join(':')
-            .replace(/000000\d*$/, '') // % 60 may introduce error
-    );
-}
-const intTime = {
-    identify: value => typeof value === 'bigint' || Number.isInteger(value),
-    default: true,
-    tag: 'tag:yaml.org,2002:int',
-    format: 'TIME',
-    test: /^[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+$/,
-    resolve: (str, _onError, { intAsBigInt }) => parseSexagesimal(str, intAsBigInt),
-    stringify: stringifySexagesimal
-};
-const floatTime = {
-    identify: value => typeof value === 'number',
-    default: true,
-    tag: 'tag:yaml.org,2002:float',
-    format: 'TIME',
-    test: /^[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\.[0-9_]*$/,
-    resolve: str => parseSexagesimal(str, false),
-    stringify: stringifySexagesimal
-};
-const timestamp = {
-    identify: value => value instanceof Date,
-    default: true,
-    tag: 'tag:yaml.org,2002:timestamp',
-    // If the time zone is omitted, the timestamp is assumed to be specified in UTC. The time part
-    // may be omitted altogether, resulting in a date format. In such a case, the time part is
-    // assumed to be 00:00:00Z (start of day, UTC).
-    test: RegExp('^([0-9]{4})-([0-9]{1,2})-([0-9]{1,2})' + // YYYY-Mm-Dd
-        '(?:' + // time is optional
-        '(?:t|T|[ \\t]+)' + // t | T | whitespace
-        '([0-9]{1,2}):([0-9]{1,2}):([0-9]{1,2}(\\.[0-9]+)?)' + // Hh:Mm:Ss(.ss)?
-        '(?:[ \\t]*(Z|[-+][012]?[0-9](?::[0-9]{2})?))?' + // Z | +5 | -03:30
-        ')?$'),
-    resolve(str) {
-        const match = str.match(timestamp.test);
-        if (!match)
-            throw new Error('!!timestamp expects a date, starting with yyyy-mm-dd');
-        const [, year, month, day, hour, minute, second] = match.map(Number);
-        const millisec = match[7] ? Number((match[7] + '00').substr(1, 3)) : 0;
-        let date = Date.UTC(year, month - 1, day, hour || 0, minute || 0, second || 0, millisec);
-        const tz = match[8];
-        if (tz && tz !== 'Z') {
-            let d = parseSexagesimal(tz, false);
-            if (Math.abs(d) < 30)
-                d *= 60;
-            date -= 60000 * d;
-        }
-        return new Date(date);
-    },
-    stringify: ({ value }) => value?.toISOString().replace(/(T00:00:00)?\.000Z$/, '') ?? ''
-};
-
-exports.floatTime = floatTime;
-exports.intTime = intTime;
-exports.timestamp = timestamp;
-
-
-/***/ }),
-
-/***/ 2889:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-
-const FOLD_FLOW = 'flow';
-const FOLD_BLOCK = 'block';
-const FOLD_QUOTED = 'quoted';
-/**
- * Tries to keep input at up to `lineWidth` characters, splitting only on spaces
- * not followed by newlines or spaces unless `mode` is `'quoted'`. Lines are
- * terminated with `\n` and started with `indent`.
- */
-function foldFlowLines(text, indent, mode = 'flow', { indentAtStart, lineWidth = 80, minContentWidth = 20, onFold, onOverflow } = {}) {
-    if (!lineWidth || lineWidth < 0)
-        return text;
-    if (lineWidth < minContentWidth)
-        minContentWidth = 0;
-    const endStep = Math.max(1 + minContentWidth, 1 + lineWidth - indent.length);
-    if (text.length <= endStep)
-        return text;
-    const folds = [];
-    const escapedFolds = {};
-    let end = lineWidth - indent.length;
-    if (typeof indentAtStart === 'number') {
-        if (indentAtStart > lineWidth - Math.max(2, minContentWidth))
-            folds.push(0);
-        else
-            end = lineWidth - indentAtStart;
-    }
-    let split = undefined;
-    let prev = undefined;
-    let overflow = false;
-    let i = -1;
-    let escStart = -1;
-    let escEnd = -1;
-    if (mode === FOLD_BLOCK) {
-        i = consumeMoreIndentedLines(text, i, indent.length);
-        if (i !== -1)
-            end = i + endStep;
-    }
-    for (let ch; (ch = text[(i += 1)]);) {
-        if (mode === FOLD_QUOTED && ch === '\\') {
-            escStart = i;
-            switch (text[i + 1]) {
-                case 'x':
-                    i += 3;
-                    break;
-                case 'u':
-                    i += 5;
-                    break;
-                case 'U':
-                    i += 9;
-                    break;
-                default:
-                    i += 1;
-            }
-            escEnd = i;
-        }
-        if (ch === '\n') {
-            if (mode === FOLD_BLOCK)
-                i = consumeMoreIndentedLines(text, i, indent.length);
-            end = i + indent.length + endStep;
-            split = undefined;
-        }
-        else {
-            if (ch === ' ' &&
-                prev &&
-                prev !== ' ' &&
-                prev !== '\n' &&
-                prev !== '\t') {
-                // space surrounded by non-space can be replaced with newline + indent
-                const next = text[i + 1];
-                if (next && next !== ' ' && next !== '\n' && next !== '\t')
-                    split = i;
-            }
-            if (i >= end) {
-                if (split) {
-                    folds.push(split);
-                    end = split + endStep;
-                    split = undefined;
-                }
-                else if (mode === FOLD_QUOTED) {
-                    // white-space collected at end may stretch past lineWidth
-                    while (prev === ' ' || prev === '\t') {
-                        prev = ch;
-                        ch = text[(i += 1)];
-                        overflow = true;
-                    }
-                    // Account for newline escape, but don't break preceding escape
-                    const j = i > escEnd + 1 ? i - 2 : escStart - 1;
-                    // Bail out if lineWidth & minContentWidth are shorter than an escape string
-                    if (escapedFolds[j])
-                        return text;
-                    folds.push(j);
-                    escapedFolds[j] = true;
-                    end = j + endStep;
-                    split = undefined;
-                }
-                else {
-                    overflow = true;
-                }
-            }
-        }
-        prev = ch;
-    }
-    if (overflow && onOverflow)
-        onOverflow();
-    if (folds.length === 0)
-        return text;
-    if (onFold)
-        onFold();
-    let res = text.slice(0, folds[0]);
-    for (let i = 0; i < folds.length; ++i) {
-        const fold = folds[i];
-        const end = folds[i + 1] || text.length;
-        if (fold === 0)
-            res = `\n${indent}${text.slice(0, end)}`;
-        else {
-            if (mode === FOLD_QUOTED && escapedFolds[fold])
-                res += `${text[fold]}\\`;
-            res += `\n${indent}${text.slice(fold + 1, end)}`;
-        }
-    }
-    return res;
-}
-/**
- * Presumes `i + 1` is at the start of a line
- * @returns index of last newline in more-indented block
- */
-function consumeMoreIndentedLines(text, i, indent) {
-    let end = i;
-    let start = i + 1;
-    let ch = text[start];
-    while (ch === ' ' || ch === '\t') {
-        if (i < start + indent) {
-            ch = text[++i];
-        }
-        else {
-            do {
-                ch = text[++i];
-            } while (ch && ch !== '\n');
-            end = i;
-            start = i + 1;
-            ch = text[start];
-        }
-    }
-    return end;
-}
-
-exports.FOLD_BLOCK = FOLD_BLOCK;
-exports.FOLD_FLOW = FOLD_FLOW;
-exports.FOLD_QUOTED = FOLD_QUOTED;
-exports.foldFlowLines = foldFlowLines;
-
-
-/***/ }),
-
-/***/ 8409:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var anchors = __nccwpck_require__(8459);
-var identity = __nccwpck_require__(5589);
-var stringifyComment = __nccwpck_require__(5182);
-var stringifyString = __nccwpck_require__(6226);
-
-function createStringifyContext(doc, options) {
-    const opt = Object.assign({
-        blockQuote: true,
-        commentString: stringifyComment.stringifyComment,
-        defaultKeyType: null,
-        defaultStringType: 'PLAIN',
-        directives: null,
-        doubleQuotedAsJSON: false,
-        doubleQuotedMinMultiLineLength: 40,
-        falseStr: 'false',
-        flowCollectionPadding: true,
-        indentSeq: true,
-        lineWidth: 80,
-        minContentWidth: 20,
-        nullStr: 'null',
-        simpleKeys: false,
-        singleQuote: null,
-        trailingComma: false,
-        trueStr: 'true',
-        verifyAliasOrder: true
-    }, doc.schema.toStringOptions, options);
-    let inFlow;
-    switch (opt.collectionStyle) {
-        case 'block':
-            inFlow = false;
-            break;
-        case 'flow':
-            inFlow = true;
-            break;
-        default:
-            inFlow = null;
-    }
-    return {
-        anchors: new Set(),
-        doc,
-        flowCollectionPadding: opt.flowCollectionPadding ? ' ' : '',
-        indent: '',
-        indentStep: typeof opt.indent === 'number' ? ' '.repeat(opt.indent) : '  ',
-        inFlow,
-        options: opt
-    };
-}
-function getTagObject(tags, item) {
-    if (item.tag) {
-        const match = tags.filter(t => t.tag === item.tag);
-        if (match.length > 0)
-            return match.find(t => t.format === item.format) ?? match[0];
-    }
-    let tagObj = undefined;
-    let obj;
-    if (identity.isScalar(item)) {
-        obj = item.value;
-        let match = tags.filter(t => t.identify?.(obj));
-        if (match.length > 1) {
-            const testMatch = match.filter(t => t.test);
-            if (testMatch.length > 0)
-                match = testMatch;
-        }
-        tagObj =
-            match.find(t => t.format === item.format) ?? match.find(t => !t.format);
-    }
-    else {
-        obj = item;
-        tagObj = tags.find(t => t.nodeClass && obj instanceof t.nodeClass);
-    }
-    if (!tagObj) {
-        const name = obj?.constructor?.name ?? (obj === null ? 'null' : typeof obj);
-        throw new Error(`Tag not resolved for ${name} value`);
-    }
-    return tagObj;
-}
-// needs to be called before value stringifier to allow for circular anchor refs
-function stringifyProps(node, tagObj, { anchors: anchors$1, doc }) {
-    if (!doc.directives)
-        return '';
-    const props = [];
-    const anchor = (identity.isScalar(node) || identity.isCollection(node)) && node.anchor;
-    if (anchor && anchors.anchorIsValid(anchor)) {
-        anchors$1.add(anchor);
-        props.push(`&${anchor}`);
-    }
-    const tag = node.tag ?? (tagObj.default ? null : tagObj.tag);
-    if (tag)
-        props.push(doc.directives.tagString(tag));
-    return props.join(' ');
-}
-function stringify(item, ctx, onComment, onChompKeep) {
-    if (identity.isPair(item))
-        return item.toString(ctx, onComment, onChompKeep);
-    if (identity.isAlias(item)) {
-        if (ctx.doc.directives)
-            return item.toString(ctx);
-        if (ctx.resolvedAliases?.has(item)) {
-            throw new TypeError(`Cannot stringify circular structure without alias nodes`);
-        }
-        else {
-            if (ctx.resolvedAliases)
-                ctx.resolvedAliases.add(item);
-            else
-                ctx.resolvedAliases = new Set([item]);
-            item = item.resolve(ctx.doc);
-        }
-    }
-    let tagObj = undefined;
-    const node = identity.isNode(item)
-        ? item
-        : ctx.doc.createNode(item, { onTagObj: o => (tagObj = o) });
-    tagObj ?? (tagObj = getTagObject(ctx.doc.schema.tags, node));
-    const props = stringifyProps(node, tagObj, ctx);
-    if (props.length > 0)
-        ctx.indentAtStart = (ctx.indentAtStart ?? 0) + props.length + 1;
-    const str = typeof tagObj.stringify === 'function'
-        ? tagObj.stringify(node, ctx, onComment, onChompKeep)
-        : identity.isScalar(node)
-            ? stringifyString.stringifyString(node, ctx, onComment, onChompKeep)
-            : node.toString(ctx, onComment, onChompKeep);
-    if (!props)
-        return str;
-    return identity.isScalar(node) || str[0] === '{' || str[0] === '['
-        ? `${props} ${str}`
-        : `${props}\n${ctx.indent}${str}`;
-}
-
-exports.createStringifyContext = createStringifyContext;
-exports.stringify = stringify;
-
-
-/***/ }),
-
-/***/ 2466:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var identity = __nccwpck_require__(5589);
-var stringify = __nccwpck_require__(8409);
-var stringifyComment = __nccwpck_require__(5182);
-
-function stringifyCollection(collection, ctx, options) {
-    const flow = ctx.inFlow ?? collection.flow;
-    const stringify = flow ? stringifyFlowCollection : stringifyBlockCollection;
-    return stringify(collection, ctx, options);
-}
-function stringifyBlockCollection({ comment, items }, ctx, { blockItemPrefix, flowChars, itemIndent, onChompKeep, onComment }) {
-    const { indent, options: { commentString } } = ctx;
-    const itemCtx = Object.assign({}, ctx, { indent: itemIndent, type: null });
-    let chompKeep = false; // flag for the preceding node's status
-    const lines = [];
-    for (let i = 0; i < items.length; ++i) {
-        const item = items[i];
-        let comment = null;
-        if (identity.isNode(item)) {
-            if (!chompKeep && item.spaceBefore)
-                lines.push('');
-            addCommentBefore(ctx, lines, item.commentBefore, chompKeep);
-            if (item.comment)
-                comment = item.comment;
-        }
-        else if (identity.isPair(item)) {
-            const ik = identity.isNode(item.key) ? item.key : null;
-            if (ik) {
-                if (!chompKeep && ik.spaceBefore)
-                    lines.push('');
-                addCommentBefore(ctx, lines, ik.commentBefore, chompKeep);
-            }
-        }
-        chompKeep = false;
-        let str = stringify.stringify(item, itemCtx, () => (comment = null), () => (chompKeep = true));
-        if (comment)
-            str += stringifyComment.lineComment(str, itemIndent, commentString(comment));
-        if (chompKeep && comment)
-            chompKeep = false;
-        lines.push(blockItemPrefix + str);
-    }
-    let str;
-    if (lines.length === 0) {
-        str = flowChars.start + flowChars.end;
-    }
-    else {
-        str = lines[0];
-        for (let i = 1; i < lines.length; ++i) {
-            const line = lines[i];
-            str += line ? `\n${indent}${line}` : '\n';
-        }
-    }
-    if (comment) {
-        str += '\n' + stringifyComment.indentComment(commentString(comment), indent);
-        if (onComment)
-            onComment();
-    }
-    else if (chompKeep && onChompKeep)
-        onChompKeep();
-    return str;
-}
-function stringifyFlowCollection({ items }, ctx, { flowChars, itemIndent }) {
-    const { indent, indentStep, flowCollectionPadding: fcPadding, options: { commentString } } = ctx;
-    itemIndent += indentStep;
-    const itemCtx = Object.assign({}, ctx, {
-        indent: itemIndent,
-        inFlow: true,
-        type: null
-    });
-    let reqNewline = false;
-    let linesAtValue = 0;
-    const lines = [];
-    for (let i = 0; i < items.length; ++i) {
-        const item = items[i];
-        let comment = null;
-        if (identity.isNode(item)) {
-            if (item.spaceBefore)
-                lines.push('');
-            addCommentBefore(ctx, lines, item.commentBefore, false);
-            if (item.comment)
-                comment = item.comment;
-        }
-        else if (identity.isPair(item)) {
-            const ik = identity.isNode(item.key) ? item.key : null;
-            if (ik) {
-                if (ik.spaceBefore)
-                    lines.push('');
-                addCommentBefore(ctx, lines, ik.commentBefore, false);
-                if (ik.comment)
-                    reqNewline = true;
-            }
-            const iv = identity.isNode(item.value) ? item.value : null;
-            if (iv) {
-                if (iv.comment)
-                    comment = iv.comment;
-                if (iv.commentBefore)
-                    reqNewline = true;
-            }
-            else if (item.value == null && ik?.comment) {
-                comment = ik.comment;
-            }
-        }
-        if (comment)
-            reqNewline = true;
-        let str = stringify.stringify(item, itemCtx, () => (comment = null));
-        reqNewline || (reqNewline = lines.length > linesAtValue || str.includes('\n'));
-        if (i < items.length - 1) {
-            str += ',';
-        }
-        else if (ctx.options.trailingComma) {
-            if (ctx.options.lineWidth > 0) {
-                reqNewline || (reqNewline = lines.reduce((sum, line) => sum + line.length + 2, 2) +
-                    (str.length + 2) >
-                    ctx.options.lineWidth);
-            }
-            if (reqNewline) {
-                str += ',';
-            }
-        }
-        if (comment)
-            str += stringifyComment.lineComment(str, itemIndent, commentString(comment));
-        lines.push(str);
-        linesAtValue = lines.length;
-    }
-    const { start, end } = flowChars;
-    if (lines.length === 0) {
-        return start + end;
-    }
-    else {
-        if (!reqNewline) {
-            const len = lines.reduce((sum, line) => sum + line.length + 2, 2);
-            reqNewline = ctx.options.lineWidth > 0 && len > ctx.options.lineWidth;
-        }
-        if (reqNewline) {
-            let str = start;
-            for (const line of lines)
-                str += line ? `\n${indentStep}${indent}${line}` : '\n';
-            return `${str}\n${indent}${end}`;
-        }
-        else {
-            return `${start}${fcPadding}${lines.join(' ')}${fcPadding}${end}`;
-        }
-    }
-}
-function addCommentBefore({ indent, options: { commentString } }, lines, comment, chompKeep) {
-    if (comment && chompKeep)
-        comment = comment.replace(/^\n+/, '');
-    if (comment) {
-        const ic = stringifyComment.indentComment(commentString(comment), indent);
-        lines.push(ic.trimStart()); // Avoid double indent on first line
-    }
-}
-
-exports.stringifyCollection = stringifyCollection;
-
-
-/***/ }),
-
-/***/ 5182:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-
-/**
- * Stringifies a comment.
- *
- * Empty comment lines are left empty,
- * lines consisting of a single space are replaced by `#`,
- * and all other lines are prefixed with a `#`.
- */
-const stringifyComment = (str) => str.replace(/^(?!$)(?: $)?/gm, '#');
-function indentComment(comment, indent) {
-    if (/^\n+$/.test(comment))
-        return comment.substring(1);
-    return indent ? comment.replace(/^(?! *$)/gm, indent) : comment;
-}
-const lineComment = (str, indent, comment) => str.endsWith('\n')
-    ? indentComment(comment, indent)
-    : comment.includes('\n')
-        ? '\n' + indentComment(comment, indent)
-        : (str.endsWith(' ') ? '' : ' ') + comment;
-
-exports.indentComment = indentComment;
-exports.lineComment = lineComment;
-exports.stringifyComment = stringifyComment;
-
-
-/***/ }),
-
-/***/ 5225:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var identity = __nccwpck_require__(5589);
-var stringify = __nccwpck_require__(8409);
-var stringifyComment = __nccwpck_require__(5182);
-
-function stringifyDocument(doc, options) {
-    const lines = [];
-    let hasDirectives = options.directives === true;
-    if (options.directives !== false && doc.directives) {
-        const dir = doc.directives.toString(doc);
-        if (dir) {
-            lines.push(dir);
-            hasDirectives = true;
-        }
-        else if (doc.directives.docStart)
-            hasDirectives = true;
-    }
-    if (hasDirectives)
-        lines.push('---');
-    const ctx = stringify.createStringifyContext(doc, options);
-    const { commentString } = ctx.options;
-    if (doc.commentBefore) {
-        if (lines.length !== 1)
-            lines.unshift('');
-        const cs = commentString(doc.commentBefore);
-        lines.unshift(stringifyComment.indentComment(cs, ''));
-    }
-    let chompKeep = false;
-    let contentComment = null;
-    if (doc.contents) {
-        if (identity.isNode(doc.contents)) {
-            if (doc.contents.spaceBefore && hasDirectives)
-                lines.push('');
-            if (doc.contents.commentBefore) {
-                const cs = commentString(doc.contents.commentBefore);
-                lines.push(stringifyComment.indentComment(cs, ''));
-            }
-            // top-level block scalars need to be indented if followed by a comment
-            ctx.forceBlockIndent = !!doc.comment;
-            contentComment = doc.contents.comment;
-        }
-        const onChompKeep = contentComment ? undefined : () => (chompKeep = true);
-        let body = stringify.stringify(doc.contents, ctx, () => (contentComment = null), onChompKeep);
-        if (contentComment)
-            body += stringifyComment.lineComment(body, '', commentString(contentComment));
-        if ((body[0] === '|' || body[0] === '>') &&
-            lines[lines.length - 1] === '---') {
-            // Top-level block scalars with a preceding doc marker ought to use the
-            // same line for their header.
-            lines[lines.length - 1] = `--- ${body}`;
-        }
-        else
-            lines.push(body);
-    }
-    else {
-        lines.push(stringify.stringify(doc.contents, ctx));
-    }
-    if (doc.directives?.docEnd) {
-        if (doc.comment) {
-            const cs = commentString(doc.comment);
-            if (cs.includes('\n')) {
-                lines.push('...');
-                lines.push(stringifyComment.indentComment(cs, ''));
-            }
-            else {
-                lines.push(`... ${cs}`);
-            }
-        }
-        else {
-            lines.push('...');
-        }
-    }
-    else {
-        let dc = doc.comment;
-        if (dc && chompKeep)
-            dc = dc.replace(/^\n+/, '');
-        if (dc) {
-            if ((!chompKeep || contentComment) && lines[lines.length - 1] !== '')
-                lines.push('');
-            lines.push(stringifyComment.indentComment(commentString(dc), ''));
-        }
-    }
-    return lines.join('\n') + '\n';
-}
-
-exports.stringifyDocument = stringifyDocument;
-
-
-/***/ }),
-
-/***/ 4174:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-
-function stringifyNumber({ format, minFractionDigits, tag, value }) {
-    if (typeof value === 'bigint')
-        return String(value);
-    const num = typeof value === 'number' ? value : Number(value);
-    if (!isFinite(num))
-        return isNaN(num) ? '.nan' : num < 0 ? '-.inf' : '.inf';
-    let n = Object.is(value, -0) ? '-0' : JSON.stringify(value);
-    if (!format &&
-        minFractionDigits &&
-        (!tag || tag === 'tag:yaml.org,2002:float') &&
-        /^-?\d/.test(n) &&
-        !n.includes('e')) {
-        let i = n.indexOf('.');
-        if (i < 0) {
-            i = n.length;
-            n += '.';
-        }
-        let d = minFractionDigits - (n.length - i - 1);
-        while (d-- > 0)
-            n += '0';
-    }
-    return n;
-}
-
-exports.stringifyNumber = stringifyNumber;
-
-
-/***/ }),
-
-/***/ 4875:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var identity = __nccwpck_require__(5589);
-var Scalar = __nccwpck_require__(9338);
-var stringify = __nccwpck_require__(8409);
-var stringifyComment = __nccwpck_require__(5182);
-
-function stringifyPair({ key, value }, ctx, onComment, onChompKeep) {
-    const { allNullValues, doc, indent, indentStep, options: { commentString, indentSeq, simpleKeys } } = ctx;
-    let keyComment = (identity.isNode(key) && key.comment) || null;
-    if (simpleKeys) {
-        if (keyComment) {
-            throw new Error('With simple keys, key nodes cannot have comments');
-        }
-        if (identity.isCollection(key) || (!identity.isNode(key) && typeof key === 'object')) {
-            const msg = 'With simple keys, collection cannot be used as a key value';
-            throw new Error(msg);
-        }
-    }
-    let explicitKey = !simpleKeys &&
-        (!key ||
-            (keyComment && value == null && !ctx.inFlow) ||
-            identity.isCollection(key) ||
-            (identity.isScalar(key)
-                ? key.type === Scalar.Scalar.BLOCK_FOLDED || key.type === Scalar.Scalar.BLOCK_LITERAL
-                : typeof key === 'object'));
-    ctx = Object.assign({}, ctx, {
-        allNullValues: false,
-        implicitKey: !explicitKey && (simpleKeys || !allNullValues),
-        indent: indent + indentStep
-    });
-    let keyCommentDone = false;
-    let chompKeep = false;
-    let str = stringify.stringify(key, ctx, () => (keyCommentDone = true), () => (chompKeep = true));
-    if (!explicitKey && !ctx.inFlow && str.length > 1024) {
-        if (simpleKeys)
-            throw new Error('With simple keys, single line scalar must not span more than 1024 characters');
-        explicitKey = true;
-    }
-    if (ctx.inFlow) {
-        if (allNullValues || value == null) {
-            if (keyCommentDone && onComment)
-                onComment();
-            return str === '' ? '?' : explicitKey ? `? ${str}` : str;
-        }
-    }
-    else if ((allNullValues && !simpleKeys) || (value == null && explicitKey)) {
-        str = `? ${str}`;
-        if (keyComment && !keyCommentDone) {
-            str += stringifyComment.lineComment(str, ctx.indent, commentString(keyComment));
-        }
-        else if (chompKeep && onChompKeep)
-            onChompKeep();
-        return str;
-    }
-    if (keyCommentDone)
-        keyComment = null;
-    if (explicitKey) {
-        if (keyComment)
-            str += stringifyComment.lineComment(str, ctx.indent, commentString(keyComment));
-        str = `? ${str}\n${indent}:`;
-    }
-    else {
-        str = `${str}:`;
-        if (keyComment)
-            str += stringifyComment.lineComment(str, ctx.indent, commentString(keyComment));
-    }
-    let vsb, vcb, valueComment;
-    if (identity.isNode(value)) {
-        vsb = !!value.spaceBefore;
-        vcb = value.commentBefore;
-        valueComment = value.comment;
-    }
-    else {
-        vsb = false;
-        vcb = null;
-        valueComment = null;
-        if (value && typeof value === 'object')
-            value = doc.createNode(value);
-    }
-    ctx.implicitKey = false;
-    if (!explicitKey && !keyComment && identity.isScalar(value))
-        ctx.indentAtStart = str.length + 1;
-    chompKeep = false;
-    if (!indentSeq &&
-        indentStep.length >= 2 &&
-        !ctx.inFlow &&
-        !explicitKey &&
-        identity.isSeq(value) &&
-        !value.flow &&
-        !value.tag &&
-        !value.anchor) {
-        // If indentSeq === false, consider '- ' as part of indentation where possible
-        ctx.indent = ctx.indent.substring(2);
-    }
-    let valueCommentDone = false;
-    const valueStr = stringify.stringify(value, ctx, () => (valueCommentDone = true), () => (chompKeep = true));
-    let ws = ' ';
-    if (keyComment || vsb || vcb) {
-        ws = vsb ? '\n' : '';
-        if (vcb) {
-            const cs = commentString(vcb);
-            ws += `\n${stringifyComment.indentComment(cs, ctx.indent)}`;
-        }
-        if (valueStr === '' && !ctx.inFlow) {
-            if (ws === '\n' && valueComment)
-                ws = '\n\n';
-        }
-        else {
-            ws += `\n${ctx.indent}`;
-        }
-    }
-    else if (!explicitKey && identity.isCollection(value)) {
-        const vs0 = valueStr[0];
-        const nl0 = valueStr.indexOf('\n');
-        const hasNewline = nl0 !== -1;
-        const flow = ctx.inFlow ?? value.flow ?? value.items.length === 0;
-        if (hasNewline || !flow) {
-            let hasPropsLine = false;
-            if (hasNewline && (vs0 === '&' || vs0 === '!')) {
-                let sp0 = valueStr.indexOf(' ');
-                if (vs0 === '&' &&
-                    sp0 !== -1 &&
-                    sp0 < nl0 &&
-                    valueStr[sp0 + 1] === '!') {
-                    sp0 = valueStr.indexOf(' ', sp0 + 1);
-                }
-                if (sp0 === -1 || nl0 < sp0)
-                    hasPropsLine = true;
-            }
-            if (!hasPropsLine)
-                ws = `\n${ctx.indent}`;
-        }
-    }
-    else if (valueStr === '' || valueStr[0] === '\n') {
-        ws = '';
-    }
-    str += ws + valueStr;
-    if (ctx.inFlow) {
-        if (valueCommentDone && onComment)
-            onComment();
-    }
-    else if (valueComment && !valueCommentDone) {
-        str += stringifyComment.lineComment(str, ctx.indent, commentString(valueComment));
-    }
-    else if (chompKeep && onChompKeep) {
-        onChompKeep();
-    }
-    return str;
-}
-
-exports.stringifyPair = stringifyPair;
-
-
-/***/ }),
-
-/***/ 6226:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var Scalar = __nccwpck_require__(9338);
-var foldFlowLines = __nccwpck_require__(2889);
-
-const getFoldOptions = (ctx, isBlock) => ({
-    indentAtStart: isBlock ? ctx.indent.length : ctx.indentAtStart,
-    lineWidth: ctx.options.lineWidth,
-    minContentWidth: ctx.options.minContentWidth
-});
-// Also checks for lines starting with %, as parsing the output as YAML 1.1 will
-// presume that's starting a new document.
-const containsDocumentMarker = (str) => /^(%|---|\.\.\.)/m.test(str);
-function lineLengthOverLimit(str, lineWidth, indentLength) {
-    if (!lineWidth || lineWidth < 0)
-        return false;
-    const limit = lineWidth - indentLength;
-    const strLen = str.length;
-    if (strLen <= limit)
-        return false;
-    for (let i = 0, start = 0; i < strLen; ++i) {
-        if (str[i] === '\n') {
-            if (i - start > limit)
-                return true;
-            start = i + 1;
-            if (strLen - start <= limit)
-                return false;
-        }
-    }
-    return true;
-}
-function doubleQuotedString(value, ctx) {
-    const json = JSON.stringify(value);
-    if (ctx.options.doubleQuotedAsJSON)
-        return json;
-    const { implicitKey } = ctx;
-    const minMultiLineLength = ctx.options.doubleQuotedMinMultiLineLength;
-    const indent = ctx.indent || (containsDocumentMarker(value) ? '  ' : '');
-    let str = '';
-    let start = 0;
-    for (let i = 0, ch = json[i]; ch; ch = json[++i]) {
-        if (ch === ' ' && json[i + 1] === '\\' && json[i + 2] === 'n') {
-            // space before newline needs to be escaped to not be folded
-            str += json.slice(start, i) + '\\ ';
-            i += 1;
-            start = i;
-            ch = '\\';
-        }
-        if (ch === '\\')
-            switch (json[i + 1]) {
-                case 'u':
-                    {
-                        str += json.slice(start, i);
-                        const code = json.substr(i + 2, 4);
-                        switch (code) {
-                            case '0000':
-                                str += '\\0';
-                                break;
-                            case '0007':
-                                str += '\\a';
-                                break;
-                            case '000b':
-                                str += '\\v';
-                                break;
-                            case '001b':
-                                str += '\\e';
-                                break;
-                            case '0085':
-                                str += '\\N';
-                                break;
-                            case '00a0':
-                                str += '\\_';
-                                break;
-                            case '2028':
-                                str += '\\L';
-                                break;
-                            case '2029':
-                                str += '\\P';
-                                break;
-                            default:
-                                if (code.substr(0, 2) === '00')
-                                    str += '\\x' + code.substr(2);
-                                else
-                                    str += json.substr(i, 6);
-                        }
-                        i += 5;
-                        start = i + 1;
-                    }
-                    break;
-                case 'n':
-                    if (implicitKey ||
-                        json[i + 2] === '"' ||
-                        json.length < minMultiLineLength) {
-                        i += 1;
-                    }
-                    else {
-                        // folding will eat first newline
-                        str += json.slice(start, i) + '\n\n';
-                        while (json[i + 2] === '\\' &&
-                            json[i + 3] === 'n' &&
-                            json[i + 4] !== '"') {
-                            str += '\n';
-                            i += 2;
-                        }
-                        str += indent;
-                        // space after newline needs to be escaped to not be folded
-                        if (json[i + 2] === ' ')
-                            str += '\\';
-                        i += 1;
-                        start = i + 1;
-                    }
-                    break;
-                default:
-                    i += 1;
-            }
-    }
-    str = start ? str + json.slice(start) : json;
-    return implicitKey
-        ? str
-        : foldFlowLines.foldFlowLines(str, indent, foldFlowLines.FOLD_QUOTED, getFoldOptions(ctx, false));
-}
-function singleQuotedString(value, ctx) {
-    if (ctx.options.singleQuote === false ||
-        (ctx.implicitKey && value.includes('\n')) ||
-        /[ \t]\n|\n[ \t]/.test(value) // single quoted string can't have leading or trailing whitespace around newline
-    )
-        return doubleQuotedString(value, ctx);
-    const indent = ctx.indent || (containsDocumentMarker(value) ? '  ' : '');
-    const res = "'" + value.replace(/'/g, "''").replace(/\n+/g, `$&\n${indent}`) + "'";
-    return ctx.implicitKey
-        ? res
-        : foldFlowLines.foldFlowLines(res, indent, foldFlowLines.FOLD_FLOW, getFoldOptions(ctx, false));
-}
-function quotedString(value, ctx) {
-    const { singleQuote } = ctx.options;
-    let qs;
-    if (singleQuote === false)
-        qs = doubleQuotedString;
-    else {
-        const hasDouble = value.includes('"');
-        const hasSingle = value.includes("'");
-        if (hasDouble && !hasSingle)
-            qs = singleQuotedString;
-        else if (hasSingle && !hasDouble)
-            qs = doubleQuotedString;
-        else
-            qs = singleQuote ? singleQuotedString : doubleQuotedString;
-    }
-    return qs(value, ctx);
-}
-// The negative lookbehind avoids a polynomial search,
-// but isn't supported yet on Safari: https://caniuse.com/js-regexp-lookbehind
-let blockEndNewlines;
-try {
-    blockEndNewlines = new RegExp('(^|(?<!\n))\n+(?!\n|$)', 'g');
-}
-catch {
-    blockEndNewlines = /\n+(?!\n|$)/g;
-}
-function blockString({ comment, type, value }, ctx, onComment, onChompKeep) {
-    const { blockQuote, commentString, lineWidth } = ctx.options;
-    // 1. Block can't end in whitespace unless the last line is non-empty.
-    // 2. Strings consisting of only whitespace are best rendered explicitly.
-    if (!blockQuote || /\n[\t ]+$/.test(value)) {
-        return quotedString(value, ctx);
-    }
-    const indent = ctx.indent ||
-        (ctx.forceBlockIndent || containsDocumentMarker(value) ? '  ' : '');
-    const literal = blockQuote === 'literal'
-        ? true
-        : blockQuote === 'folded' || type === Scalar.Scalar.BLOCK_FOLDED
-            ? false
-            : type === Scalar.Scalar.BLOCK_LITERAL
-                ? true
-                : !lineLengthOverLimit(value, lineWidth, indent.length);
-    if (!value)
-        return literal ? '|\n' : '>\n';
-    // determine chomping from whitespace at value end
-    let chomp;
-    let endStart;
-    for (endStart = value.length; endStart > 0; --endStart) {
-        const ch = value[endStart - 1];
-        if (ch !== '\n' && ch !== '\t' && ch !== ' ')
-            break;
-    }
-    let end = value.substring(endStart);
-    const endNlPos = end.indexOf('\n');
-    if (endNlPos === -1) {
-        chomp = '-'; // strip
-    }
-    else if (value === end || endNlPos !== end.length - 1) {
-        chomp = '+'; // keep
-        if (onChompKeep)
-            onChompKeep();
-    }
-    else {
-        chomp = ''; // clip
-    }
-    if (end) {
-        value = value.slice(0, -end.length);
-        if (end[end.length - 1] === '\n')
-            end = end.slice(0, -1);
-        end = end.replace(blockEndNewlines, `$&${indent}`);
-    }
-    // determine indent indicator from whitespace at value start
-    let startWithSpace = false;
-    let startEnd;
-    let startNlPos = -1;
-    for (startEnd = 0; startEnd < value.length; ++startEnd) {
-        const ch = value[startEnd];
-        if (ch === ' ')
-            startWithSpace = true;
-        else if (ch === '\n')
-            startNlPos = startEnd;
-        else
-            break;
-    }
-    let start = value.substring(0, startNlPos < startEnd ? startNlPos + 1 : startEnd);
-    if (start) {
-        value = value.substring(start.length);
-        start = start.replace(/\n+/g, `$&${indent}`);
-    }
-    const indentSize = indent ? '2' : '1'; // root is at -1
-    // Leading | or > is added later
-    let header = (startWithSpace ? indentSize : '') + chomp;
-    if (comment) {
-        header += ' ' + commentString(comment.replace(/ ?[\r\n]+/g, ' '));
-        if (onComment)
-            onComment();
-    }
-    if (!literal) {
-        const foldedValue = value
-            .replace(/\n+/g, '\n$&')
-            .replace(/(?:^|\n)([\t ].*)(?:([\n\t ]*)\n(?![\n\t ]))?/g, '$1$2') // more-indented lines aren't folded
-            //                ^ more-ind. ^ empty     ^ capture next empty lines only at end of indent
-            .replace(/\n+/g, `$&${indent}`);
-        let literalFallback = false;
-        const foldOptions = getFoldOptions(ctx, true);
-        if (blockQuote !== 'folded' && type !== Scalar.Scalar.BLOCK_FOLDED) {
-            foldOptions.onOverflow = () => {
-                literalFallback = true;
-            };
-        }
-        const body = foldFlowLines.foldFlowLines(`${start}${foldedValue}${end}`, indent, foldFlowLines.FOLD_BLOCK, foldOptions);
-        if (!literalFallback)
-            return `>${header}\n${indent}${body}`;
-    }
-    value = value.replace(/\n+/g, `$&${indent}`);
-    return `|${header}\n${indent}${start}${value}${end}`;
-}
-function plainString(item, ctx, onComment, onChompKeep) {
-    const { type, value } = item;
-    const { actualString, implicitKey, indent, indentStep, inFlow } = ctx;
-    if ((implicitKey && value.includes('\n')) ||
-        (inFlow && /[[\]{},]/.test(value))) {
-        return quotedString(value, ctx);
-    }
-    if (/^[\n\t ,[\]{}#&*!|>'"%@`]|^[?-]$|^[?-][ \t]|[\n:][ \t]|[ \t]\n|[\n\t ]#|[\n\t :]$/.test(value)) {
-        // not allowed:
-        // - '-' or '?'
-        // - start with an indicator character (except [?:-]) or /[?-] /
-        // - '\n ', ': ' or ' \n' anywhere
-        // - '#' not preceded by a non-space char
-        // - end with ' ' or ':'
-        return implicitKey || inFlow || !value.includes('\n')
-            ? quotedString(value, ctx)
-            : blockString(item, ctx, onComment, onChompKeep);
-    }
-    if (!implicitKey &&
-        !inFlow &&
-        type !== Scalar.Scalar.PLAIN &&
-        value.includes('\n')) {
-        // Where allowed & type not set explicitly, prefer block style for multiline strings
-        return blockString(item, ctx, onComment, onChompKeep);
-    }
-    if (containsDocumentMarker(value)) {
-        if (indent === '') {
-            ctx.forceBlockIndent = true;
-            return blockString(item, ctx, onComment, onChompKeep);
-        }
-        else if (implicitKey && indent === indentStep) {
-            return quotedString(value, ctx);
-        }
-    }
-    const str = value.replace(/\n+/g, `$&\n${indent}`);
-    // Verify that output will be parsed as a string, as e.g. plain numbers and
-    // booleans get parsed with those types in v1.2 (e.g. '42', 'true' & '0.9e-3'),
-    // and others in v1.1.
-    if (actualString) {
-        const test = (tag) => tag.default && tag.tag !== 'tag:yaml.org,2002:str' && tag.test?.test(str);
-        const { compat, tags } = ctx.doc.schema;
-        if (tags.some(test) || compat?.some(test))
-            return quotedString(value, ctx);
-    }
-    return implicitKey
-        ? str
-        : foldFlowLines.foldFlowLines(str, indent, foldFlowLines.FOLD_FLOW, getFoldOptions(ctx, false));
-}
-function stringifyString(item, ctx, onComment, onChompKeep) {
-    const { implicitKey, inFlow } = ctx;
-    const ss = typeof item.value === 'string'
-        ? item
-        : Object.assign({}, item, { value: String(item.value) });
-    let { type } = item;
-    if (type !== Scalar.Scalar.QUOTE_DOUBLE) {
-        // force double quotes on control characters & unpaired surrogates
-        if (/[\x00-\x08\x0b-\x1f\x7f-\x9f\u{D800}-\u{DFFF}]/u.test(ss.value))
-            type = Scalar.Scalar.QUOTE_DOUBLE;
-    }
-    const _stringify = (_type) => {
-        switch (_type) {
-            case Scalar.Scalar.BLOCK_FOLDED:
-            case Scalar.Scalar.BLOCK_LITERAL:
-                return implicitKey || inFlow
-                    ? quotedString(ss.value, ctx) // blocks are not valid inside flow containers
-                    : blockString(ss, ctx, onComment, onChompKeep);
-            case Scalar.Scalar.QUOTE_DOUBLE:
-                return doubleQuotedString(ss.value, ctx);
-            case Scalar.Scalar.QUOTE_SINGLE:
-                return singleQuotedString(ss.value, ctx);
-            case Scalar.Scalar.PLAIN:
-                return plainString(ss, ctx, onComment, onChompKeep);
-            default:
-                return null;
-        }
-    };
-    let res = _stringify(type);
-    if (res === null) {
-        const { defaultKeyType, defaultStringType } = ctx.options;
-        const t = (implicitKey && defaultKeyType) || defaultStringType;
-        res = _stringify(t);
-        if (res === null)
-            throw new Error(`Unsupported default string type ${t}`);
-    }
-    return res;
-}
-
-exports.stringifyString = stringifyString;
-
-
-/***/ }),
-
-/***/ 6796:
-/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
-
-"use strict";
-
-
-var identity = __nccwpck_require__(5589);
-
-const BREAK = Symbol('break visit');
-const SKIP = Symbol('skip children');
-const REMOVE = Symbol('remove node');
-/**
- * Apply a visitor to an AST node or document.
- *
- * Walks through the tree (depth-first) starting from `node`, calling a
- * `visitor` function with three arguments:
- *   - `key`: For sequence values and map `Pair`, the node's index in the
- *     collection. Within a `Pair`, `'key'` or `'value'`, correspondingly.
- *     `null` for the root node.
- *   - `node`: The current node.
- *   - `path`: The ancestry of the current node.
- *
- * The return value of the visitor may be used to control the traversal:
- *   - `undefined` (default): Do nothing and continue
- *   - `visit.SKIP`: Do not visit the children of this node, continue with next
- *     sibling
- *   - `visit.BREAK`: Terminate traversal completely
- *   - `visit.REMOVE`: Remove the current node, then continue with the next one
- *   - `Node`: Replace the current node, then continue by visiting it
- *   - `number`: While iterating the items of a sequence or map, set the index
- *     of the next step. This is useful especially if the index of the current
- *     node has changed.
- *
- * If `visitor` is a single function, it will be called with all values
- * encountered in the tree, including e.g. `null` values. Alternatively,
- * separate visitor functions may be defined for each `Map`, `Pair`, `Seq`,
- * `Alias` and `Scalar` node. To define the same visitor function for more than
- * one node type, use the `Collection` (map and seq), `Value` (map, seq & scalar)
- * and `Node` (alias, map, seq & scalar) targets. Of all these, only the most
- * specific defined one will be used for each node.
- */
-function visit(node, visitor) {
-    const visitor_ = initVisitor(visitor);
-    if (identity.isDocument(node)) {
-        const cd = visit_(null, node.contents, visitor_, Object.freeze([node]));
-        if (cd === REMOVE)
-            node.contents = null;
-    }
-    else
-        visit_(null, node, visitor_, Object.freeze([]));
-}
-// Without the `as symbol` casts, TS declares these in the `visit`
-// namespace using `var`, but then complains about that because
-// `unique symbol` must be `const`.
-/** Terminate visit traversal completely */
-visit.BREAK = BREAK;
-/** Do not visit the children of the current node */
-visit.SKIP = SKIP;
-/** Remove the current node */
-visit.REMOVE = REMOVE;
-function visit_(key, node, visitor, path) {
-    const ctrl = callVisitor(key, node, visitor, path);
-    if (identity.isNode(ctrl) || identity.isPair(ctrl)) {
-        replaceNode(key, path, ctrl);
-        return visit_(key, ctrl, visitor, path);
-    }
-    if (typeof ctrl !== 'symbol') {
-        if (identity.isCollection(node)) {
-            path = Object.freeze(path.concat(node));
-            for (let i = 0; i < node.items.length; ++i) {
-                const ci = visit_(i, node.items[i], visitor, path);
-                if (typeof ci === 'number')
-                    i = ci - 1;
-                else if (ci === BREAK)
-                    return BREAK;
-                else if (ci === REMOVE) {
-                    node.items.splice(i, 1);
-                    i -= 1;
-                }
-            }
-        }
-        else if (identity.isPair(node)) {
-            path = Object.freeze(path.concat(node));
-            const ck = visit_('key', node.key, visitor, path);
-            if (ck === BREAK)
-                return BREAK;
-            else if (ck === REMOVE)
-                node.key = null;
-            const cv = visit_('value', node.value, visitor, path);
-            if (cv === BREAK)
-                return BREAK;
-            else if (cv === REMOVE)
-                node.value = null;
-        }
-    }
-    return ctrl;
-}
-/**
- * Apply an async visitor to an AST node or document.
- *
- * Walks through the tree (depth-first) starting from `node`, calling a
- * `visitor` function with three arguments:
- *   - `key`: For sequence values and map `Pair`, the node's index in the
- *     collection. Within a `Pair`, `'key'` or `'value'`, correspondingly.
- *     `null` for the root node.
- *   - `node`: The current node.
- *   - `path`: The ancestry of the current node.
- *
- * The return value of the visitor may be used to control the traversal:
- *   - `Promise`: Must resolve to one of the following values
- *   - `undefined` (default): Do nothing and continue
- *   - `visit.SKIP`: Do not visit the children of this node, continue with next
- *     sibling
- *   - `visit.BREAK`: Terminate traversal completely
- *   - `visit.REMOVE`: Remove the current node, then continue with the next one
- *   - `Node`: Replace the current node, then continue by visiting it
- *   - `number`: While iterating the items of a sequence or map, set the index
- *     of the next step. This is useful especially if the index of the current
- *     node has changed.
- *
- * If `visitor` is a single function, it will be called with all values
- * encountered in the tree, including e.g. `null` values. Alternatively,
- * separate visitor functions may be defined for each `Map`, `Pair`, `Seq`,
- * `Alias` and `Scalar` node. To define the same visitor function for more than
- * one node type, use the `Collection` (map and seq), `Value` (map, seq & scalar)
- * and `Node` (alias, map, seq & scalar) targets. Of all these, only the most
- * specific defined one will be used for each node.
- */
-async function visitAsync(node, visitor) {
-    const visitor_ = initVisitor(visitor);
-    if (identity.isDocument(node)) {
-        const cd = await visitAsync_(null, node.contents, visitor_, Object.freeze([node]));
-        if (cd === REMOVE)
-            node.contents = null;
-    }
-    else
-        await visitAsync_(null, node, visitor_, Object.freeze([]));
-}
-// Without the `as symbol` casts, TS declares these in the `visit`
-// namespace using `var`, but then complains about that because
-// `unique symbol` must be `const`.
-/** Terminate visit traversal completely */
-visitAsync.BREAK = BREAK;
-/** Do not visit the children of the current node */
-visitAsync.SKIP = SKIP;
-/** Remove the current node */
-visitAsync.REMOVE = REMOVE;
-async function visitAsync_(key, node, visitor, path) {
-    const ctrl = await callVisitor(key, node, visitor, path);
-    if (identity.isNode(ctrl) || identity.isPair(ctrl)) {
-        replaceNode(key, path, ctrl);
-        return visitAsync_(key, ctrl, visitor, path);
-    }
-    if (typeof ctrl !== 'symbol') {
-        if (identity.isCollection(node)) {
-            path = Object.freeze(path.concat(node));
-            for (let i = 0; i < node.items.length; ++i) {
-                const ci = await visitAsync_(i, node.items[i], visitor, path);
-                if (typeof ci === 'number')
-                    i = ci - 1;
-                else if (ci === BREAK)
-                    return BREAK;
-                else if (ci === REMOVE) {
-                    node.items.splice(i, 1);
-                    i -= 1;
-                }
-            }
-        }
-        else if (identity.isPair(node)) {
-            path = Object.freeze(path.concat(node));
-            const ck = await visitAsync_('key', node.key, visitor, path);
-            if (ck === BREAK)
-                return BREAK;
-            else if (ck === REMOVE)
-                node.key = null;
-            const cv = await visitAsync_('value', node.value, visitor, path);
-            if (cv === BREAK)
-                return BREAK;
-            else if (cv === REMOVE)
-                node.value = null;
-        }
-    }
-    return ctrl;
-}
-function initVisitor(visitor) {
-    if (typeof visitor === 'object' &&
-        (visitor.Collection || visitor.Node || visitor.Value)) {
-        return Object.assign({
-            Alias: visitor.Node,
-            Map: visitor.Node,
-            Scalar: visitor.Node,
-            Seq: visitor.Node
-        }, visitor.Value && {
-            Map: visitor.Value,
-            Scalar: visitor.Value,
-            Seq: visitor.Value
-        }, visitor.Collection && {
-            Map: visitor.Collection,
-            Seq: visitor.Collection
-        }, visitor);
-    }
-    return visitor;
-}
-function callVisitor(key, node, visitor, path) {
-    if (typeof visitor === 'function')
-        return visitor(key, node, path);
-    if (identity.isMap(node))
-        return visitor.Map?.(key, node, path);
-    if (identity.isSeq(node))
-        return visitor.Seq?.(key, node, path);
-    if (identity.isPair(node))
-        return visitor.Pair?.(key, node, path);
-    if (identity.isScalar(node))
-        return visitor.Scalar?.(key, node, path);
-    if (identity.isAlias(node))
-        return visitor.Alias?.(key, node, path);
-    return undefined;
-}
-function replaceNode(key, path, node) {
-    const parent = path[path.length - 1];
-    if (identity.isCollection(parent)) {
-        parent.items[key] = node;
-    }
-    else if (identity.isPair(parent)) {
-        if (key === 'key')
-            parent.key = node;
-        else
-            parent.value = node;
-    }
-    else if (identity.isDocument(parent)) {
-        parent.contents = node;
-    }
-    else {
-        const pt = identity.isAlias(parent) ? 'alias' : 'scalar';
-        throw new Error(`Cannot replace node with ${pt} parent`);
-    }
-}
-
-exports.visit = visit;
-exports.visitAsync = visitAsync;
-
-
-/***/ }),
-
-/***/ 1850:
-/***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __nccwpck_require__) => {
-
-"use strict";
-// ESM COMPAT FLAG
-__nccwpck_require__.r(__webpack_exports__);
-
-// EXPORTS
-__nccwpck_require__.d(__webpack_exports__, {
-  "createPackage": () => (/* binding */ createPackage),
-  "createPackageFromFiles": () => (/* binding */ createPackageFromFiles),
-  "createPackageFromStreams": () => (/* binding */ createPackageFromStreams),
-  "createPackageWithOptions": () => (/* binding */ createPackageWithOptions),
-  "extractAll": () => (/* binding */ extractAll),
-  "extractFile": () => (/* binding */ extractFile),
-  "getRawHeader": () => (/* binding */ getRawHeader),
-  "listPackage": () => (/* binding */ listPackage),
-  "statFile": () => (/* binding */ statFile),
-  "uncache": () => (/* reexport */ uncacheFilesystem),
-  "uncacheAll": () => (/* reexport */ uncacheAll)
-});
-
-// EXTERNAL MODULE: external "node:path"
-var external_node_path_ = __nccwpck_require__(9411);
-;// CONCATENATED MODULE: ./node_modules/@electron/asar/node_modules/balanced-match/dist/esm/index.js
-const balanced = (a, b, str) => {
-    const ma = a instanceof RegExp ? maybeMatch(a, str) : a;
-    const mb = b instanceof RegExp ? maybeMatch(b, str) : b;
-    const r = ma !== null && mb != null && range(ma, mb, str);
-    return (r && {
-        start: r[0],
-        end: r[1],
-        pre: str.slice(0, r[0]),
-        body: str.slice(r[0] + ma.length, r[1]),
-        post: str.slice(r[1] + mb.length),
-    });
-};
-const maybeMatch = (reg, str) => {
-    const m = str.match(reg);
-    return m ? m[0] : null;
-};
-const range = (a, b, str) => {
-    let begs, beg, left, right = undefined, result;
-    let ai = str.indexOf(a);
-    let bi = str.indexOf(b, ai + 1);
-    let i = ai;
-    if (ai >= 0 && bi > 0) {
-        if (a === b) {
-            return [ai, bi];
-        }
-        begs = [];
-        left = str.length;
-        while (i >= 0 && !result) {
-            if (i === ai) {
-                begs.push(i);
-                ai = str.indexOf(a, i + 1);
-            }
-            else if (begs.length === 1) {
-                const r = begs.pop();
-                if (r !== undefined)
-                    result = [r, bi];
-            }
-            else {
-                beg = begs.pop();
-                if (beg !== undefined && beg < left) {
-                    left = beg;
-                    right = bi;
-                }
-                bi = str.indexOf(b, i + 1);
-            }
-            i = ai < bi && ai >= 0 ? ai : bi;
-        }
-        if (begs.length && right !== undefined) {
-            result = [left, right];
-        }
-    }
-    return result;
-};
-//# sourceMappingURL=index.js.map
-;// CONCATENATED MODULE: ./node_modules/@electron/asar/node_modules/brace-expansion/dist/esm/index.js
-
-const escSlash = '\0SLASH' + Math.random() + '\0';
-const escOpen = '\0OPEN' + Math.random() + '\0';
-const escClose = '\0CLOSE' + Math.random() + '\0';
-const escComma = '\0COMMA' + Math.random() + '\0';
-const escPeriod = '\0PERIOD' + Math.random() + '\0';
-const escSlashPattern = new RegExp(escSlash, 'g');
-const escOpenPattern = new RegExp(escOpen, 'g');
-const escClosePattern = new RegExp(escClose, 'g');
-const escCommaPattern = new RegExp(escComma, 'g');
-const escPeriodPattern = new RegExp(escPeriod, 'g');
-const slashPattern = /\\\\/g;
-const openPattern = /\\{/g;
-const closePattern = /\\}/g;
-const commaPattern = /\\,/g;
-const periodPattern = /\\\./g;
-const EXPANSION_MAX = 100_000;
-function numeric(str) {
-    return !isNaN(str) ? parseInt(str, 10) : str.charCodeAt(0);
-}
-function escapeBraces(str) {
-    return str
-        .replace(slashPattern, escSlash)
-        .replace(openPattern, escOpen)
-        .replace(closePattern, escClose)
-        .replace(commaPattern, escComma)
-        .replace(periodPattern, escPeriod);
-}
-function unescapeBraces(str) {
-    return str
-        .replace(escSlashPattern, '\\')
-        .replace(escOpenPattern, '{')
-        .replace(escClosePattern, '}')
-        .replace(escCommaPattern, ',')
-        .replace(escPeriodPattern, '.');
-}
-/**
- * Basically just str.split(","), but handling cases
- * where we have nested braced sections, which should be
- * treated as individual members, like {a,{b,c},d}
- */
-function parseCommaParts(str) {
-    if (!str) {
-        return [''];
-    }
-    const parts = [];
-    const m = balanced('{', '}', str);
-    if (!m) {
-        return str.split(',');
-    }
-    const { pre, body, post } = m;
-    const p = pre.split(',');
-    p[p.length - 1] += '{' + body + '}';
-    const postParts = parseCommaParts(post);
-    if (post.length) {
-        ;
-        p[p.length - 1] += postParts.shift();
-        p.push.apply(p, postParts);
-    }
-    parts.push.apply(parts, p);
-    return parts;
-}
-function expand(str, options = {}) {
-    if (!str) {
-        return [];
-    }
-    const { max = EXPANSION_MAX } = options;
-    // I don't know why Bash 4.3 does this, but it does.
-    // Anything starting with {} will have the first two bytes preserved
-    // but *only* at the top level, so {},a}b will not expand to anything,
-    // but a{},b}c will be expanded to [a}c,abc].
-    // One could argue that this is a bug in Bash, but since the goal of
-    // this module is to match Bash's rules, we escape a leading {}
-    if (str.slice(0, 2) === '{}') {
-        str = '\\{\\}' + str.slice(2);
-    }
-    return expand_(escapeBraces(str), max, true).map(unescapeBraces);
-}
-function embrace(str) {
-    return '{' + str + '}';
-}
-function isPadded(el) {
-    return /^-?0\d/.test(el);
-}
-function lte(i, y) {
-    return i <= y;
-}
-function gte(i, y) {
-    return i >= y;
-}
-function expand_(str, max, isTop) {
-    /** @type {string[]} */
-    const expansions = [];
-    const m = balanced('{', '}', str);
-    if (!m)
-        return [str];
-    // no need to expand pre, since it is guaranteed to be free of brace-sets
-    const pre = m.pre;
-    const post = m.post.length ? expand_(m.post, max, false) : [''];
-    if (/\$$/.test(m.pre)) {
-        for (let k = 0; k < post.length && k < max; k++) {
-            const expansion = pre + '{' + m.body + '}' + post[k];
-            expansions.push(expansion);
-        }
-    }
-    else {
-        const isNumericSequence = /^-?\d+\.\.-?\d+(?:\.\.-?\d+)?$/.test(m.body);
-        const isAlphaSequence = /^[a-zA-Z]\.\.[a-zA-Z](?:\.\.-?\d+)?$/.test(m.body);
-        const isSequence = isNumericSequence || isAlphaSequence;
-        const isOptions = m.body.indexOf(',') >= 0;
-        if (!isSequence && !isOptions) {
-            // {a},b}
-            if (m.post.match(/,(?!,).*\}/)) {
-                str = m.pre + '{' + m.body + escClose + m.post;
-                return expand_(str, max, true);
-            }
-            return [str];
-        }
-        let n;
-        if (isSequence) {
-            n = m.body.split(/\.\./);
-        }
-        else {
-            n = parseCommaParts(m.body);
-            if (n.length === 1 && n[0] !== undefined) {
-                // x{{a,b}}y ==> x{a}y x{b}y
-                n = expand_(n[0], max, false).map(embrace);
-                //XXX is this necessary? Can't seem to hit it in tests.
-                /* c8 ignore start */
-                if (n.length === 1) {
-                    return post.map(p => m.pre + n[0] + p);
-                }
-                /* c8 ignore stop */
-            }
-        }
-        // at this point, n is the parts, and we know it's not a comma set
-        // with a single entry.
-        let N;
-        if (isSequence && n[0] !== undefined && n[1] !== undefined) {
-            const x = numeric(n[0]);
-            const y = numeric(n[1]);
-            const width = Math.max(n[0].length, n[1].length);
-            let incr = n.length === 3 && n[2] !== undefined ?
-                Math.max(Math.abs(numeric(n[2])), 1)
-                : 1;
-            let test = lte;
-            const reverse = y < x;
-            if (reverse) {
-                incr *= -1;
-                test = gte;
-            }
-            const pad = n.some(isPadded);
-            N = [];
-            for (let i = x; test(i, y) && N.length < max; i += incr) {
-                let c;
-                if (isAlphaSequence) {
-                    c = String.fromCharCode(i);
-                    if (c === '\\') {
-                        c = '';
-                    }
-                }
-                else {
-                    c = String(i);
-                    if (pad) {
-                        const need = width - c.length;
-                        if (need > 0) {
-                            const z = new Array(need + 1).join('0');
-                            if (i < 0) {
-                                c = '-' + z + c.slice(1);
-                            }
-                            else {
-                                c = z + c;
-                            }
-                        }
-                    }
-                }
-                N.push(c);
-            }
-        }
-        else {
-            N = [];
-            for (let j = 0; j < n.length; j++) {
-                N.push.apply(N, expand_(n[j], max, false));
-            }
-        }
-        for (let j = 0; j < N.length; j++) {
-            for (let k = 0; k < post.length && expansions.length < max; k++) {
-                const expansion = pre + N[j] + post[k];
-                if (!isTop || isSequence || expansion) {
-                    expansions.push(expansion);
-                }
-            }
-        }
-    }
-    return expansions;
-}
-//# sourceMappingURL=index.js.map
-;// CONCATENATED MODULE: ./node_modules/@electron/asar/node_modules/minimatch/dist/esm/assert-valid-pattern.js
-const MAX_PATTERN_LENGTH = 1024 * 64;
-const assertValidPattern = (pattern) => {
-    if (typeof pattern !== 'string') {
-        throw new TypeError('invalid pattern');
-    }
-    if (pattern.length > MAX_PATTERN_LENGTH) {
-        throw new TypeError('pattern is too long');
-    }
-};
-//# sourceMappingURL=assert-valid-pattern.js.map
-;// CONCATENATED MODULE: ./node_modules/@electron/asar/node_modules/minimatch/dist/esm/brace-expressions.js
-// translate the various posix character classes into unicode properties
-// this works across all unicode locales
-// { <posix class>: [<translation>, /u flag required, negated]
-const posixClasses = {
-    '[:alnum:]': ['\\p{L}\\p{Nl}\\p{Nd}', true],
-    '[:alpha:]': ['\\p{L}\\p{Nl}', true],
-    '[:ascii:]': ['\\x' + '00-\\x' + '7f', false],
-    '[:blank:]': ['\\p{Zs}\\t', true],
-    '[:cntrl:]': ['\\p{Cc}', true],
-    '[:digit:]': ['\\p{Nd}', true],
-    '[:graph:]': ['\\p{Z}\\p{C}', true, true],
-    '[:lower:]': ['\\p{Ll}', true],
-    '[:print:]': ['\\p{C}', true],
-    '[:punct:]': ['\\p{P}', true],
-    '[:space:]': ['\\p{Z}\\t\\r\\n\\v\\f', true],
-    '[:upper:]': ['\\p{Lu}', true],
-    '[:word:]': ['\\p{L}\\p{Nl}\\p{Nd}\\p{Pc}', true],
-    '[:xdigit:]': ['A-Fa-f0-9', false],
-};
-// only need to escape a few things inside of brace expressions
-// escapes: [ \ ] -
-const braceEscape = (s) => s.replace(/[[\]\\-]/g, '\\$&');
-// escape all regexp magic characters
-const regexpEscape = (s) => s.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&');
-// everything has already been escaped, we just have to join
-const rangesToString = (ranges) => ranges.join('');
-// takes a glob string at a posix brace expression, and returns
-// an equivalent regular expression source, and boolean indicating
-// whether the /u flag needs to be applied, and the number of chars
-// consumed to parse the character class.
-// This also removes out of order ranges, and returns ($.) if the
-// entire class just no good.
-const parseClass = (glob, position) => {
-    const pos = position;
-    /* c8 ignore start */
-    if (glob.charAt(pos) !== '[') {
-        throw new Error('not in a brace expression');
-    }
-    /* c8 ignore stop */
-    const ranges = [];
-    const negs = [];
-    let i = pos + 1;
-    let sawStart = false;
-    let uflag = false;
-    let escaping = false;
-    let negate = false;
-    let endPos = pos;
-    let rangeStart = '';
-    WHILE: while (i < glob.length) {
-        const c = glob.charAt(i);
-        if ((c === '!' || c === '^') && i === pos + 1) {
-            negate = true;
-            i++;
-            continue;
-        }
-        if (c === ']' && sawStart && !escaping) {
-            endPos = i + 1;
-            break;
-        }
-        sawStart = true;
-        if (c === '\\') {
-            if (!escaping) {
-                escaping = true;
-                i++;
-                continue;
-            }
-            // escaped \ char, fall through and treat like normal char
-        }
-        if (c === '[' && !escaping) {
-            // either a posix class, a collation equivalent, or just a [
-            for (const [cls, [unip, u, neg]] of Object.entries(posixClasses)) {
-                if (glob.startsWith(cls, i)) {
-                    // invalid, [a-[] is fine, but not [a-[:alpha]]
-                    if (rangeStart) {
-                        return ['$.', false, glob.length - pos, true];
-                    }
-                    i += cls.length;
-                    if (neg)
-                        negs.push(unip);
-                    else
-                        ranges.push(unip);
-                    uflag = uflag || u;
-                    continue WHILE;
-                }
-            }
-        }
-        // now it's just a normal character, effectively
-        escaping = false;
-        if (rangeStart) {
-            // throw this range away if it's not valid, but others
-            // can still match.
-            if (c > rangeStart) {
-                ranges.push(braceEscape(rangeStart) + '-' + braceEscape(c));
-            }
-            else if (c === rangeStart) {
-                ranges.push(braceEscape(c));
-            }
-            rangeStart = '';
-            i++;
-            continue;
-        }
-        // now might be the start of a range.
-        // can be either c-d or c-] or c<more...>] or c] at this point
-        if (glob.startsWith('-]', i + 1)) {
-            ranges.push(braceEscape(c + '-'));
-            i += 2;
-            continue;
-        }
-        if (glob.startsWith('-', i + 1)) {
-            rangeStart = c;
-            i += 2;
-            continue;
-        }
-        // not the start of a range, just a single character
-        ranges.push(braceEscape(c));
-        i++;
-    }
-    if (endPos < i) {
-        // didn't see the end of the class, not a valid class,
-        // but might still be valid as a literal match.
-        return ['', false, 0, false];
-    }
-    // if we got no ranges and no negates, then we have a range that
-    // cannot possibly match anything, and that poisons the whole glob
-    if (!ranges.length && !negs.length) {
-        return ['$.', false, glob.length - pos, true];
-    }
-    // if we got one positive range, and it's a single character, then that's
-    // not actually a magic pattern, it's just that one literal character.
-    // we should not treat that as "magic", we should just return the literal
-    // character. [_] is a perfectly valid way to escape glob magic chars.
-    if (negs.length === 0 &&
-        ranges.length === 1 &&
-        /^\\?.$/.test(ranges[0]) &&
-        !negate) {
-        const r = ranges[0].length === 2 ? ranges[0].slice(-1) : ranges[0];
-        return [regexpEscape(r), false, endPos - pos, false];
-    }
-    const sranges = '[' + (negate ? '^' : '') + rangesToString(ranges) + ']';
-    const snegs = '[' + (negate ? '' : '^') + rangesToString(negs) + ']';
-    const comb = ranges.length && negs.length ? '(' + sranges + '|' + snegs + ')'
-        : ranges.length ? sranges
-            : snegs;
-    return [comb, uflag, endPos - pos, true];
-};
-//# sourceMappingURL=brace-expressions.js.map
-;// CONCATENATED MODULE: ./node_modules/@electron/asar/node_modules/minimatch/dist/esm/unescape.js
-/**
- * Un-escape a string that has been escaped with {@link escape}.
- *
- * If the {@link MinimatchOptions.windowsPathsNoEscape} option is used, then
- * square-bracket escapes are removed, but not backslash escapes.
- *
- * For example, it will turn the string `'[*]'` into `*`, but it will not
- * turn `'\\*'` into `'*'`, because `\` is a path separator in
- * `windowsPathsNoEscape` mode.
- *
- * When `windowsPathsNoEscape` is not set, then both square-bracket escapes and
- * backslash escapes are removed.
- *
- * Slashes (and backslashes in `windowsPathsNoEscape` mode) cannot be escaped
- * or unescaped.
- *
- * When `magicalBraces` is not set, escapes of braces (`{` and `}`) will not be
- * unescaped.
- */
-const unescape_unescape = (s, { windowsPathsNoEscape = false, magicalBraces = true, } = {}) => {
-    if (magicalBraces) {
-        return windowsPathsNoEscape ?
-            s.replace(/\[([^/\\])\]/g, '$1')
-            : s
-                .replace(/((?!\\).|^)\[([^/\\])\]/g, '$1$2')
-                .replace(/\\([^/])/g, '$1');
-    }
-    return windowsPathsNoEscape ?
-        s.replace(/\[([^/\\{}])\]/g, '$1')
-        : s
-            .replace(/((?!\\).|^)\[([^/\\{}])\]/g, '$1$2')
-            .replace(/\\([^/{}])/g, '$1');
-};
-//# sourceMappingURL=unescape.js.map
-;// CONCATENATED MODULE: ./node_modules/@electron/asar/node_modules/minimatch/dist/esm/ast.js
-// parse a single path portion
-var _a;
-
-
-const types = new Set(['!', '?', '+', '*', '@']);
-const isExtglobType = (c) => types.has(c);
-const isExtglobAST = (c) => isExtglobType(c.type);
-// Map of which extglob types can adopt the children of a nested extglob
-//
-// anything but ! can adopt a matching type:
-// +(a|+(b|c)|d) => +(a|b|c|d)
-// *(a|*(b|c)|d) => *(a|b|c|d)
-// @(a|@(b|c)|d) => @(a|b|c|d)
-// ?(a|?(b|c)|d) => ?(a|b|c|d)
-//
-// * can adopt anything, because 0 or repetition is allowed
-// *(a|?(b|c)|d) => *(a|b|c|d)
-// *(a|+(b|c)|d) => *(a|b|c|d)
-// *(a|@(b|c)|d) => *(a|b|c|d)
-//
-// + can adopt @, because 1 or repetition is allowed
-// +(a|@(b|c)|d) => +(a|b|c|d)
-//
-// + and @ CANNOT adopt *, because 0 would be allowed
-// +(a|*(b|c)|d) => would match "", on *(b|c)
-// @(a|*(b|c)|d) => would match "", on *(b|c)
-//
-// + and @ CANNOT adopt ?, because 0 would be allowed
-// +(a|?(b|c)|d) => would match "", on ?(b|c)
-// @(a|?(b|c)|d) => would match "", on ?(b|c)
-//
-// ? can adopt @, because 0 or 1 is allowed
-// ?(a|@(b|c)|d) => ?(a|b|c|d)
-//
-// ? and @ CANNOT adopt * or +, because >1 would be allowed
-// ?(a|*(b|c)|d) => would match bbb on *(b|c)
-// @(a|*(b|c)|d) => would match bbb on *(b|c)
-// ?(a|+(b|c)|d) => would match bbb on +(b|c)
-// @(a|+(b|c)|d) => would match bbb on +(b|c)
-//
-// ! CANNOT adopt ! (nothing else can either)
-// !(a|!(b|c)|d) => !(a|b|c|d) would fail to match on b (not not b|c)
-//
-// ! can adopt @
-// !(a|@(b|c)|d) => !(a|b|c|d)
-//
-// ! CANNOT adopt *
-// !(a|*(b|c)|d) => !(a|b|c|d) would match on bbb, not allowed
-//
-// ! CANNOT adopt +
-// !(a|+(b|c)|d) => !(a|b|c|d) would match on bbb, not allowed
-//
-// ! CANNOT adopt ?
-// x!(a|?(b|c)|d) => x!(a|b|c|d) would fail to match "x"
-const adoptionMap = new Map([
-    ['!', ['@']],
-    ['?', ['?', '@']],
-    ['@', ['@']],
-    ['*', ['*', '+', '?', '@']],
-    ['+', ['+', '@']],
-]);
-// nested extglobs that can be adopted in, but with the addition of
-// a blank '' element.
-const adoptionWithSpaceMap = new Map([
-    ['!', ['?']],
-    ['@', ['?']],
-    ['+', ['?', '*']],
-]);
-// union of the previous two maps
-const adoptionAnyMap = new Map([
-    ['!', ['?', '@']],
-    ['?', ['?', '@']],
-    ['@', ['?', '@']],
-    ['*', ['*', '+', '?', '@']],
-    ['+', ['+', '@', '?', '*']],
-]);
-// Extglobs that can take over their parent if they are the only child
-// the key is parent, value maps child to resulting extglob parent type
-// '@' is omitted because it's a special case. An `@` extglob with a single
-// member can always be usurped by that subpattern.
-const usurpMap = new Map([
-    ['!', new Map([['!', '@']])],
-    [
-        '?',
-        new Map([
-            ['*', '*'],
-            ['+', '*'],
-        ]),
-    ],
-    [
-        '@',
-        new Map([
-            ['!', '!'],
-            ['?', '?'],
-            ['@', '@'],
-            ['*', '*'],
-            ['+', '+'],
-        ]),
-    ],
-    [
-        '+',
-        new Map([
-            ['?', '*'],
-            ['*', '*'],
-        ]),
-    ],
-]);
-// Patterns that get prepended to bind to the start of either the
-// entire string, or just a single path portion, to prevent dots
-// and/or traversal patterns, when needed.
-// Exts don't need the ^ or / bit, because the root binds that already.
-const startNoTraversal = '(?!(?:^|/)\\.\\.?(?:$|/))';
-const startNoDot = '(?!\\.)';
-// characters that indicate a start of pattern needs the "no dots" bit,
-// because a dot *might* be matched. ( is not in the list, because in
-// the case of a child extglob, it will handle the prevention itself.
-const addPatternStart = new Set(['[', '.']);
-// cases where traversal is A-OK, no dot prevention needed
-const justDots = new Set(['..', '.']);
-const reSpecials = new Set('().*{}+?[]^$\\!');
-const regExpEscape = (s) => s.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&');
-// any single thing other than /
-const qmark = '[^/]';
-// * => any number of characters
-const star = qmark + '*?';
-// use + when we need to ensure that *something* matches, because the * is
-// the only thing in the path portion.
-const starNoEmpty = qmark + '+?';
-// remove the \ chars that we added if we end up doing a nonmagic compare
-// const deslash = (s: string) => s.replace(/\\(.)/g, '$1')
-let ID = 0;
-class AST {
-    type;
-    #root;
-    #hasMagic;
-    #uflag = false;
-    #parts = [];
-    #parent;
-    #parentIndex;
-    #negs;
-    #filledNegs = false;
-    #options;
-    #toString;
-    // set to true if it's an extglob with no children
-    // (which really means one child of '')
-    #emptyExt = false;
-    id = ++ID;
-    get depth() {
-        return (this.#parent?.depth ?? -1) + 1;
-    }
-    [Symbol.for('nodejs.util.inspect.custom')]() {
-        return {
-            '@@type': 'AST',
-            id: this.id,
-            type: this.type,
-            root: this.#root.id,
-            parent: this.#parent?.id,
-            depth: this.depth,
-            partsLength: this.#parts.length,
-            parts: this.#parts,
-        };
-    }
-    constructor(type, parent, options = {}) {
-        this.type = type;
-        // extglobs are inherently magical
-        if (type)
-            this.#hasMagic = true;
-        this.#parent = parent;
-        this.#root = this.#parent ? this.#parent.#root : this;
-        this.#options = this.#root === this ? options : this.#root.#options;
-        this.#negs = this.#root === this ? [] : this.#root.#negs;
-        if (type === '!' && !this.#root.#filledNegs)
-            this.#negs.push(this);
-        this.#parentIndex = this.#parent ? this.#parent.#parts.length : 0;
-    }
-    get hasMagic() {
-        /* c8 ignore start */
-        if (this.#hasMagic !== undefined)
-            return this.#hasMagic;
-        /* c8 ignore stop */
-        for (const p of this.#parts) {
-            if (typeof p === 'string')
-                continue;
-            if (p.type || p.hasMagic)
-                return (this.#hasMagic = true);
-        }
-        // note: will be undefined until we generate the regexp src and find out
-        return this.#hasMagic;
-    }
-    // reconstructs the pattern
-    toString() {
-        return (this.#toString !== undefined ? this.#toString
-            : !this.type ?
-                (this.#toString = this.#parts.map(p => String(p)).join(''))
-                : (this.#toString =
-                    this.type +
-                        '(' +
-                        this.#parts.map(p => String(p)).join('|') +
-                        ')'));
-    }
-    #fillNegs() {
-        /* c8 ignore start */
-        if (this !== this.#root)
-            throw new Error('should only call on root');
-        if (this.#filledNegs)
-            return this;
-        /* c8 ignore stop */
-        // call toString() once to fill this out
-        this.toString();
-        this.#filledNegs = true;
-        let n;
-        while ((n = this.#negs.pop())) {
-            if (n.type !== '!')
-                continue;
-            // walk up the tree, appending everthing that comes AFTER parentIndex
-            let p = n;
-            let pp = p.#parent;
-            while (pp) {
-                for (let i = p.#parentIndex + 1; !pp.type && i < pp.#parts.length; i++) {
-                    for (const part of n.#parts) {
-                        /* c8 ignore start */
-                        if (typeof part === 'string') {
-                            throw new Error('string part in extglob AST??');
-                        }
-                        /* c8 ignore stop */
-                        part.copyIn(pp.#parts[i]);
-                    }
-                }
-                p = pp;
-                pp = p.#parent;
-            }
-        }
-        return this;
-    }
-    push(...parts) {
-        for (const p of parts) {
-            if (p === '')
-                continue;
-            /* c8 ignore start */
-            if (typeof p !== 'string' &&
-                !(p instanceof _a && p.#parent === this)) {
-                throw new Error('invalid part: ' + p);
-            }
-            /* c8 ignore stop */
-            this.#parts.push(p);
-        }
-    }
-    toJSON() {
-        const ret = this.type === null ?
-            this.#parts
-                .slice()
-                .map(p => (typeof p === 'string' ? p : p.toJSON()))
-            : [this.type, ...this.#parts.map(p => p.toJSON())];
-        if (this.isStart() && !this.type)
-            ret.unshift([]);
-        if (this.isEnd() &&
-            (this === this.#root ||
-                (this.#root.#filledNegs && this.#parent?.type === '!'))) {
-            ret.push({});
-        }
-        return ret;
-    }
-    isStart() {
-        if (this.#root === this)
-            return true;
-        // if (this.type) return !!this.#parent?.isStart()
-        if (!this.#parent?.isStart())
-            return false;
-        if (this.#parentIndex === 0)
-            return true;
-        // if everything AHEAD of this is a negation, then it's still the "start"
-        const p = this.#parent;
-        for (let i = 0; i < this.#parentIndex; i++) {
-            const pp = p.#parts[i];
-            if (!(pp instanceof _a && pp.type === '!')) {
-                return false;
-            }
-        }
-        return true;
-    }
-    isEnd() {
-        if (this.#root === this)
-            return true;
-        if (this.#parent?.type === '!')
-            return true;
-        if (!this.#parent?.isEnd())
-            return false;
-        if (!this.type)
-            return this.#parent?.isEnd();
-        // if not root, it'll always have a parent
-        /* c8 ignore start */
-        const pl = this.#parent ? this.#parent.#parts.length : 0;
-        /* c8 ignore stop */
-        return this.#parentIndex === pl - 1;
-    }
-    copyIn(part) {
-        if (typeof part === 'string')
-            this.push(part);
-        else
-            this.push(part.clone(this));
-    }
-    clone(parent) {
-        const c = new _a(this.type, parent);
-        for (const p of this.#parts) {
-            c.copyIn(p);
-        }
-        return c;
-    }
-    static #parseAST(str, ast, pos, opt, extDepth) {
-        const maxDepth = opt.maxExtglobRecursion ?? 2;
-        let escaping = false;
-        let inBrace = false;
-        let braceStart = -1;
-        let braceNeg = false;
-        if (ast.type === null) {
-            // outside of a extglob, append until we find a start
-            let i = pos;
-            let acc = '';
-            while (i < str.length) {
-                const c = str.charAt(i++);
-                // still accumulate escapes at this point, but we do ignore
-                // starts that are escaped
-                if (escaping || c === '\\') {
-                    escaping = !escaping;
-                    acc += c;
-                    continue;
-                }
-                if (inBrace) {
-                    if (i === braceStart + 1) {
-                        if (c === '^' || c === '!') {
-                            braceNeg = true;
-                        }
-                    }
-                    else if (c === ']' && !(i === braceStart + 2 && braceNeg)) {
-                        inBrace = false;
-                    }
-                    acc += c;
-                    continue;
-                }
-                else if (c === '[') {
-                    inBrace = true;
-                    braceStart = i;
-                    braceNeg = false;
-                    acc += c;
-                    continue;
-                }
-                // we don't have to check for adoption here, because that's
-                // done at the other recursion point.
-                const doRecurse = !opt.noext &&
-                    isExtglobType(c) &&
-                    str.charAt(i) === '(' &&
-                    extDepth <= maxDepth;
-                if (doRecurse) {
-                    ast.push(acc);
-                    acc = '';
-                    const ext = new _a(c, ast);
-                    i = _a.#parseAST(str, ext, i, opt, extDepth + 1);
-                    ast.push(ext);
-                    continue;
-                }
-                acc += c;
-            }
-            ast.push(acc);
-            return i;
-        }
-        // some kind of extglob, pos is at the (
-        // find the next | or )
-        let i = pos + 1;
-        let part = new _a(null, ast);
-        const parts = [];
-        let acc = '';
-        while (i < str.length) {
-            const c = str.charAt(i++);
-            // still accumulate escapes at this point, but we do ignore
-            // starts that are escaped
-            if (escaping || c === '\\') {
-                escaping = !escaping;
-                acc += c;
-                continue;
-            }
-            if (inBrace) {
-                if (i === braceStart + 1) {
-                    if (c === '^' || c === '!') {
-                        braceNeg = true;
-                    }
-                }
-                else if (c === ']' && !(i === braceStart + 2 && braceNeg)) {
-                    inBrace = false;
-                }
-                acc += c;
-                continue;
-            }
-            else if (c === '[') {
-                inBrace = true;
-                braceStart = i;
-                braceNeg = false;
-                acc += c;
-                continue;
-            }
-            const doRecurse = !opt.noext &&
-                isExtglobType(c) &&
-                str.charAt(i) === '(' &&
-                /* c8 ignore start - the maxDepth is sufficient here */
-                (extDepth <= maxDepth || (ast && ast.#canAdoptType(c)));
-            /* c8 ignore stop */
-            if (doRecurse) {
-                const depthAdd = ast && ast.#canAdoptType(c) ? 0 : 1;
-                part.push(acc);
-                acc = '';
-                const ext = new _a(c, part);
-                part.push(ext);
-                i = _a.#parseAST(str, ext, i, opt, extDepth + depthAdd);
-                continue;
-            }
-            if (c === '|') {
-                part.push(acc);
-                acc = '';
-                parts.push(part);
-                part = new _a(null, ast);
-                continue;
-            }
-            if (c === ')') {
-                if (acc === '' && ast.#parts.length === 0) {
-                    ast.#emptyExt = true;
-                }
-                part.push(acc);
-                acc = '';
-                ast.push(...parts, part);
-                return i;
-            }
-            acc += c;
-        }
-        // unfinished extglob
-        // if we got here, it was a malformed extglob! not an extglob, but
-        // maybe something else in there.
-        ast.type = null;
-        ast.#hasMagic = undefined;
-        ast.#parts = [str.substring(pos - 1)];
-        return i;
-    }
-    #canAdoptWithSpace(child) {
-        return this.#canAdopt(child, adoptionWithSpaceMap);
-    }
-    #canAdopt(child, map = adoptionMap) {
-        if (!child ||
-            typeof child !== 'object' ||
-            child.type !== null ||
-            child.#parts.length !== 1 ||
-            this.type === null) {
-            return false;
-        }
-        const gc = child.#parts[0];
-        if (!gc || typeof gc !== 'object' || gc.type === null) {
-            return false;
-        }
-        return this.#canAdoptType(gc.type, map);
-    }
-    #canAdoptType(c, map = adoptionAnyMap) {
-        return !!map.get(this.type)?.includes(c);
-    }
-    #adoptWithSpace(child, index) {
-        const gc = child.#parts[0];
-        const blank = new _a(null, gc, this.options);
-        blank.#parts.push('');
-        gc.push(blank);
-        this.#adopt(child, index);
-    }
-    #adopt(child, index) {
-        const gc = child.#parts[0];
-        this.#parts.splice(index, 1, ...gc.#parts);
-        for (const p of gc.#parts) {
-            if (typeof p === 'object')
-                p.#parent = this;
-        }
-        this.#toString = undefined;
-    }
-    #canUsurpType(c) {
-        const m = usurpMap.get(this.type);
-        return !!m?.has(c);
-    }
-    #canUsurp(child) {
-        if (!child ||
-            typeof child !== 'object' ||
-            child.type !== null ||
-            child.#parts.length !== 1 ||
-            this.type === null ||
-            this.#parts.length !== 1) {
-            return false;
-        }
-        const gc = child.#parts[0];
-        if (!gc || typeof gc !== 'object' || gc.type === null) {
-            return false;
-        }
-        return this.#canUsurpType(gc.type);
-    }
-    #usurp(child) {
-        const m = usurpMap.get(this.type);
-        const gc = child.#parts[0];
-        const nt = m?.get(gc.type);
-        /* c8 ignore start - impossible */
-        if (!nt)
-            return false;
-        /* c8 ignore stop */
-        this.#parts = gc.#parts;
-        for (const p of this.#parts) {
-            if (typeof p === 'object') {
-                p.#parent = this;
-            }
-        }
-        this.type = nt;
-        this.#toString = undefined;
-        this.#emptyExt = false;
-    }
-    static fromGlob(pattern, options = {}) {
-        const ast = new _a(null, undefined, options);
-        _a.#parseAST(pattern, ast, 0, options, 0);
-        return ast;
-    }
-    // returns the regular expression if there's magic, or the unescaped
-    // string if not.
-    toMMPattern() {
-        // should only be called on root
-        /* c8 ignore start */
-        if (this !== this.#root)
-            return this.#root.toMMPattern();
-        /* c8 ignore stop */
-        const glob = this.toString();
-        const [re, body, hasMagic, uflag] = this.toRegExpSource();
-        // if we're in nocase mode, and not nocaseMagicOnly, then we do
-        // still need a regular expression if we have to case-insensitively
-        // match capital/lowercase characters.
-        const anyMagic = hasMagic ||
-            this.#hasMagic ||
-            (this.#options.nocase &&
-                !this.#options.nocaseMagicOnly &&
-                glob.toUpperCase() !== glob.toLowerCase());
-        if (!anyMagic) {
-            return body;
-        }
-        const flags = (this.#options.nocase ? 'i' : '') + (uflag ? 'u' : '');
-        return Object.assign(new RegExp(`^${re}$`, flags), {
-            _src: re,
-            _glob: glob,
-        });
-    }
-    get options() {
-        return this.#options;
-    }
-    // returns the string match, the regexp source, whether there's magic
-    // in the regexp (so a regular expression is required) and whether or
-    // not the uflag is needed for the regular expression (for posix classes)
-    // TODO: instead of injecting the start/end at this point, just return
-    // the BODY of the regexp, along with the start/end portions suitable
-    // for binding the start/end in either a joined full-path makeRe context
-    // (where we bind to (^|/), or a standalone matchPart context (where
-    // we bind to ^, and not /).  Otherwise slashes get duped!
-    //
-    // In part-matching mode, the start is:
-    // - if not isStart: nothing
-    // - if traversal possible, but not allowed: ^(?!\.\.?$)
-    // - if dots allowed or not possible: ^
-    // - if dots possible and not allowed: ^(?!\.)
-    // end is:
-    // - if not isEnd(): nothing
-    // - else: $
-    //
-    // In full-path matching mode, we put the slash at the START of the
-    // pattern, so start is:
-    // - if first pattern: same as part-matching mode
-    // - if not isStart(): nothing
-    // - if traversal possible, but not allowed: /(?!\.\.?(?:$|/))
-    // - if dots allowed or not possible: /
-    // - if dots possible and not allowed: /(?!\.)
-    // end is:
-    // - if last pattern, same as part-matching mode
-    // - else nothing
-    //
-    // Always put the (?:$|/) on negated tails, though, because that has to be
-    // there to bind the end of the negated pattern portion, and it's easier to
-    // just stick it in now rather than try to inject it later in the middle of
-    // the pattern.
-    //
-    // We can just always return the same end, and leave it up to the caller
-    // to know whether it's going to be used joined or in parts.
-    // And, if the start is adjusted slightly, can do the same there:
-    // - if not isStart: nothing
-    // - if traversal possible, but not allowed: (?:/|^)(?!\.\.?$)
-    // - if dots allowed or not possible: (?:/|^)
-    // - if dots possible and not allowed: (?:/|^)(?!\.)
-    //
-    // But it's better to have a simpler binding without a conditional, for
-    // performance, so probably better to return both start options.
-    //
-    // Then the caller just ignores the end if it's not the first pattern,
-    // and the start always gets applied.
-    //
-    // But that's always going to be $ if it's the ending pattern, or nothing,
-    // so the caller can just attach $ at the end of the pattern when building.
-    //
-    // So the todo is:
-    // - better detect what kind of start is needed
-    // - return both flavors of starting pattern
-    // - attach $ at the end of the pattern when creating the actual RegExp
-    //
-    // Ah, but wait, no, that all only applies to the root when the first pattern
-    // is not an extglob. If the first pattern IS an extglob, then we need all
-    // that dot prevention biz to live in the extglob portions, because eg
-    // +(*|.x*) can match .xy but not .yx.
-    //
-    // So, return the two flavors if it's #root and the first child is not an
-    // AST, otherwise leave it to the child AST to handle it, and there,
-    // use the (?:^|/) style of start binding.
-    //
-    // Even simplified further:
-    // - Since the start for a join is eg /(?!\.) and the start for a part
-    // is ^(?!\.), we can just prepend (?!\.) to the pattern (either root
-    // or start or whatever) and prepend ^ or / at the Regexp construction.
-    toRegExpSource(allowDot) {
-        const dot = allowDot ?? !!this.#options.dot;
-        if (this.#root === this) {
-            this.#flatten();
-            this.#fillNegs();
-        }
-        if (!isExtglobAST(this)) {
-            const noEmpty = this.isStart() &&
-                this.isEnd() &&
-                !this.#parts.some(s => typeof s !== 'string');
-            const src = this.#parts
-                .map(p => {
-                const [re, _, hasMagic, uflag] = typeof p === 'string' ?
-                    _a.#parseGlob(p, this.#hasMagic, noEmpty)
-                    : p.toRegExpSource(allowDot);
-                this.#hasMagic = this.#hasMagic || hasMagic;
-                this.#uflag = this.#uflag || uflag;
-                return re;
-            })
-                .join('');
-            let start = '';
-            if (this.isStart()) {
-                if (typeof this.#parts[0] === 'string') {
-                    // this is the string that will match the start of the pattern,
-                    // so we need to protect against dots and such.
-                    // '.' and '..' cannot match unless the pattern is that exactly,
-                    // even if it starts with . or dot:true is set.
-                    const dotTravAllowed = this.#parts.length === 1 && justDots.has(this.#parts[0]);
-                    if (!dotTravAllowed) {
-                        const aps = addPatternStart;
-                        // check if we have a possibility of matching . or ..,
-                        // and prevent that.
-                        const needNoTrav = 
-                        // dots are allowed, and the pattern starts with [ or .
-                        (dot && aps.has(src.charAt(0))) ||
-                            // the pattern starts with \., and then [ or .
-                            (src.startsWith('\\.') && aps.has(src.charAt(2))) ||
-                            // the pattern starts with \.\., and then [ or .
-                            (src.startsWith('\\.\\.') && aps.has(src.charAt(4)));
-                        // no need to prevent dots if it can't match a dot, or if a
-                        // sub-pattern will be preventing it anyway.
-                        const needNoDot = !dot && !allowDot && aps.has(src.charAt(0));
-                        start =
-                            needNoTrav ? startNoTraversal
-                                : needNoDot ? startNoDot
-                                    : '';
-                    }
-                }
-            }
-            // append the "end of path portion" pattern to negation tails
-            let end = '';
-            if (this.isEnd() &&
-                this.#root.#filledNegs &&
-                this.#parent?.type === '!') {
-                end = '(?:$|\\/)';
-            }
-            const final = start + src + end;
-            return [
-                final,
-                unescape_unescape(src),
-                (this.#hasMagic = !!this.#hasMagic),
-                this.#uflag,
-            ];
-        }
-        // We need to calculate the body *twice* if it's a repeat pattern
-        // at the start, once in nodot mode, then again in dot mode, so a
-        // pattern like *(?) can match 'x.y'
-        const repeated = this.type === '*' || this.type === '+';
-        // some kind of extglob
-        const start = this.type === '!' ? '(?:(?!(?:' : '(?:';
-        let body = this.#partsToRegExp(dot);
-        if (this.isStart() && this.isEnd() && !body && this.type !== '!') {
-            // invalid extglob, has to at least be *something* present, if it's
-            // the entire path portion.
-            const s = this.toString();
-            const me = this;
-            me.#parts = [s];
-            me.type = null;
-            me.#hasMagic = undefined;
-            return [s, unescape_unescape(this.toString()), false, false];
-        }
-        let bodyDotAllowed = !repeated || allowDot || dot || !startNoDot ?
-            ''
-            : this.#partsToRegExp(true);
-        if (bodyDotAllowed === body) {
-            bodyDotAllowed = '';
-        }
-        if (bodyDotAllowed) {
-            body = `(?:${body})(?:${bodyDotAllowed})*?`;
-        }
-        // an empty !() is exactly equivalent to a starNoEmpty
-        let final = '';
-        if (this.type === '!' && this.#emptyExt) {
-            final = (this.isStart() && !dot ? startNoDot : '') + starNoEmpty;
-        }
-        else {
-            const close = this.type === '!' ?
-                // !() must match something,but !(x) can match ''
-                '))' +
-                    (this.isStart() && !dot && !allowDot ? startNoDot : '') +
-                    star +
-                    ')'
-                : this.type === '@' ? ')'
-                    : this.type === '?' ? ')?'
-                        : this.type === '+' && bodyDotAllowed ? ')'
-                            : this.type === '*' && bodyDotAllowed ? `)?`
-                                : `)${this.type}`;
-            final = start + body + close;
-        }
-        return [
-            final,
-            unescape_unescape(body),
-            (this.#hasMagic = !!this.#hasMagic),
-            this.#uflag,
-        ];
-    }
-    #flatten() {
-        if (!isExtglobAST(this)) {
-            for (const p of this.#parts) {
-                if (typeof p === 'object') {
-                    p.#flatten();
-                }
-            }
-        }
-        else {
-            // do up to 10 passes to flatten as much as possible
-            let iterations = 0;
-            let done = false;
-            do {
-                done = true;
-                for (let i = 0; i < this.#parts.length; i++) {
-                    const c = this.#parts[i];
-                    if (typeof c === 'object') {
-                        c.#flatten();
-                        if (this.#canAdopt(c)) {
-                            done = false;
-                            this.#adopt(c, i);
-                        }
-                        else if (this.#canAdoptWithSpace(c)) {
-                            done = false;
-                            this.#adoptWithSpace(c, i);
-                        }
-                        else if (this.#canUsurp(c)) {
-                            done = false;
-                            this.#usurp(c);
-                        }
-                    }
-                }
-            } while (!done && ++iterations < 10);
-        }
-        this.#toString = undefined;
-    }
-    #partsToRegExp(dot) {
-        return this.#parts
-            .map(p => {
-            // extglob ASTs should only contain parent ASTs
-            /* c8 ignore start */
-            if (typeof p === 'string') {
-                throw new Error('string type in extglob ast??');
-            }
-            /* c8 ignore stop */
-            // can ignore hasMagic, because extglobs are already always magic
-            const [re, _, _hasMagic, uflag] = p.toRegExpSource(dot);
-            this.#uflag = this.#uflag || uflag;
-            return re;
-        })
-            .filter(p => !(this.isStart() && this.isEnd()) || !!p)
-            .join('|');
-    }
-    static #parseGlob(glob, hasMagic, noEmpty = false) {
-        let escaping = false;
-        let re = '';
-        let uflag = false;
-        // multiple stars that aren't globstars coalesce into one *
-        let inStar = false;
-        for (let i = 0; i < glob.length; i++) {
-            const c = glob.charAt(i);
-            if (escaping) {
-                escaping = false;
-                re += (reSpecials.has(c) ? '\\' : '') + c;
-                continue;
-            }
-            if (c === '*') {
-                if (inStar)
-                    continue;
-                inStar = true;
-                re += noEmpty && /^[*]+$/.test(glob) ? starNoEmpty : star;
-                hasMagic = true;
-                continue;
-            }
-            else {
-                inStar = false;
-            }
-            if (c === '\\') {
-                if (i === glob.length - 1) {
-                    re += '\\\\';
-                }
-                else {
-                    escaping = true;
-                }
-                continue;
-            }
-            if (c === '[') {
-                const [src, needUflag, consumed, magic] = parseClass(glob, i);
-                if (consumed) {
-                    re += src;
-                    uflag = uflag || needUflag;
-                    i += consumed - 1;
-                    hasMagic = hasMagic || magic;
-                    continue;
-                }
-            }
-            if (c === '?') {
-                re += qmark;
-                hasMagic = true;
-                continue;
-            }
-            re += regExpEscape(c);
-        }
-        return [re, unescape_unescape(glob), !!hasMagic, uflag];
-    }
-}
-_a = AST;
-//# sourceMappingURL=ast.js.map
-;// CONCATENATED MODULE: ./node_modules/@electron/asar/node_modules/minimatch/dist/esm/escape.js
-/**
- * Escape all magic characters in a glob pattern.
- *
- * If the {@link MinimatchOptions.windowsPathsNoEscape}
- * option is used, then characters are escaped by wrapping in `[]`, because
- * a magic character wrapped in a character class can only be satisfied by
- * that exact character.  In this mode, `\` is _not_ escaped, because it is
- * not interpreted as a magic character, but instead as a path separator.
- *
- * If the {@link MinimatchOptions.magicalBraces} option is used,
- * then braces (`{` and `}`) will be escaped.
- */
-const escape_escape = (s, { windowsPathsNoEscape = false, magicalBraces = false, } = {}) => {
-    // don't need to escape +@! because we escape the parens
-    // that make those magic, and escaping ! as [!] isn't valid,
-    // because [!]] is a valid glob class meaning not ']'.
-    if (magicalBraces) {
-        return windowsPathsNoEscape ?
-            s.replace(/[?*()[\]{}]/g, '[$&]')
-            : s.replace(/[?*()[\]\\{}]/g, '\\$&');
-    }
-    return windowsPathsNoEscape ?
-        s.replace(/[?*()[\]]/g, '[$&]')
-        : s.replace(/[?*()[\]\\]/g, '\\$&');
-};
-//# sourceMappingURL=escape.js.map
-;// CONCATENATED MODULE: ./node_modules/@electron/asar/node_modules/minimatch/dist/esm/index.js
-
-
-
-
-
-const minimatch = (p, pattern, options = {}) => {
-    assertValidPattern(pattern);
-    // shortcut: comments match nothing.
-    if (!options.nocomment && pattern.charAt(0) === '#') {
-        return false;
-    }
-    return new Minimatch(pattern, options).match(p);
-};
-// Optimized checking for the most common glob patterns.
-const starDotExtRE = /^\*+([^+@!?*[(]*)$/;
-const starDotExtTest = (ext) => (f) => !f.startsWith('.') && f.endsWith(ext);
-const starDotExtTestDot = (ext) => (f) => f.endsWith(ext);
-const starDotExtTestNocase = (ext) => {
-    ext = ext.toLowerCase();
-    return (f) => !f.startsWith('.') && f.toLowerCase().endsWith(ext);
-};
-const starDotExtTestNocaseDot = (ext) => {
-    ext = ext.toLowerCase();
-    return (f) => f.toLowerCase().endsWith(ext);
-};
-const starDotStarRE = /^\*+\.\*+$/;
-const starDotStarTest = (f) => !f.startsWith('.') && f.includes('.');
-const starDotStarTestDot = (f) => f !== '.' && f !== '..' && f.includes('.');
-const dotStarRE = /^\.\*+$/;
-const dotStarTest = (f) => f !== '.' && f !== '..' && f.startsWith('.');
-const starRE = /^\*+$/;
-const starTest = (f) => f.length !== 0 && !f.startsWith('.');
-const starTestDot = (f) => f.length !== 0 && f !== '.' && f !== '..';
-const qmarksRE = /^\?+([^+@!?*[(]*)?$/;
-const qmarksTestNocase = ([$0, ext = '']) => {
-    const noext = qmarksTestNoExt([$0]);
-    if (!ext)
-        return noext;
-    ext = ext.toLowerCase();
-    return (f) => noext(f) && f.toLowerCase().endsWith(ext);
-};
-const qmarksTestNocaseDot = ([$0, ext = '']) => {
-    const noext = qmarksTestNoExtDot([$0]);
-    if (!ext)
-        return noext;
-    ext = ext.toLowerCase();
-    return (f) => noext(f) && f.toLowerCase().endsWith(ext);
-};
-const qmarksTestDot = ([$0, ext = '']) => {
-    const noext = qmarksTestNoExtDot([$0]);
-    return !ext ? noext : (f) => noext(f) && f.endsWith(ext);
-};
-const qmarksTest = ([$0, ext = '']) => {
-    const noext = qmarksTestNoExt([$0]);
-    return !ext ? noext : (f) => noext(f) && f.endsWith(ext);
-};
-const qmarksTestNoExt = ([$0]) => {
-    const len = $0.length;
-    return (f) => f.length === len && !f.startsWith('.');
-};
-const qmarksTestNoExtDot = ([$0]) => {
-    const len = $0.length;
-    return (f) => f.length === len && f !== '.' && f !== '..';
-};
-/* c8 ignore start */
-const defaultPlatform = (typeof process === 'object' && process ?
-    (typeof process.env === 'object' &&
-        process.env &&
-        process.env.__MINIMATCH_TESTING_PLATFORM__) ||
-        process.platform
-    : 'posix');
-const esm_path = {
-    win32: { sep: '\\' },
-    posix: { sep: '/' },
-};
-/* c8 ignore stop */
-const sep = defaultPlatform === 'win32' ? esm_path.win32.sep : esm_path.posix.sep;
-minimatch.sep = sep;
-const GLOBSTAR = Symbol('globstar **');
-minimatch.GLOBSTAR = GLOBSTAR;
-// any single thing other than /
-// don't need to escape / when using new RegExp()
-const esm_qmark = '[^/]';
-// * => any number of characters
-const esm_star = esm_qmark + '*?';
-// ** when dots are allowed.  Anything goes, except .. and .
-// not (^ or / followed by one or two dots followed by $ or /),
-// followed by anything, any number of times.
-const twoStarDot = '(?:(?!(?:\\/|^)(?:\\.{1,2})($|\\/)).)*?';
-// not a ^ or / followed by a dot,
-// followed by anything, any number of times.
-const twoStarNoDot = '(?:(?!(?:\\/|^)\\.).)*?';
-const filter = (pattern, options = {}) => (p) => minimatch(p, pattern, options);
-minimatch.filter = filter;
-const ext = (a, b = {}) => Object.assign({}, a, b);
-const defaults = (def) => {
-    if (!def || typeof def !== 'object' || !Object.keys(def).length) {
-        return minimatch;
-    }
-    const orig = minimatch;
-    const m = (p, pattern, options = {}) => orig(p, pattern, ext(def, options));
-    return Object.assign(m, {
-        Minimatch: class Minimatch extends orig.Minimatch {
-            constructor(pattern, options = {}) {
-                super(pattern, ext(def, options));
-            }
-            static defaults(options) {
-                return orig.defaults(ext(def, options)).Minimatch;
-            }
-        },
-        AST: class AST extends orig.AST {
-            /* c8 ignore start */
-            constructor(type, parent, options = {}) {
-                super(type, parent, ext(def, options));
-            }
-            /* c8 ignore stop */
-            static fromGlob(pattern, options = {}) {
-                return orig.AST.fromGlob(pattern, ext(def, options));
-            }
-        },
-        unescape: (s, options = {}) => orig.unescape(s, ext(def, options)),
-        escape: (s, options = {}) => orig.escape(s, ext(def, options)),
-        filter: (pattern, options = {}) => orig.filter(pattern, ext(def, options)),
-        defaults: (options) => orig.defaults(ext(def, options)),
-        makeRe: (pattern, options = {}) => orig.makeRe(pattern, ext(def, options)),
-        braceExpand: (pattern, options = {}) => orig.braceExpand(pattern, ext(def, options)),
-        match: (list, pattern, options = {}) => orig.match(list, pattern, ext(def, options)),
-        sep: orig.sep,
-        GLOBSTAR: GLOBSTAR,
-    });
-};
-minimatch.defaults = defaults;
-// Brace expansion:
-// a{b,c}d -> abd acd
-// a{b,}c -> abc ac
-// a{0..3}d -> a0d a1d a2d a3d
-// a{b,c{d,e}f}g -> abg acdfg acefg
-// a{b,c}d{e,f}g -> abdeg acdeg abdeg abdfg
-//
-// Invalid sets are not expanded.
-// a{2..}b -> a{2..}b
-// a{b}c -> a{b}c
-const braceExpand = (pattern, options = {}) => {
-    assertValidPattern(pattern);
-    // Thanks to Yeting Li <https://github.com/yetingli> for
-    // improving this regexp to avoid a ReDOS vulnerability.
-    if (options.nobrace || !/\{(?:(?!\{).)*\}/.test(pattern)) {
-        // shortcut. no need to expand.
-        return [pattern];
-    }
-    return expand(pattern, { max: options.braceExpandMax });
-};
-minimatch.braceExpand = braceExpand;
-// parse a component of the expanded set.
-// At this point, no pattern may contain "/" in it
-// so we're going to return a 2d array, where each entry is the full
-// pattern, split on '/', and then turned into a regular expression.
-// A regexp is made at the end which joins each array with an
-// escaped /, and another full one which joins each regexp with |.
-//
-// Following the lead of Bash 4.1, note that "**" only has special meaning
-// when it is the *only* thing in a path portion.  Otherwise, any series
-// of * is equivalent to a single *.  Globstar behavior is enabled by
-// default, and can be disabled by setting options.noglobstar.
-const makeRe = (pattern, options = {}) => new Minimatch(pattern, options).makeRe();
-minimatch.makeRe = makeRe;
-const match = (list, pattern, options = {}) => {
-    const mm = new Minimatch(pattern, options);
-    list = list.filter(f => mm.match(f));
-    if (mm.options.nonull && !list.length) {
-        list.push(pattern);
-    }
-    return list;
-};
-minimatch.match = match;
-// replace stuff like \* with *
-const globMagic = /[?*]|[+@!]\(.*?\)|\[|\]/;
-const esm_regExpEscape = (s) => s.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&');
-class Minimatch {
-    options;
-    set;
-    pattern;
-    windowsPathsNoEscape;
-    nonegate;
-    negate;
-    comment;
-    empty;
-    preserveMultipleSlashes;
-    partial;
-    globSet;
-    globParts;
-    nocase;
-    isWindows;
-    platform;
-    windowsNoMagicRoot;
-    maxGlobstarRecursion;
-    regexp;
-    constructor(pattern, options = {}) {
-        assertValidPattern(pattern);
-        options = options || {};
-        this.options = options;
-        this.maxGlobstarRecursion = options.maxGlobstarRecursion ?? 200;
-        this.pattern = pattern;
-        this.platform = options.platform || defaultPlatform;
-        this.isWindows = this.platform === 'win32';
-        // avoid the annoying deprecation flag lol
-        const awe = ('allowWindow' + 'sEscape');
-        this.windowsPathsNoEscape =
-            !!options.windowsPathsNoEscape || options[awe] === false;
-        if (this.windowsPathsNoEscape) {
-            this.pattern = this.pattern.replace(/\\/g, '/');
-        }
-        this.preserveMultipleSlashes = !!options.preserveMultipleSlashes;
-        this.regexp = null;
-        this.negate = false;
-        this.nonegate = !!options.nonegate;
-        this.comment = false;
-        this.empty = false;
-        this.partial = !!options.partial;
-        this.nocase = !!this.options.nocase;
-        this.windowsNoMagicRoot =
-            options.windowsNoMagicRoot !== undefined ?
-                options.windowsNoMagicRoot
-                : !!(this.isWindows && this.nocase);
-        this.globSet = [];
-        this.globParts = [];
-        this.set = [];
-        // make the set of regexps etc.
-        this.make();
-    }
-    hasMagic() {
-        if (this.options.magicalBraces && this.set.length > 1) {
-            return true;
-        }
-        for (const pattern of this.set) {
-            for (const part of pattern) {
-                if (typeof part !== 'string')
-                    return true;
-            }
-        }
-        return false;
-    }
-    debug(..._) { }
-    make() {
-        const pattern = this.pattern;
-        const options = this.options;
-        // empty patterns and comments match nothing.
-        if (!options.nocomment && pattern.charAt(0) === '#') {
-            this.comment = true;
-            return;
-        }
-        if (!pattern) {
-            this.empty = true;
-            return;
-        }
-        // step 1: figure out negation, etc.
-        this.parseNegate();
-        // step 2: expand braces
-        this.globSet = [...new Set(this.braceExpand())];
-        if (options.debug) {
-            //oxlint-disable-next-line no-console
-            this.debug = (...args) => console.error(...args);
-        }
-        this.debug(this.pattern, this.globSet);
-        // step 3: now we have a set, so turn each one into a series of
-        // path-portion matching patterns.
-        // These will be regexps, except in the case of "**", which is
-        // set to the GLOBSTAR object for globstar behavior,
-        // and will not contain any / characters
-        //
-        // First, we preprocess to make the glob pattern sets a bit simpler
-        // and deduped.  There are some perf-killing patterns that can cause
-        // problems with a glob walk, but we can simplify them down a bit.
-        const rawGlobParts = this.globSet.map(s => this.slashSplit(s));
-        this.globParts = this.preprocess(rawGlobParts);
-        this.debug(this.pattern, this.globParts);
-        // glob --> regexps
-        let set = this.globParts.map((s, _, __) => {
-            if (this.isWindows && this.windowsNoMagicRoot) {
-                // check if it's a drive or unc path.
-                const isUNC = s[0] === '' &&
-                    s[1] === '' &&
-                    (s[2] === '?' || !globMagic.test(s[2])) &&
-                    !globMagic.test(s[3]);
-                const isDrive = /^[a-z]:/i.test(s[0]);
-                if (isUNC) {
-                    return [
-                        ...s.slice(0, 4),
-                        ...s.slice(4).map(ss => this.parse(ss)),
-                    ];
-                }
-                else if (isDrive) {
-                    return [s[0], ...s.slice(1).map(ss => this.parse(ss))];
-                }
-            }
-            return s.map(ss => this.parse(ss));
-        });
-        this.debug(this.pattern, set);
-        // filter out everything that didn't compile properly.
-        this.set = set.filter(s => s.indexOf(false) === -1);
-        // do not treat the ? in UNC paths as magic
-        if (this.isWindows) {
-            for (let i = 0; i < this.set.length; i++) {
-                const p = this.set[i];
-                if (p[0] === '' &&
-                    p[1] === '' &&
-                    this.globParts[i][2] === '?' &&
-                    typeof p[3] === 'string' &&
-                    /^[a-z]:$/i.test(p[3])) {
-                    p[2] = '?';
-                }
-            }
-        }
-        this.debug(this.pattern, this.set);
-    }
-    // various transforms to equivalent pattern sets that are
-    // faster to process in a filesystem walk.  The goal is to
-    // eliminate what we can, and push all ** patterns as far
-    // to the right as possible, even if it increases the number
-    // of patterns that we have to process.
-    preprocess(globParts) {
-        // if we're not in globstar mode, then turn ** into *
-        if (this.options.noglobstar) {
-            for (const partset of globParts) {
-                for (let j = 0; j < partset.length; j++) {
-                    if (partset[j] === '**') {
-                        partset[j] = '*';
-                    }
-                }
-            }
-        }
-        const { optimizationLevel = 1 } = this.options;
-        if (optimizationLevel >= 2) {
-            // aggressive optimization for the purpose of fs walking
-            globParts = this.firstPhasePreProcess(globParts);
-            globParts = this.secondPhasePreProcess(globParts);
-        }
-        else if (optimizationLevel >= 1) {
-            // just basic optimizations to remove some .. parts
-            globParts = this.levelOneOptimize(globParts);
-        }
-        else {
-            // just collapse multiple ** portions into one
-            globParts = this.adjascentGlobstarOptimize(globParts);
-        }
-        return globParts;
-    }
-    // just get rid of adjascent ** portions
-    adjascentGlobstarOptimize(globParts) {
-        return globParts.map(parts => {
-            let gs = -1;
-            while (-1 !== (gs = parts.indexOf('**', gs + 1))) {
-                let i = gs;
-                while (parts[i + 1] === '**') {
-                    i++;
-                }
-                if (i !== gs) {
-                    parts.splice(gs, i - gs);
-                }
-            }
-            return parts;
-        });
-    }
-    // get rid of adjascent ** and resolve .. portions
-    levelOneOptimize(globParts) {
-        return globParts.map(parts => {
-            parts = parts.reduce((set, part) => {
-                const prev = set[set.length - 1];
-                if (part === '**' && prev === '**') {
-                    return set;
-                }
-                if (part === '..') {
-                    if (prev && prev !== '..' && prev !== '.' && prev !== '**') {
-                        set.pop();
-                        return set;
-                    }
-                }
-                set.push(part);
-                return set;
-            }, []);
-            return parts.length === 0 ? [''] : parts;
-        });
-    }
-    levelTwoFileOptimize(parts) {
-        if (!Array.isArray(parts)) {
-            parts = this.slashSplit(parts);
-        }
-        let didSomething = false;
-        do {
-            didSomething = false;
-            // <pre>/<e>/<rest> -> <pre>/<rest>
-            if (!this.preserveMultipleSlashes) {
-                for (let i = 1; i < parts.length - 1; i++) {
-                    const p = parts[i];
-                    // don't squeeze out UNC patterns
-                    if (i === 1 && p === '' && parts[0] === '')
-                        continue;
-                    if (p === '.' || p === '') {
-                        didSomething = true;
-                        parts.splice(i, 1);
-                        i--;
-                    }
-                }
-                if (parts[0] === '.' &&
-                    parts.length === 2 &&
-                    (parts[1] === '.' || parts[1] === '')) {
-                    didSomething = true;
-                    parts.pop();
-                }
-            }
-            // <pre>/<p>/../<rest> -> <pre>/<rest>
-            let dd = 0;
-            while (-1 !== (dd = parts.indexOf('..', dd + 1))) {
-                const p = parts[dd - 1];
-                if (p &&
-                    p !== '.' &&
-                    p !== '..' &&
-                    p !== '**' &&
-                    !(this.isWindows && /^[a-z]:$/i.test(p))) {
-                    didSomething = true;
-                    parts.splice(dd - 1, 2);
-                    dd -= 2;
-                }
-            }
-        } while (didSomething);
-        return parts.length === 0 ? [''] : parts;
-    }
-    // First phase: single-pattern processing
-    // <pre> is 1 or more portions
-    // <rest> is 1 or more portions
-    // <p> is any portion other than ., .., '', or **
-    // <e> is . or ''
-    //
-    // **/.. is *brutal* for filesystem walking performance, because
-    // it effectively resets the recursive walk each time it occurs,
-    // and ** cannot be reduced out by a .. pattern part like a regexp
-    // or most strings (other than .., ., and '') can be.
-    //
-    // <pre>/**/../<p>/<p>/<rest> -> {<pre>/../<p>/<p>/<rest>,<pre>/**/<p>/<p>/<rest>}
-    // <pre>/<e>/<rest> -> <pre>/<rest>
-    // <pre>/<p>/../<rest> -> <pre>/<rest>
-    // **/**/<rest> -> **/<rest>
-    //
-    // **/*/<rest> -> */**/<rest> <== not valid because ** doesn't follow
-    // this WOULD be allowed if ** did follow symlinks, or * didn't
-    firstPhasePreProcess(globParts) {
-        let didSomething = false;
-        do {
-            didSomething = false;
-            // <pre>/**/../<p>/<p>/<rest> -> {<pre>/../<p>/<p>/<rest>,<pre>/**/<p>/<p>/<rest>}
-            for (let parts of globParts) {
-                let gs = -1;
-                while (-1 !== (gs = parts.indexOf('**', gs + 1))) {
-                    let gss = gs;
-                    while (parts[gss + 1] === '**') {
-                        // <pre>/**/**/<rest> -> <pre>/**/<rest>
-                        gss++;
-                    }
-                    // eg, if gs is 2 and gss is 4, that means we have 3 **
-                    // parts, and can remove 2 of them.
-                    if (gss > gs) {
-                        parts.splice(gs + 1, gss - gs);
-                    }
-                    let next = parts[gs + 1];
-                    const p = parts[gs + 2];
-                    const p2 = parts[gs + 3];
-                    if (next !== '..')
-                        continue;
-                    if (!p ||
-                        p === '.' ||
-                        p === '..' ||
-                        !p2 ||
-                        p2 === '.' ||
-                        p2 === '..') {
-                        continue;
-                    }
-                    didSomething = true;
-                    // edit parts in place, and push the new one
-                    parts.splice(gs, 1);
-                    const other = parts.slice(0);
-                    other[gs] = '**';
-                    globParts.push(other);
-                    gs--;
-                }
-                // <pre>/<e>/<rest> -> <pre>/<rest>
-                if (!this.preserveMultipleSlashes) {
-                    for (let i = 1; i < parts.length - 1; i++) {
-                        const p = parts[i];
-                        // don't squeeze out UNC patterns
-                        if (i === 1 && p === '' && parts[0] === '')
-                            continue;
-                        if (p === '.' || p === '') {
-                            didSomething = true;
-                            parts.splice(i, 1);
-                            i--;
-                        }
-                    }
-                    if (parts[0] === '.' &&
-                        parts.length === 2 &&
-                        (parts[1] === '.' || parts[1] === '')) {
-                        didSomething = true;
-                        parts.pop();
-                    }
-                }
-                // <pre>/<p>/../<rest> -> <pre>/<rest>
-                let dd = 0;
-                while (-1 !== (dd = parts.indexOf('..', dd + 1))) {
-                    const p = parts[dd - 1];
-                    if (p && p !== '.' && p !== '..' && p !== '**') {
-                        didSomething = true;
-                        const needDot = dd === 1 && parts[dd + 1] === '**';
-                        const splin = needDot ? ['.'] : [];
-                        parts.splice(dd - 1, 2, ...splin);
-                        if (parts.length === 0)
-                            parts.push('');
-                        dd -= 2;
-                    }
-                }
-            }
-        } while (didSomething);
-        return globParts;
-    }
-    // second phase: multi-pattern dedupes
-    // {<pre>/*/<rest>,<pre>/<p>/<rest>} -> <pre>/*/<rest>
-    // {<pre>/<rest>,<pre>/<rest>} -> <pre>/<rest>
-    // {<pre>/**/<rest>,<pre>/<rest>} -> <pre>/**/<rest>
-    //
-    // {<pre>/**/<rest>,<pre>/**/<p>/<rest>} -> <pre>/**/<rest>
-    // ^-- not valid because ** doens't follow symlinks
-    secondPhasePreProcess(globParts) {
-        for (let i = 0; i < globParts.length - 1; i++) {
-            for (let j = i + 1; j < globParts.length; j++) {
-                const matched = this.partsMatch(globParts[i], globParts[j], !this.preserveMultipleSlashes);
-                if (matched) {
-                    globParts[i] = [];
-                    globParts[j] = matched;
-                    break;
-                }
-            }
-        }
-        return globParts.filter(gs => gs.length);
-    }
-    partsMatch(a, b, emptyGSMatch = false) {
-        let ai = 0;
-        let bi = 0;
-        let result = [];
-        let which = '';
-        while (ai < a.length && bi < b.length) {
-            if (a[ai] === b[bi]) {
-                result.push(which === 'b' ? b[bi] : a[ai]);
-                ai++;
-                bi++;
-            }
-            else if (emptyGSMatch && a[ai] === '**' && b[bi] === a[ai + 1]) {
-                result.push(a[ai]);
-                ai++;
-            }
-            else if (emptyGSMatch && b[bi] === '**' && a[ai] === b[bi + 1]) {
-                result.push(b[bi]);
-                bi++;
-            }
-            else if (a[ai] === '*' &&
-                b[bi] &&
-                (this.options.dot || !b[bi].startsWith('.')) &&
-                b[bi] !== '**') {
-                if (which === 'b')
-                    return false;
-                which = 'a';
-                result.push(a[ai]);
-                ai++;
-                bi++;
-            }
-            else if (b[bi] === '*' &&
-                a[ai] &&
-                (this.options.dot || !a[ai].startsWith('.')) &&
-                a[ai] !== '**') {
-                if (which === 'a')
-                    return false;
-                which = 'b';
-                result.push(b[bi]);
-                ai++;
-                bi++;
-            }
-            else {
-                return false;
-            }
-        }
-        // if we fall out of the loop, it means they two are identical
-        // as long as their lengths match
-        return a.length === b.length && result;
-    }
-    parseNegate() {
-        if (this.nonegate)
-            return;
-        const pattern = this.pattern;
-        let negate = false;
-        let negateOffset = 0;
-        for (let i = 0; i < pattern.length && pattern.charAt(i) === '!'; i++) {
-            negate = !negate;
-            negateOffset++;
-        }
-        if (negateOffset)
-            this.pattern = pattern.slice(negateOffset);
-        this.negate = negate;
-    }
-    // set partial to true to test if, for example,
-    // "/a/b" matches the start of "/*/b/*/d"
-    // Partial means, if you run out of file before you run
-    // out of pattern, then that's fine, as long as all
-    // the parts match.
-    matchOne(file, pattern, partial = false) {
-        let fileStartIndex = 0;
-        let patternStartIndex = 0;
-        // UNC paths like //?/X:/... can match X:/... and vice versa
-        // Drive letters in absolute drive or unc paths are always compared
-        // case-insensitively.
-        if (this.isWindows) {
-            const fileDrive = typeof file[0] === 'string' && /^[a-z]:$/i.test(file[0]);
-            const fileUNC = !fileDrive &&
-                file[0] === '' &&
-                file[1] === '' &&
-                file[2] === '?' &&
-                /^[a-z]:$/i.test(file[3]);
-            const patternDrive = typeof pattern[0] === 'string' && /^[a-z]:$/i.test(pattern[0]);
-            const patternUNC = !patternDrive &&
-                pattern[0] === '' &&
-                pattern[1] === '' &&
-                pattern[2] === '?' &&
-                typeof pattern[3] === 'string' &&
-                /^[a-z]:$/i.test(pattern[3]);
-            const fdi = fileUNC ? 3
-                : fileDrive ? 0
-                    : undefined;
-            const pdi = patternUNC ? 3
-                : patternDrive ? 0
-                    : undefined;
-            if (typeof fdi === 'number' && typeof pdi === 'number') {
-                const [fd, pd] = [
-                    file[fdi],
-                    pattern[pdi],
-                ];
-                // start matching at the drive letter index of each
-                if (fd.toLowerCase() === pd.toLowerCase()) {
-                    pattern[pdi] = fd;
-                    patternStartIndex = pdi;
-                    fileStartIndex = fdi;
-                }
-            }
-        }
-        // resolve and reduce . and .. portions in the file as well.
-        // don't need to do the second phase, because it's only one string[]
-        const { optimizationLevel = 1 } = this.options;
-        if (optimizationLevel >= 2) {
-            file = this.levelTwoFileOptimize(file);
-        }
-        if (pattern.includes(GLOBSTAR)) {
-            return this.#matchGlobstar(file, pattern, partial, fileStartIndex, patternStartIndex);
-        }
-        return this.#matchOne(file, pattern, partial, fileStartIndex, patternStartIndex);
-    }
-    #matchGlobstar(file, pattern, partial, fileIndex, patternIndex) {
-        // split the pattern into head, tail, and middle of ** delimited parts
-        const firstgs = pattern.indexOf(GLOBSTAR, patternIndex);
-        const lastgs = pattern.lastIndexOf(GLOBSTAR);
-        // split the pattern up into globstar-delimited sections
-        // the tail has to be at the end, and the others just have
-        // to be found in order from the head.
-        const [head, body, tail] = partial ?
-            [
-                pattern.slice(patternIndex, firstgs),
-                pattern.slice(firstgs + 1),
-                [],
-            ]
-            : [
-                pattern.slice(patternIndex, firstgs),
-                pattern.slice(firstgs + 1, lastgs),
-                pattern.slice(lastgs + 1),
-            ];
-        // check the head, from the current file/pattern index.
-        if (head.length) {
-            const fileHead = file.slice(fileIndex, fileIndex + head.length);
-            if (!this.#matchOne(fileHead, head, partial, 0, 0)) {
-                return false;
-            }
-            fileIndex += head.length;
-            patternIndex += head.length;
-        }
-        // now we know the head matches!
-        // if the last portion is not empty, it MUST match the end
-        // check the tail
-        let fileTailMatch = 0;
-        if (tail.length) {
-            // if head + tail > file, then we cannot possibly match
-            if (tail.length + fileIndex > file.length)
-                return false;
-            // try to match the tail
-            let tailStart = file.length - tail.length;
-            if (this.#matchOne(file, tail, partial, tailStart, 0)) {
-                fileTailMatch = tail.length;
-            }
-            else {
-                // affordance for stuff like a/**/* matching a/b/
-                // if the last file portion is '', and there's more to the pattern
-                // then try without the '' bit.
-                if (file[file.length - 1] !== '' ||
-                    fileIndex + tail.length === file.length) {
-                    return false;
-                }
-                tailStart--;
-                if (!this.#matchOne(file, tail, partial, tailStart, 0)) {
-                    return false;
-                }
-                fileTailMatch = tail.length + 1;
-            }
-        }
-        // now we know the tail matches!
-        // the middle is zero or more portions wrapped in **, possibly
-        // containing more ** sections.
-        // so a/**/b/**/c/**/d has become **/b/**/c/**
-        // if it's empty, it means a/**/b, just verify we have no bad dots
-        // if there's no tail, so it ends on /**, then we must have *something*
-        // after the head, or it's not a matc
-        if (!body.length) {
-            let sawSome = !!fileTailMatch;
-            for (let i = fileIndex; i < file.length - fileTailMatch; i++) {
-                const f = String(file[i]);
-                sawSome = true;
-                if (f === '.' ||
-                    f === '..' ||
-                    (!this.options.dot && f.startsWith('.'))) {
-                    return false;
-                }
-            }
-            // in partial mode, we just need to get past all file parts
-            return partial || sawSome;
-        }
-        // now we know that there's one or more body sections, which can
-        // be matched anywhere from the 0 index (because the head was pruned)
-        // through to the length-fileTailMatch index.
-        // split the body up into sections, and note the minimum index it can
-        // be found at (start with the length of all previous segments)
-        // [section, before, after]
-        const bodySegments = [[[], 0]];
-        let currentBody = bodySegments[0];
-        let nonGsParts = 0;
-        const nonGsPartsSums = [0];
-        for (const b of body) {
-            if (b === GLOBSTAR) {
-                nonGsPartsSums.push(nonGsParts);
-                currentBody = [[], 0];
-                bodySegments.push(currentBody);
-            }
-            else {
-                currentBody[0].push(b);
-                nonGsParts++;
-            }
-        }
-        let i = bodySegments.length - 1;
-        const fileLength = file.length - fileTailMatch;
-        for (const b of bodySegments) {
-            b[1] = fileLength - (nonGsPartsSums[i--] + b[0].length);
-        }
-        return !!this.#matchGlobStarBodySections(file, bodySegments, fileIndex, 0, partial, 0, !!fileTailMatch);
-    }
-    // return false for "nope, not matching"
-    // return null for "not matching, cannot keep trying"
-    #matchGlobStarBodySections(file, 
-    // pattern section, last possible position for it
-    bodySegments, fileIndex, bodyIndex, partial, globStarDepth, sawTail) {
-        // take the first body segment, and walk from fileIndex to its "after"
-        // value at the end
-        // If it doesn't match at that position, we increment, until we hit
-        // that final possible position, and give up.
-        // If it does match, then advance and try to rest.
-        // If any of them fail we keep walking forward.
-        // this is still a bit recursively painful, but it's more constrained
-        // than previous implementations, because we never test something that
-        // can't possibly be a valid matching condition.
-        const bs = bodySegments[bodyIndex];
-        if (!bs) {
-            // just make sure that there's no bad dots
-            for (let i = fileIndex; i < file.length; i++) {
-                sawTail = true;
-                const f = file[i];
-                if (f === '.' ||
-                    f === '..' ||
-                    (!this.options.dot && f.startsWith('.'))) {
-                    return false;
-                }
-            }
-            return sawTail;
-        }
-        // have a non-globstar body section to test
-        const [body, after] = bs;
-        while (fileIndex <= after) {
-            const m = this.#matchOne(file.slice(0, fileIndex + body.length), body, partial, fileIndex, 0);
-            // if limit exceeded, no match. intentional false negative,
-            // acceptable break in correctness for security.
-            if (m && globStarDepth < this.maxGlobstarRecursion) {
-                // match! see if the rest match. if so, we're done!
-                const sub = this.#matchGlobStarBodySections(file, bodySegments, fileIndex + body.length, bodyIndex + 1, partial, globStarDepth + 1, sawTail);
-                if (sub !== false) {
-                    return sub;
-                }
-            }
-            const f = file[fileIndex];
-            if (f === '.' ||
-                f === '..' ||
-                (!this.options.dot && f.startsWith('.'))) {
-                return false;
-            }
-            fileIndex++;
-        }
-        // walked off. no point continuing
-        return partial || null;
-    }
-    #matchOne(file, pattern, partial, fileIndex, patternIndex) {
-        let fi;
-        let pi;
-        let pl;
-        let fl;
-        for (fi = fileIndex,
-            pi = patternIndex,
-            fl = file.length,
-            pl = pattern.length; fi < fl && pi < pl; fi++, pi++) {
-            this.debug('matchOne loop');
-            let p = pattern[pi];
-            let f = file[fi];
-            this.debug(pattern, p, f);
-            // should be impossible.
-            // some invalid regexp stuff in the set.
-            /* c8 ignore start */
-            if (p === false || p === GLOBSTAR) {
-                return false;
-            }
-            /* c8 ignore stop */
-            // something other than **
-            // non-magic patterns just have to match exactly
-            // patterns with magic have been turned into regexps.
-            let hit;
-            if (typeof p === 'string') {
-                hit = f === p;
-                this.debug('string match', p, f, hit);
-            }
-            else {
-                hit = p.test(f);
-                this.debug('pattern match', p, f, hit);
-            }
-            if (!hit)
-                return false;
-        }
-        // Note: ending in / means that we'll get a final ""
-        // at the end of the pattern.  This can only match a
-        // corresponding "" at the end of the file.
-        // If the file ends in /, then it can only match a
-        // a pattern that ends in /, unless the pattern just
-        // doesn't have any more for it. But, a/b/ should *not*
-        // match "a/b/*", even though "" matches against the
-        // [^/]*? pattern, except in partial mode, where it might
-        // simply not be reached yet.
-        // However, a/b/ should still satisfy a/*
-        // now either we fell off the end of the pattern, or we're done.
-        if (fi === fl && pi === pl) {
-            // ran out of pattern and filename at the same time.
-            // an exact hit!
-            return true;
-        }
-        else if (fi === fl) {
-            // ran out of file, but still had pattern left.
-            // this is ok if we're doing the match as part of
-            // a glob fs traversal.
-            return partial;
-        }
-        else if (pi === pl) {
-            // ran out of pattern, still have file left.
-            // this is only acceptable if we're on the very last
-            // empty segment of a file with a trailing slash.
-            // a/* should match a/b/
-            return fi === fl - 1 && file[fi] === '';
-            /* c8 ignore start */
-        }
-        else {
-            // should be unreachable.
-            throw new Error('wtf?');
-        }
-        /* c8 ignore stop */
-    }
-    braceExpand() {
-        return braceExpand(this.pattern, this.options);
-    }
-    parse(pattern) {
-        assertValidPattern(pattern);
-        const options = this.options;
-        // shortcuts
-        if (pattern === '**')
-            return GLOBSTAR;
-        if (pattern === '')
-            return '';
-        // far and away, the most common glob pattern parts are
-        // *, *.*, and *.<ext>  Add a fast check method for those.
-        let m;
-        let fastTest = null;
-        if ((m = pattern.match(starRE))) {
-            fastTest = options.dot ? starTestDot : starTest;
-        }
-        else if ((m = pattern.match(starDotExtRE))) {
-            fastTest = (options.nocase ?
-                options.dot ?
-                    starDotExtTestNocaseDot
-                    : starDotExtTestNocase
-                : options.dot ? starDotExtTestDot
-                    : starDotExtTest)(m[1]);
-        }
-        else if ((m = pattern.match(qmarksRE))) {
-            fastTest = (options.nocase ?
-                options.dot ?
-                    qmarksTestNocaseDot
-                    : qmarksTestNocase
-                : options.dot ? qmarksTestDot
-                    : qmarksTest)(m);
-        }
-        else if ((m = pattern.match(starDotStarRE))) {
-            fastTest = options.dot ? starDotStarTestDot : starDotStarTest;
-        }
-        else if ((m = pattern.match(dotStarRE))) {
-            fastTest = dotStarTest;
-        }
-        const re = AST.fromGlob(pattern, this.options).toMMPattern();
-        if (fastTest && typeof re === 'object') {
-            // Avoids overriding in frozen environments
-            Reflect.defineProperty(re, 'test', { value: fastTest });
-        }
-        return re;
-    }
-    makeRe() {
-        if (this.regexp || this.regexp === false)
-            return this.regexp;
-        // at this point, this.set is a 2d array of partial
-        // pattern strings, or "**".
-        //
-        // It's better to use .match().  This function shouldn't
-        // be used, really, but it's pretty convenient sometimes,
-        // when you just want to work with a regex.
-        const set = this.set;
-        if (!set.length) {
-            this.regexp = false;
-            return this.regexp;
-        }
-        const options = this.options;
-        const twoStar = options.noglobstar ? esm_star
-            : options.dot ? twoStarDot
-                : twoStarNoDot;
-        const flags = new Set(options.nocase ? ['i'] : []);
-        // regexpify non-globstar patterns
-        // if ** is only item, then we just do one twoStar
-        // if ** is first, and there are more, prepend (\/|twoStar\/)? to next
-        // if ** is last, append (\/twoStar|) to previous
-        // if ** is in the middle, append (\/|\/twoStar\/) to previous
-        // then filter out GLOBSTAR symbols
-        let re = set
-            .map(pattern => {
-            const pp = pattern.map(p => {
-                if (p instanceof RegExp) {
-                    for (const f of p.flags.split(''))
-                        flags.add(f);
-                }
-                return (typeof p === 'string' ? esm_regExpEscape(p)
-                    : p === GLOBSTAR ? GLOBSTAR
-                        : p._src);
-            });
-            pp.forEach((p, i) => {
-                const next = pp[i + 1];
-                const prev = pp[i - 1];
-                if (p !== GLOBSTAR || prev === GLOBSTAR) {
-                    return;
-                }
-                if (prev === undefined) {
-                    if (next !== undefined && next !== GLOBSTAR) {
-                        pp[i + 1] = '(?:\\/|' + twoStar + '\\/)?' + next;
-                    }
-                    else {
-                        pp[i] = twoStar;
-                    }
-                }
-                else if (next === undefined) {
-                    pp[i - 1] = prev + '(?:\\/|\\/' + twoStar + ')?';
-                }
-                else if (next !== GLOBSTAR) {
-                    pp[i - 1] = prev + '(?:\\/|\\/' + twoStar + '\\/)' + next;
-                    pp[i + 1] = GLOBSTAR;
-                }
-            });
-            const filtered = pp.filter(p => p !== GLOBSTAR);
-            // For partial matches, we need to make the pattern match
-            // any prefix of the full path. We do this by generating
-            // alternative patterns that match progressively longer prefixes.
-            if (this.partial && filtered.length >= 1) {
-                const prefixes = [];
-                for (let i = 1; i <= filtered.length; i++) {
-                    prefixes.push(filtered.slice(0, i).join('/'));
-                }
-                return '(?:' + prefixes.join('|') + ')';
-            }
-            return filtered.join('/');
-        })
-            .join('|');
-        // need to wrap in parens if we had more than one thing with |,
-        // otherwise only the first will be anchored to ^ and the last to $
-        const [open, close] = set.length > 1 ? ['(?:', ')'] : ['', ''];
-        // must match entire pattern
-        // ending in a * or ** will make it less strict.
-        re = '^' + open + re + close + '$';
-        // In partial mode, '/' should always match as it's a valid prefix for any pattern
-        if (this.partial) {
-            re = '^(?:\\/|' + open + re.slice(1, -1) + close + ')$';
-        }
-        // can match anything, as long as it's not this.
-        if (this.negate)
-            re = '^(?!' + re + ').+$';
-        try {
-            this.regexp = new RegExp(re, [...flags].join(''));
-            /* c8 ignore start */
-        }
-        catch {
-            // should be impossible
-            this.regexp = false;
-        }
-        /* c8 ignore stop */
-        return this.regexp;
-    }
-    slashSplit(p) {
-        // if p starts with // on windows, we preserve that
-        // so that UNC paths aren't broken.  Otherwise, any number of
-        // / characters are coalesced into one, unless
-        // preserveMultipleSlashes is set to true.
-        if (this.preserveMultipleSlashes) {
-            return p.split('/');
-        }
-        else if (this.isWindows && /^\/\/[^/]+/.test(p)) {
-            // add an extra '' for the one we lose
-            return ['', ...p.split(/\/+/)];
-        }
-        else {
-            return p.split(/\/+/);
-        }
-    }
-    match(f, partial = this.partial) {
-        this.debug('match', f, this.pattern);
-        // short-circuit in the case of busted things.
-        // comments, etc.
-        if (this.comment) {
-            return false;
-        }
-        if (this.empty) {
-            return f === '';
-        }
-        if (f === '/' && partial) {
-            return true;
-        }
-        const options = this.options;
-        // windows: need to use /, not \
-        if (this.isWindows) {
-            f = f.split('\\').join('/');
-        }
-        // treat the test path as a set of pathparts.
-        const ff = this.slashSplit(f);
-        this.debug(this.pattern, 'split', ff);
-        // just ONE of the pattern sets in this.set needs to match
-        // in order for it to be valid.  If negating, then just one
-        // match means that we have failed.
-        // Either way, return on the first hit.
-        const set = this.set;
-        this.debug(this.pattern, 'set', set);
-        // Find the basename of the path by looking for the last non-empty segment
-        let filename = ff[ff.length - 1];
-        if (!filename) {
-            for (let i = ff.length - 2; !filename && i >= 0; i--) {
-                filename = ff[i];
-            }
-        }
-        for (const pattern of set) {
-            let file = ff;
-            if (options.matchBase && pattern.length === 1) {
-                file = [filename];
-            }
-            const hit = this.matchOne(file, pattern, partial);
-            if (hit) {
-                if (options.flipNegate) {
-                    return true;
-                }
-                return !this.negate;
-            }
-        }
-        // didn't get any hits.  this is success if it's a negative
-        // pattern, failure otherwise.
-        if (options.flipNegate) {
-            return false;
-        }
-        return this.negate;
-    }
-    static defaults(def) {
-        return minimatch.defaults(def).Minimatch;
-    }
-}
-/* c8 ignore start */
-
-
-
-/* c8 ignore stop */
-minimatch.AST = AST;
-minimatch.Minimatch = Minimatch;
-minimatch.escape = escape_escape;
-minimatch.unescape = unescape_unescape;
-//# sourceMappingURL=index.js.map
-;// CONCATENATED MODULE: external "node:module"
-const external_node_module_namespaceObject = require("node:module");
-;// CONCATENATED MODULE: ./node_modules/@electron/asar/lib/wrapped-fs.js
-
-const wrapped_fs_require = (0,external_node_module_namespaceObject.createRequire)("file:///C:/Dev/bulidalon/activate-unity-license/node_modules/@electron/asar/lib/wrapped-fs.js");
-const wrapped_fs_fs = 'electron' in process.versions ? wrapped_fs_require('original-fs') : wrapped_fs_require('node:fs');
-const promisifiedMethods = [
-    'lstat',
-    'mkdtemp',
-    'readFile',
-    'stat',
-    'writeFile',
-    'symlink',
-    'readlink',
-];
-const wrappedFs = Object.keys(wrapped_fs_fs).reduce((accum, method) => {
-    return {
-        ...accum,
-        [method]: promisifiedMethods.includes(method) ? wrapped_fs_fs.promises[method] : wrapped_fs_fs[method],
-    };
-}, {
-    // To make it more like fs-extra
-    mkdirp: (dir) => wrapped_fs_fs.promises.mkdir(dir, { recursive: true }),
-    mkdirpSync: (dir) => wrapped_fs_fs.mkdirSync(dir, { recursive: true }),
-});
-//# sourceMappingURL=wrapped-fs.js.map
-;// CONCATENATED MODULE: external "node:os"
-const external_node_os_namespaceObject = require("node:os");
-;// CONCATENATED MODULE: external "node:stream/promises"
-const promises_namespaceObject = require("node:stream/promises");
-// EXTERNAL MODULE: external "node:crypto"
-var external_node_crypto_ = __nccwpck_require__(6005);
-// EXTERNAL MODULE: external "node:stream"
-var external_node_stream_ = __nccwpck_require__(4492);
-;// CONCATENATED MODULE: ./node_modules/@electron/asar/lib/integrity.js
-
-
-
-const ALGORITHM = 'SHA256';
-// 4MB default block size
-const BLOCK_SIZE = 4 * 1024 * 1024;
-async function getFileIntegrity(inputFileStream) {
-    const fileHash = external_node_crypto_.createHash(ALGORITHM);
-    const blockHashes = [];
-    let blockHash = external_node_crypto_.createHash(ALGORITHM);
-    let currentBlockSize = 0;
-    await promises_namespaceObject.pipeline(inputFileStream, new external_node_stream_.PassThrough({
-        decodeStrings: false,
-        transform(_chunk, encoding, callback) {
-            fileHash.update(_chunk);
-            let offset = 0;
-            while (offset < _chunk.byteLength) {
-                const remaining = BLOCK_SIZE - currentBlockSize;
-                const end = Math.min(offset + remaining, _chunk.byteLength);
-                const slice = offset === 0 && end === _chunk.byteLength ? _chunk : _chunk.subarray(offset, end);
-                blockHash.update(slice);
-                currentBlockSize += end - offset;
-                if (currentBlockSize === BLOCK_SIZE) {
-                    blockHashes.push(blockHash.digest('hex'));
-                    blockHash = external_node_crypto_.createHash(ALGORITHM);
-                    currentBlockSize = 0;
-                }
-                offset = end;
-            }
-            callback();
-        },
-        flush(callback) {
-            if (currentBlockSize > 0 || blockHashes.length === 0) {
-                blockHashes.push(blockHash.digest('hex'));
-            }
-            callback();
-        },
-    }));
-    return {
-        algorithm: ALGORITHM,
-        hash: fileHash.digest('hex'),
-        blockSize: BLOCK_SIZE,
-        blocks: blockHashes,
-    };
-}
-function getFileIntegrityFromBuffer(data) {
-    const hash = external_node_crypto_.createHash(ALGORITHM).update(data).digest('hex');
-    const blocks = [];
-    for (let offset = 0; offset < data.length; offset += BLOCK_SIZE) {
-        const end = Math.min(offset + BLOCK_SIZE, data.length);
-        blocks.push(external_node_crypto_.createHash(ALGORITHM).update(data.subarray(offset, end)).digest('hex'));
-    }
-    if (data.length === 0) {
-        blocks.push(external_node_crypto_.createHash(ALGORITHM).update(data).digest('hex'));
-    }
-    return { algorithm: ALGORITHM, hash, blockSize: BLOCK_SIZE, blocks };
-}
-//# sourceMappingURL=integrity.js.map
-;// CONCATENATED MODULE: ./node_modules/@electron/asar/lib/filesystem.js
-
-
-
-
-
-const UINT32_MAX = 2 ** 32 - 1;
-// Files smaller than this use buffer-based integrity hashing (avoids stream overhead).
-// Files larger than this use streaming to avoid holding large buffers in memory.
-const BUFFER_HASH_THRESHOLD = 2 * 1024 * 1024; // 2MB
-class Filesystem {
-    src;
-    header;
-    headerSize;
-    offset;
-    constructor(src) {
-        this.src = external_node_path_.resolve(src);
-        this.header = { files: Object.create(null) };
-        this.headerSize = 0;
-        this.offset = BigInt(0);
-    }
-    getRootPath() {
-        return this.src;
-    }
-    getHeader() {
-        return this.header;
-    }
-    getHeaderSize() {
-        return this.headerSize;
-    }
-    setHeader(header, headerSize) {
-        this.header = header;
-        this.headerSize = headerSize;
-    }
-    searchNodeFromDirectory(p) {
-        let json = this.header;
-        const dirs = p.split(external_node_path_.sep);
-        for (const dir of dirs) {
-            if (dir !== '.') {
-                if ('files' in json) {
-                    if (!json.files[dir]) {
-                        json.files[dir] = { files: Object.create(null) };
-                    }
-                    json = json.files[dir];
-                }
-                else {
-                    throw new Error('Unexpected directory state while traversing: ' + p);
-                }
-            }
-        }
-        return json;
-    }
-    searchNodeFromPath(p) {
-        p = external_node_path_.relative(this.src, p);
-        if (!p) {
-            return this.header;
-        }
-        const name = external_node_path_.basename(p);
-        const node = this.searchNodeFromDirectory(external_node_path_.dirname(p));
-        if (!node.files) {
-            node.files = Object.create(null);
-        }
-        if (!node.files[name]) {
-            node.files[name] = Object.create(null);
-        }
-        return node.files[name];
-    }
-    insertDirectory(p, shouldUnpack) {
-        const node = this.searchNodeFromPath(p);
-        if (shouldUnpack) {
-            node.unpacked = shouldUnpack;
-        }
-        node.files = node.files || Object.create(null);
-        return node.files;
-    }
-    insertFile(p, streamGenerator, shouldUnpack, file, options = {}) {
-        const dirNode = this.searchNodeFromPath(external_node_path_.dirname(p));
-        const node = this.searchNodeFromPath(p);
-        if (shouldUnpack || dirNode.unpacked) {
-            node.size = file.stat.size;
-            node.unpacked = true;
-            return getFileIntegrity(streamGenerator()).then((integrity) => {
-                node.integrity = integrity;
-            });
-        }
-        const transformed = options.transform && options.transform(p);
-        if (transformed) {
-            return this.insertFileAsync(p, streamGenerator, file, node, transformed);
-        }
-        const size = file.stat.size;
-        // JavaScript cannot precisely present integers >= UINT32_MAX.
-        if (size > UINT32_MAX) {
-            throw new Error(`${p}: file size can not be larger than 4.2GB`);
-        }
-        node.size = size;
-        node.offset = this.offset.toString();
-        if (process.platform !== 'win32' && file.stat.mode & 0o100) {
-            node.executable = true;
-        }
-        if (size <= BUFFER_HASH_THRESHOLD) {
-            // Fully synchronous fast path — no Promise, no stream, no microtask yield
-            try {
-                const fileBuffer = wrappedFs.readFileSync(p);
-                node.integrity = getFileIntegrityFromBuffer(fileBuffer);
-                file.cachedBuffer = fileBuffer;
-                this.offset += BigInt(size);
-                return Promise.resolve();
-            }
-            catch {
-                // Fall through to stream path
-            }
-        }
-        return getFileIntegrity(streamGenerator()).then((integrity) => {
-            node.integrity = integrity;
-            this.offset += BigInt(size);
-        });
-    }
-    async insertFileAsync(p, streamGenerator, file, node, transformed) {
-        const tmpdir = await wrappedFs.mkdtemp(external_node_path_.join(external_node_os_namespaceObject.tmpdir(), 'asar-'));
-        const tmpfile = external_node_path_.join(tmpdir, external_node_path_.basename(p));
-        const out = wrappedFs.createWriteStream(tmpfile);
-        await promises_namespaceObject.pipeline(streamGenerator(), transformed, out);
-        file.transformed = {
-            path: tmpfile,
-            stat: await wrappedFs.lstat(tmpfile),
-        };
-        const size = file.transformed.stat.size;
-        if (size > UINT32_MAX) {
-            throw new Error(`${p}: file size can not be larger than 4.2GB`);
-        }
-        node.size = size;
-        node.offset = this.offset.toString();
-        if (process.platform !== 'win32' && file.stat.mode & 0o100) {
-            node.executable = true;
-        }
-        node.integrity = await getFileIntegrity(streamGenerator());
-        this.offset += BigInt(size);
-    }
-    insertLink(p, shouldUnpack, parentPath = wrappedFs.realpathSync(external_node_path_.dirname(p)), symlink = wrappedFs.readlinkSync(p), // /var/tmp => /private/var
-    src = wrappedFs.realpathSync(this.src)) {
-        const link = this.resolveLink(src, parentPath, symlink);
-        if (link.startsWith('..')) {
-            throw new Error(`${p}: file "${link}" links out of the package`);
-        }
-        const node = this.searchNodeFromPath(p);
-        const dirNode = this.searchNodeFromPath(external_node_path_.dirname(p));
-        if (shouldUnpack || dirNode.unpacked) {
-            node.unpacked = true;
-        }
-        node.link = link;
-        return link;
-    }
-    resolveLink(src, parentPath, symlink) {
-        const target = external_node_path_.join(parentPath, symlink);
-        const link = external_node_path_.relative(src, target);
-        return link;
-    }
-    listFiles(options) {
-        const files = [];
-        const fillFilesFromMetadata = function (basePath, metadata) {
-            if (!('files' in metadata)) {
-                return;
-            }
-            for (const [childPath, childMetadata] of Object.entries(metadata.files)) {
-                const fullPath = external_node_path_.join(basePath, childPath);
-                const packState = 'unpacked' in childMetadata && childMetadata.unpacked ? 'unpack' : 'pack  ';
-                files.push(options && options.isPack ? `${packState} : ${fullPath}` : fullPath);
-                fillFilesFromMetadata(fullPath, childMetadata);
-            }
-        };
-        fillFilesFromMetadata('/', this.header);
-        return files;
-    }
-    getNode(p, followLinks = true) {
-        const node = this.searchNodeFromDirectory(external_node_path_.dirname(p));
-        const name = external_node_path_.basename(p);
-        if ('link' in node && followLinks) {
-            return this.getNode(external_node_path_.join(node.link, name));
-        }
-        if (name) {
-            return node.files[name];
-        }
-        else {
-            return node;
-        }
-    }
-    getFile(p, followLinks = true) {
-        const info = this.getNode(p, followLinks);
-        if (!info) {
-            throw new Error(`"${p}" was not found in this archive`);
-        }
-        // if followLinks is false we don't resolve symlinks
-        if ('link' in info && followLinks) {
-            return this.getFile(info.link, followLinks);
-        }
-        else {
-            return info;
-        }
-    }
-}
-//# sourceMappingURL=filesystem.js.map
-;// CONCATENATED MODULE: ./node_modules/@electron/asar/lib/pickle.js
-// sizeof(T).
-const SIZE_INT32 = 4;
-const SIZE_UINT32 = 4;
-const SIZE_INT64 = 8;
-const SIZE_UINT64 = 8;
-const SIZE_FLOAT = 4;
-const SIZE_DOUBLE = 8;
-// The allocation granularity of the payload.
-const PAYLOAD_UNIT = 64;
-// Largest JS number.
-const CAPACITY_READ_ONLY = 9007199254740992;
-// Aligns 'i' by rounding it up to the next multiple of 'alignment'.
-const alignInt = function (i, alignment) {
-    return i + ((alignment - (i % alignment)) % alignment);
-};
-// PickleIterator reads data from a Pickle. The Pickle object must remain valid
-// while the PickleIterator object is in use.
-class PickleIterator {
-    payload;
-    payloadOffset;
-    readIndex;
-    endIndex;
-    constructor(pickle) {
-        this.payload = pickle.getHeader();
-        this.payloadOffset = pickle.getHeaderSize();
-        this.readIndex = 0;
-        this.endIndex = pickle.getPayloadSize();
-    }
-    readBool() {
-        return this.readInt() !== 0;
-    }
-    readInt() {
-        return this.readBytes(SIZE_INT32, Buffer.prototype.readInt32LE);
-    }
-    readUInt32() {
-        return this.readBytes(SIZE_UINT32, Buffer.prototype.readUInt32LE);
-    }
-    readInt64() {
-        return this.readBytes(SIZE_INT64, Buffer.prototype.readBigInt64LE);
-    }
-    readUInt64() {
-        return this.readBytes(SIZE_UINT64, Buffer.prototype.readBigUInt64LE);
-    }
-    readFloat() {
-        return this.readBytes(SIZE_FLOAT, Buffer.prototype.readFloatLE);
-    }
-    readDouble() {
-        return this.readBytes(SIZE_DOUBLE, Buffer.prototype.readDoubleLE);
-    }
-    readString() {
-        return this.readBytes(this.readInt()).toString();
-    }
-    readBytes(length, method) {
-        const readPayloadOffset = this.getReadPayloadOffsetAndAdvance(length);
-        if (method != null) {
-            return method.call(this.payload, readPayloadOffset, length);
-        }
-        else {
-            return this.payload.slice(readPayloadOffset, readPayloadOffset + length);
-        }
-    }
-    getReadPayloadOffsetAndAdvance(length) {
-        if (length > this.endIndex - this.readIndex) {
-            this.readIndex = this.endIndex;
-            throw new Error('Failed to read data with length of ' + length);
-        }
-        const readPayloadOffset = this.payloadOffset + this.readIndex;
-        this.advance(length);
-        return readPayloadOffset;
-    }
-    advance(size) {
-        const alignedSize = alignInt(size, SIZE_UINT32);
-        if (this.endIndex - this.readIndex < alignedSize) {
-            this.readIndex = this.endIndex;
-        }
-        else {
-            this.readIndex += alignedSize;
-        }
-    }
-}
-// This class provides facilities for basic binary value packing and unpacking.
-//
-// The Pickle class supports appending primitive values (ints, strings, etc.)
-// to a pickle instance.  The Pickle instance grows its internal memory buffer
-// dynamically to hold the sequence of primitive values.   The internal memory
-// buffer is exposed as the "data" of the Pickle.  This "data" can be passed
-// to a Pickle object to initialize it for reading.
-//
-// When reading from a Pickle object, it is important for the consumer to know
-// what value types to read and in what order to read them as the Pickle does
-// not keep track of the type of data written to it.
-//
-// The Pickle's data has a header which contains the size of the Pickle's
-// payload.  It can optionally support additional space in the header.  That
-// space is controlled by the header_size parameter passed to the Pickle
-// constructor.
-class Pickle {
-    header;
-    headerSize;
-    capacityAfterHeader;
-    writeOffset;
-    constructor(buffer) {
-        if (buffer) {
-            this.header = buffer;
-            this.headerSize = buffer.length - this.getPayloadSize();
-            this.capacityAfterHeader = CAPACITY_READ_ONLY;
-            this.writeOffset = 0;
-            if (this.headerSize > buffer.length) {
-                this.headerSize = 0;
-            }
-            if (this.headerSize !== alignInt(this.headerSize, SIZE_UINT32)) {
-                this.headerSize = 0;
-            }
-            if (this.headerSize === 0) {
-                this.header = Buffer.alloc(0);
-            }
-        }
-        else {
-            this.header = Buffer.alloc(0);
-            this.headerSize = SIZE_UINT32;
-            this.capacityAfterHeader = 0;
-            this.writeOffset = 0;
-            this.resize(PAYLOAD_UNIT);
-            this.setPayloadSize(0);
-        }
-    }
-    static createEmpty() {
-        return new Pickle();
-    }
-    static createFromBuffer(buffer) {
-        return new Pickle(buffer);
-    }
-    getHeader() {
-        return this.header;
-    }
-    getHeaderSize() {
-        return this.headerSize;
-    }
-    createIterator() {
-        return new PickleIterator(this);
-    }
-    toBuffer() {
-        return this.header.slice(0, this.headerSize + this.getPayloadSize());
-    }
-    writeBool(value) {
-        return this.writeInt(value ? 1 : 0);
-    }
-    writeInt(value) {
-        return this.writeBytes(value, SIZE_INT32, Buffer.prototype.writeInt32LE);
-    }
-    writeUInt32(value) {
-        return this.writeBytes(value, SIZE_UINT32, Buffer.prototype.writeUInt32LE);
-    }
-    writeInt64(value) {
-        return this.writeBytes(BigInt(value), SIZE_INT64, Buffer.prototype.writeBigInt64LE);
-    }
-    writeUInt64(value) {
-        return this.writeBytes(BigInt(value), SIZE_UINT64, Buffer.prototype.writeBigUInt64LE);
-    }
-    writeFloat(value) {
-        return this.writeBytes(value, SIZE_FLOAT, Buffer.prototype.writeFloatLE);
-    }
-    writeDouble(value) {
-        return this.writeBytes(value, SIZE_DOUBLE, Buffer.prototype.writeDoubleLE);
-    }
-    writeString(value) {
-        const length = Buffer.byteLength(value, 'utf8');
-        if (!this.writeInt(length)) {
-            return false;
-        }
-        return this.writeBytes(value, length);
-    }
-    setPayloadSize(payloadSize) {
-        return this.header.writeUInt32LE(payloadSize, 0);
-    }
-    getPayloadSize() {
-        return this.header.readUInt32LE(0);
-    }
-    writeBytes(data, length, method) {
-        const dataLength = alignInt(length, SIZE_UINT32);
-        const newSize = this.writeOffset + dataLength;
-        if (newSize > this.capacityAfterHeader) {
-            this.resize(Math.max(this.capacityAfterHeader * 2, newSize));
-        }
-        if (method) {
-            method.call(this.header, data, this.headerSize + this.writeOffset);
-        }
-        else {
-            this.header.write(data, this.headerSize + this.writeOffset, length);
-        }
-        const endOffset = this.headerSize + this.writeOffset + length;
-        this.header.fill(0, endOffset, endOffset + dataLength - length);
-        this.setPayloadSize(newSize);
-        this.writeOffset = newSize;
-        return true;
-    }
-    resize(newCapacity) {
-        newCapacity = alignInt(newCapacity, PAYLOAD_UNIT);
-        const newHeader = Buffer.alloc(this.headerSize + newCapacity);
-        this.header.copy(newHeader, 0, 0, this.headerSize + this.writeOffset);
-        this.header = newHeader;
-        this.capacityAfterHeader = newCapacity;
-    }
-}
-//# sourceMappingURL=pickle.js.map
-;// CONCATENATED MODULE: ./node_modules/@electron/asar/lib/disk.js
-
-
-
-
-
-let filesystemCache = Object.create(null);
-async function copyFile(dest, src, filename) {
-    const srcFile = external_node_path_.join(src, filename);
-    const targetFile = external_node_path_.join(dest, filename);
-    const [content, stats] = await Promise.all([
-        wrappedFs.readFile(srcFile),
-        wrappedFs.stat(srcFile),
-        wrappedFs.mkdirp(external_node_path_.dirname(targetFile)),
-    ]);
-    return wrappedFs.writeFile(targetFile, content, { mode: stats.mode });
-}
-async function streamTransformedFile(stream, outStream) {
-    return new Promise((resolve, reject) => {
-        stream.pipe(outStream, { end: false });
-        stream.on('error', reject);
-        stream.on('end', () => resolve());
-    });
-}
-const writeFileListToStream = async function (dest, filesystem, out, lists, metadata) {
-    const { files, links } = lists;
-    // Batch cached buffers into a single write to avoid per-file write syscalls
-    let pendingBuffers = [];
-    const flushPendingBuffers = async () => {
-        if (pendingBuffers.length === 0)
-            return;
-        const combined = pendingBuffers.length === 1 ? pendingBuffers[0] : Buffer.concat(pendingBuffers);
-        pendingBuffers = [];
-        await new Promise((resolve, reject) => {
-            out.write(combined, (err) => (err ? reject(err) : resolve()));
-        });
-    };
-    for (const file of files) {
-        if (file.unpack) {
-            await flushPendingBuffers();
-            const filename = external_node_path_.relative(filesystem.getRootPath(), file.filename);
-            await copyFile(`${dest}.unpacked`, filesystem.getRootPath(), filename);
-        }
-        else {
-            const fileMeta = metadata[file.filename];
-            if (fileMeta.cachedBuffer) {
-                pendingBuffers.push(fileMeta.cachedBuffer);
-                fileMeta.cachedBuffer = undefined;
-            }
-            else {
-                await flushPendingBuffers();
-                const transformed = fileMeta.transformed;
-                const stream = wrappedFs.createReadStream(transformed ? transformed.path : file.filename);
-                await streamTransformedFile(stream, out);
-            }
-        }
-    }
-    await flushPendingBuffers();
-    for (const file of links.filter((f) => f.unpack)) {
-        const filename = external_node_path_.relative(filesystem.getRootPath(), file.filename);
-        const link = await wrappedFs.readlink(file.filename);
-        await createSymlink(dest, filename, link);
-    }
-    return new Promise((resolve, reject) => {
-        out.on('error', reject);
-        out.end(() => resolve());
-    });
-};
-async function writeFilesystem(dest, filesystem, lists, metadata) {
-    const out = await createFilesystemWriteStream(filesystem, dest);
-    return writeFileListToStream(dest, filesystem, out, lists, metadata);
-}
-async function streamFilesystem(dest, filesystem, lists) {
-    const out = await createFilesystemWriteStream(filesystem, dest);
-    const { files, links } = lists;
-    for await (const file of files) {
-        // the file should not be packed into archive
-        if (file.unpack) {
-            const targetFile = external_node_path_.join(`${dest}.unpacked`, file.filename);
-            await wrappedFs.mkdirp(external_node_path_.dirname(targetFile));
-            const writeStream = wrappedFs.createWriteStream(targetFile, { mode: file.mode });
-            await promises_namespaceObject.pipeline(file.streamGenerator(), writeStream);
-        }
-        else {
-            await streamTransformedFile(file.streamGenerator(), out);
-        }
-    }
-    for (const file of links.filter((f) => f.unpack && f.link)) {
-        // the symlink needs to be recreated outside in .unpacked
-        await createSymlink(dest, file.filename, file.link);
-    }
-    return new Promise((resolve, reject) => {
-        out.on('error', reject);
-        out.end(() => resolve());
-    });
-}
-function readArchiveHeaderSync(archivePath) {
-    const fd = wrappedFs.openSync(archivePath, 'r');
-    let size;
-    let headerBuf;
-    try {
-        const sizeBuf = Buffer.alloc(8);
-        if (wrappedFs.readSync(fd, sizeBuf, 0, 8, null) !== 8) {
-            throw new Error('Unable to read header size');
-        }
-        const sizePickle = Pickle.createFromBuffer(sizeBuf);
-        size = sizePickle.createIterator().readUInt32();
-        headerBuf = Buffer.alloc(size);
-        if (wrappedFs.readSync(fd, headerBuf, 0, size, null) !== size) {
-            throw new Error('Unable to read header');
-        }
-    }
-    finally {
-        wrappedFs.closeSync(fd);
-    }
-    const headerPickle = Pickle.createFromBuffer(headerBuf);
-    const header = headerPickle.createIterator().readString();
-    return { headerString: header, header: JSON.parse(header), headerSize: size };
-}
-function readFilesystemSync(archivePath) {
-    if (!filesystemCache[archivePath]) {
-        const header = readArchiveHeaderSync(archivePath);
-        const filesystem = new Filesystem(archivePath);
-        filesystem.setHeader(header.header, header.headerSize);
-        filesystemCache[archivePath] = filesystem;
-    }
-    return filesystemCache[archivePath];
-}
-function uncacheFilesystem(archivePath) {
-    if (filesystemCache[archivePath]) {
-        filesystemCache[archivePath] = undefined;
-        return true;
-    }
-    return false;
-}
-function uncacheAll() {
-    filesystemCache = {};
-}
-function readFileSync(filesystem, filename, info) {
-    let buffer = Buffer.alloc(info.size);
-    if (info.size <= 0) {
-        return buffer;
-    }
-    if (info.unpacked) {
-        // it's an unpacked file, copy it.
-        buffer = wrappedFs.readFileSync(external_node_path_.join(`${filesystem.getRootPath()}.unpacked`, filename));
-    }
-    else {
-        // Node throws an exception when reading 0 bytes into a 0-size buffer,
-        // so we short-circuit the read in this case.
-        const fd = wrappedFs.openSync(filesystem.getRootPath(), 'r');
-        try {
-            const offset = 8 + filesystem.getHeaderSize() + parseInt(info.offset);
-            wrappedFs.readSync(fd, buffer, 0, info.size, offset);
-        }
-        finally {
-            wrappedFs.closeSync(fd);
-        }
-    }
-    return buffer;
-}
-function readFileWithFd(fd, filesystem, filename, info) {
-    let buffer = Buffer.alloc(info.size);
-    if (info.size <= 0) {
-        return buffer;
-    }
-    if (info.unpacked) {
-        buffer = fs.readFileSync(path.join(`${filesystem.getRootPath()}.unpacked`, filename));
-    }
-    else {
-        const offset = 8 + filesystem.getHeaderSize() + parseInt(info.offset);
-        fs.readSync(fd, buffer, 0, info.size, offset);
-    }
-    return buffer;
-}
-async function createFilesystemWriteStream(filesystem, dest) {
-    const headerPickle = Pickle.createEmpty();
-    headerPickle.writeString(JSON.stringify(filesystem.getHeader()));
-    const headerBuf = headerPickle.toBuffer();
-    const sizePickle = Pickle.createEmpty();
-    sizePickle.writeUInt32(headerBuf.length);
-    const sizeBuf = sizePickle.toBuffer();
-    const out = wrappedFs.createWriteStream(dest);
-    await new Promise((resolve, reject) => {
-        out.on('error', reject);
-        out.write(sizeBuf);
-        return out.write(headerBuf, () => resolve());
-    });
-    return out;
-}
-async function createSymlink(dest, filepath, link) {
-    // if symlink is within subdirectories, then we need to recreate dir structure
-    await wrappedFs.mkdirp(external_node_path_.join(`${dest}.unpacked`, external_node_path_.dirname(filepath)));
-    // create symlink within unpacked dir
-    await wrappedFs.symlink(link, external_node_path_.join(`${dest}.unpacked`, filepath)).catch(async (error) => {
-        if (error.code === 'EPERM' && error.syscall === 'symlink') {
-            throw new Error('Could not create symlinks for unpacked assets. On Windows, consider activating Developer Mode to allow non-admin users to create symlinks by following the instructions at https://docs.microsoft.com/en-us/windows/apps/get-started/enable-your-device-for-development.');
-        }
-        throw error;
-    });
-}
-//# sourceMappingURL=disk.js.map
-// EXTERNAL MODULE: external "node:url"
-var external_node_url_ = __nccwpck_require__(1041);
-// EXTERNAL MODULE: external "fs"
-var external_fs_ = __nccwpck_require__(7147);
-// EXTERNAL MODULE: external "node:fs"
-var external_node_fs_ = __nccwpck_require__(7561);
-var external_node_fs_namespaceObject = /*#__PURE__*/__nccwpck_require__.t(external_node_fs_, 2);
-// EXTERNAL MODULE: external "node:fs/promises"
-var promises_ = __nccwpck_require__(3977);
-// EXTERNAL MODULE: external "node:events"
-var external_node_events_ = __nccwpck_require__(5673);
-// EXTERNAL MODULE: external "node:string_decoder"
-var external_node_string_decoder_ = __nccwpck_require__(6915);
-;// CONCATENATED MODULE: ./node_modules/glob/dist/esm/index.min.js
-var Gt=(n,t,e)=>{let s=n instanceof RegExp?ce(n,e):n,i=t instanceof RegExp?ce(t,e):t,r=s!==null&&i!=null&&ss(s,i,e);return r&&{start:r[0],end:r[1],pre:e.slice(0,r[0]),body:e.slice(r[0]+s.length,r[1]),post:e.slice(r[1]+i.length)}},ce=(n,t)=>{let e=t.match(n);return e?e[0]:null},ss=(n,t,e)=>{let s,i,r,o,h,a=e.indexOf(n),l=e.indexOf(t,a+1),u=a;if(a>=0&&l>0){if(n===t)return[a,l];for(s=[],r=e.length;u>=0&&!h;){if(u===a)s.push(u),a=e.indexOf(n,u+1);else if(s.length===1){let c=s.pop();c!==void 0&&(h=[c,l])}else i=s.pop(),i!==void 0&&i<r&&(r=i,o=l),l=e.indexOf(t,u+1);u=a<l&&a>=0?a:l}s.length&&o!==void 0&&(h=[r,o])}return h};var fe="\0SLASH"+Math.random()+"\0",ue="\0OPEN"+Math.random()+"\0",qt="\0CLOSE"+Math.random()+"\0",de="\0COMMA"+Math.random()+"\0",pe="\0PERIOD"+Math.random()+"\0",is=new RegExp(fe,"g"),rs=new RegExp(ue,"g"),ns=new RegExp(qt,"g"),os=new RegExp(de,"g"),hs=new RegExp(pe,"g"),as=/\\\\/g,ls=/\\{/g,cs=/\\}/g,index_min_fs=/\\,/g,us=/\\./g,ds=1e5;function Ht(n){return isNaN(n)?n.charCodeAt(0):parseInt(n,10)}function ps(n){return n.replace(as,fe).replace(ls,ue).replace(cs,qt).replace(index_min_fs,de).replace(us,pe)}function ms(n){return n.replace(is,"\\").replace(rs,"{").replace(ns,"}").replace(os,",").replace(hs,".")}function me(n){if(!n)return[""];let t=[],e=Gt("{","}",n);if(!e)return n.split(",");let{pre:s,body:i,post:r}=e,o=s.split(",");o[o.length-1]+="{"+i+"}";let h=me(r);return r.length&&(o[o.length-1]+=h.shift(),o.push.apply(o,h)),t.push.apply(t,o),t}function ge(n,t={}){if(!n)return[];let{max:e=ds}=t;return n.slice(0,2)==="{}"&&(n="\\{\\}"+n.slice(2)),ht(ps(n),e,!0).map(ms)}function gs(n){return"{"+n+"}"}function ws(n){return/^-?0\d/.test(n)}function ys(n,t){return n<=t}function bs(n,t){return n>=t}function ht(n,t,e){let s=[],i=Gt("{","}",n);if(!i)return[n];let r=i.pre,o=i.post.length?ht(i.post,t,!1):[""];if(/\$$/.test(i.pre))for(let h=0;h<o.length&&h<t;h++){let a=r+"{"+i.body+"}"+o[h];s.push(a)}else{let h=/^-?\d+\.\.-?\d+(?:\.\.-?\d+)?$/.test(i.body),a=/^[a-zA-Z]\.\.[a-zA-Z](?:\.\.-?\d+)?$/.test(i.body),l=h||a,u=i.body.indexOf(",")>=0;if(!l&&!u)return i.post.match(/,(?!,).*\}/)?(n=i.pre+"{"+i.body+qt+i.post,ht(n,t,!0)):[n];let c;if(l)c=i.body.split(/\.\./);else if(c=me(i.body),c.length===1&&c[0]!==void 0&&(c=ht(c[0],t,!1).map(gs),c.length===1))return o.map(f=>i.pre+c[0]+f);let d;if(l&&c[0]!==void 0&&c[1]!==void 0){let f=Ht(c[0]),m=Ht(c[1]),p=Math.max(c[0].length,c[1].length),w=c.length===3&&c[2]!==void 0?Math.abs(Ht(c[2])):1,g=ys;m<f&&(w*=-1,g=bs);let E=c.some(ws);d=[];for(let y=f;g(y,m);y+=w){let b;if(a)b=String.fromCharCode(y),b==="\\"&&(b="");else if(b=String(y),E){let z=p-b.length;if(z>0){let $=new Array(z+1).join("0");y<0?b="-"+$+b.slice(1):b=$+b}}d.push(b)}}else{d=[];for(let f=0;f<c.length;f++)d.push.apply(d,ht(c[f],t,!1))}for(let f=0;f<d.length;f++)for(let m=0;m<o.length&&s.length<t;m++){let p=r+d[f]+o[m];(!e||l||p)&&s.push(p)}}return s}var at=n=>{if(typeof n!="string")throw new TypeError("invalid pattern");if(n.length>65536)throw new TypeError("pattern is too long")};var Ss={"[:alnum:]":["\\p{L}\\p{Nl}\\p{Nd}",!0],"[:alpha:]":["\\p{L}\\p{Nl}",!0],"[:ascii:]":["\\x00-\\x7f",!1],"[:blank:]":["\\p{Zs}\\t",!0],"[:cntrl:]":["\\p{Cc}",!0],"[:digit:]":["\\p{Nd}",!0],"[:graph:]":["\\p{Z}\\p{C}",!0,!0],"[:lower:]":["\\p{Ll}",!0],"[:print:]":["\\p{C}",!0],"[:punct:]":["\\p{P}",!0],"[:space:]":["\\p{Z}\\t\\r\\n\\v\\f",!0],"[:upper:]":["\\p{Lu}",!0],"[:word:]":["\\p{L}\\p{Nl}\\p{Nd}\\p{Pc}",!0],"[:xdigit:]":["A-Fa-f0-9",!1]},lt=n=>n.replace(/[[\]\\-]/g,"\\$&"),Es=n=>n.replace(/[-[\]{}()*+?.,\\^$|#\s]/g,"\\$&"),we=n=>n.join(""),ye=(n,t)=>{let e=t;if(n.charAt(e)!=="[")throw new Error("not in a brace expression");let s=[],i=[],r=e+1,o=!1,h=!1,a=!1,l=!1,u=e,c="";t:for(;r<n.length;){let p=n.charAt(r);if((p==="!"||p==="^")&&r===e+1){l=!0,r++;continue}if(p==="]"&&o&&!a){u=r+1;break}if(o=!0,p==="\\"&&!a){a=!0,r++;continue}if(p==="["&&!a){for(let[w,[g,S,E]]of Object.entries(Ss))if(n.startsWith(w,r)){if(c)return["$.",!1,n.length-e,!0];r+=w.length,E?i.push(g):s.push(g),h=h||S;continue t}}if(a=!1,c){p>c?s.push(lt(c)+"-"+lt(p)):p===c&&s.push(lt(p)),c="",r++;continue}if(n.startsWith("-]",r+1)){s.push(lt(p+"-")),r+=2;continue}if(n.startsWith("-",r+1)){c=p,r+=2;continue}s.push(lt(p)),r++}if(u<r)return["",!1,0,!1];if(!s.length&&!i.length)return["$.",!1,n.length-e,!0];if(i.length===0&&s.length===1&&/^\\?.$/.test(s[0])&&!l){let p=s[0].length===2?s[0].slice(-1):s[0];return[Es(p),!1,u-e,!1]}let d="["+(l?"^":"")+we(s)+"]",f="["+(l?"":"^")+we(i)+"]";return[s.length&&i.length?"("+d+"|"+f+")":s.length?d:f,h,u-e,!0]};var W=(n,{windowsPathsNoEscape:t=!1,magicalBraces:e=!0}={})=>e?t?n.replace(/\[([^\/\\])\]/g,"$1"):n.replace(/((?!\\).|^)\[([^\/\\])\]/g,"$1$2").replace(/\\([^\/])/g,"$1"):t?n.replace(/\[([^\/\\{}])\]/g,"$1"):n.replace(/((?!\\).|^)\[([^\/\\{}])\]/g,"$1$2").replace(/\\([^\/{}])/g,"$1");var xs=new Set(["!","?","+","*","@"]),be=n=>xs.has(n),vs="(?!(?:^|/)\\.\\.?(?:$|/))",Ct="(?!\\.)",Cs=new Set(["[","."]),Ts=new Set(["..","."]),As=new Set("().*{}+?[]^$\\!"),ks=n=>n.replace(/[-[\]{}()*+?.,\\^$|#\s]/g,"\\$&"),Kt="[^/]",Se=Kt+"*?",Ee=Kt+"+?",Q=class n{type;#t;#s;#n=!1;#r=[];#o;#S;#w;#c=!1;#h;#u;#f=!1;constructor(t,e,s={}){this.type=t,t&&(this.#s=!0),this.#o=e,this.#t=this.#o?this.#o.#t:this,this.#h=this.#t===this?s:this.#t.#h,this.#w=this.#t===this?[]:this.#t.#w,t==="!"&&!this.#t.#c&&this.#w.push(this),this.#S=this.#o?this.#o.#r.length:0}get hasMagic(){if(this.#s!==void 0)return this.#s;for(let t of this.#r)if(typeof t!="string"&&(t.type||t.hasMagic))return this.#s=!0;return this.#s}toString(){return this.#u!==void 0?this.#u:this.type?this.#u=this.type+"("+this.#r.map(t=>String(t)).join("|")+")":this.#u=this.#r.map(t=>String(t)).join("")}#a(){if(this!==this.#t)throw new Error("should only call on root");if(this.#c)return this;this.toString(),this.#c=!0;let t;for(;t=this.#w.pop();){if(t.type!=="!")continue;let e=t,s=e.#o;for(;s;){for(let i=e.#S+1;!s.type&&i<s.#r.length;i++)for(let r of t.#r){if(typeof r=="string")throw new Error("string part in extglob AST??");r.copyIn(s.#r[i])}e=s,s=e.#o}}return this}push(...t){for(let e of t)if(e!==""){if(typeof e!="string"&&!(e instanceof n&&e.#o===this))throw new Error("invalid part: "+e);this.#r.push(e)}}toJSON(){let t=this.type===null?this.#r.slice().map(e=>typeof e=="string"?e:e.toJSON()):[this.type,...this.#r.map(e=>e.toJSON())];return this.isStart()&&!this.type&&t.unshift([]),this.isEnd()&&(this===this.#t||this.#t.#c&&this.#o?.type==="!")&&t.push({}),t}isStart(){if(this.#t===this)return!0;if(!this.#o?.isStart())return!1;if(this.#S===0)return!0;let t=this.#o;for(let e=0;e<this.#S;e++){let s=t.#r[e];if(!(s instanceof n&&s.type==="!"))return!1}return!0}isEnd(){if(this.#t===this||this.#o?.type==="!")return!0;if(!this.#o?.isEnd())return!1;if(!this.type)return this.#o?.isEnd();let t=this.#o?this.#o.#r.length:0;return this.#S===t-1}copyIn(t){typeof t=="string"?this.push(t):this.push(t.clone(this))}clone(t){let e=new n(this.type,t);for(let s of this.#r)e.copyIn(s);return e}static#i(t,e,s,i){let r=!1,o=!1,h=-1,a=!1;if(e.type===null){let f=s,m="";for(;f<t.length;){let p=t.charAt(f++);if(r||p==="\\"){r=!r,m+=p;continue}if(o){f===h+1?(p==="^"||p==="!")&&(a=!0):p==="]"&&!(f===h+2&&a)&&(o=!1),m+=p;continue}else if(p==="["){o=!0,h=f,a=!1,m+=p;continue}if(!i.noext&&be(p)&&t.charAt(f)==="("){e.push(m),m="";let w=new n(p,e);f=n.#i(t,w,f,i),e.push(w);continue}m+=p}return e.push(m),f}let l=s+1,u=new n(null,e),c=[],d="";for(;l<t.length;){let f=t.charAt(l++);if(r||f==="\\"){r=!r,d+=f;continue}if(o){l===h+1?(f==="^"||f==="!")&&(a=!0):f==="]"&&!(l===h+2&&a)&&(o=!1),d+=f;continue}else if(f==="["){o=!0,h=l,a=!1,d+=f;continue}if(be(f)&&t.charAt(l)==="("){u.push(d),d="";let m=new n(f,u);u.push(m),l=n.#i(t,m,l,i);continue}if(f==="|"){u.push(d),d="",c.push(u),u=new n(null,e);continue}if(f===")")return d===""&&e.#r.length===0&&(e.#f=!0),u.push(d),d="",e.push(...c,u),l;d+=f}return e.type=null,e.#s=void 0,e.#r=[t.substring(s-1)],l}static fromGlob(t,e={}){let s=new n(null,void 0,e);return n.#i(t,s,0,e),s}toMMPattern(){if(this!==this.#t)return this.#t.toMMPattern();let t=this.toString(),[e,s,i,r]=this.toRegExpSource();if(!(i||this.#s||this.#h.nocase&&!this.#h.nocaseMagicOnly&&t.toUpperCase()!==t.toLowerCase()))return s;let h=(this.#h.nocase?"i":"")+(r?"u":"");return Object.assign(new RegExp(`^${e}$`,h),{_src:e,_glob:t})}get options(){return this.#h}toRegExpSource(t){let e=t??!!this.#h.dot;if(this.#t===this&&this.#a(),!this.type){let a=this.isStart()&&this.isEnd()&&!this.#r.some(f=>typeof f!="string"),l=this.#r.map(f=>{let[m,p,w,g]=typeof f=="string"?n.#E(f,this.#s,a):f.toRegExpSource(t);return this.#s=this.#s||w,this.#n=this.#n||g,m}).join(""),u="";if(this.isStart()&&typeof this.#r[0]=="string"&&!(this.#r.length===1&&Ts.has(this.#r[0]))){let m=Cs,p=e&&m.has(l.charAt(0))||l.startsWith("\\.")&&m.has(l.charAt(2))||l.startsWith("\\.\\.")&&m.has(l.charAt(4)),w=!e&&!t&&m.has(l.charAt(0));u=p?vs:w?Ct:""}let c="";return this.isEnd()&&this.#t.#c&&this.#o?.type==="!"&&(c="(?:$|\\/)"),[u+l+c,W(l),this.#s=!!this.#s,this.#n]}let s=this.type==="*"||this.type==="+",i=this.type==="!"?"(?:(?!(?:":"(?:",r=this.#d(e);if(this.isStart()&&this.isEnd()&&!r&&this.type!=="!"){let a=this.toString();return this.#r=[a],this.type=null,this.#s=void 0,[a,W(this.toString()),!1,!1]}let o=!s||t||e||!Ct?"":this.#d(!0);o===r&&(o=""),o&&(r=`(?:${r})(?:${o})*?`);let h="";if(this.type==="!"&&this.#f)h=(this.isStart()&&!e?Ct:"")+Ee;else{let a=this.type==="!"?"))"+(this.isStart()&&!e&&!t?Ct:"")+Se+")":this.type==="@"?")":this.type==="?"?")?":this.type==="+"&&o?")":this.type==="*"&&o?")?":`)${this.type}`;h=i+r+a}return[h,W(r),this.#s=!!this.#s,this.#n]}#d(t){return this.#r.map(e=>{if(typeof e=="string")throw new Error("string type in extglob ast??");let[s,i,r,o]=e.toRegExpSource(t);return this.#n=this.#n||o,s}).filter(e=>!(this.isStart()&&this.isEnd())||!!e).join("|")}static#E(t,e,s=!1){let i=!1,r="",o=!1,h=!1;for(let a=0;a<t.length;a++){let l=t.charAt(a);if(i){i=!1,r+=(As.has(l)?"\\":"")+l;continue}if(l==="*"){if(h)continue;h=!0,r+=s&&/^[*]+$/.test(t)?Ee:Se,e=!0;continue}else h=!1;if(l==="\\"){a===t.length-1?r+="\\\\":i=!0;continue}if(l==="["){let[u,c,d,f]=ye(t,a);if(d){r+=u,o=o||c,a+=d-1,e=e||f;continue}}if(l==="?"){r+=Kt,e=!0;continue}r+=ks(l)}return[r,W(t),!!e,o]}};var tt=(n,{windowsPathsNoEscape:t=!1,magicalBraces:e=!1}={})=>e?t?n.replace(/[?*()[\]{}]/g,"[$&]"):n.replace(/[?*()[\]\\{}]/g,"\\$&"):t?n.replace(/[?*()[\]]/g,"[$&]"):n.replace(/[?*()[\]\\]/g,"\\$&");var O=(n,t,e={})=>(at(t),!e.nocomment&&t.charAt(0)==="#"?!1:new D(t,e).match(n)),Rs=/^\*+([^+@!?\*\[\(]*)$/,Os=n=>t=>!t.startsWith(".")&&t.endsWith(n),Fs=n=>t=>t.endsWith(n),Ds=n=>(n=n.toLowerCase(),t=>!t.startsWith(".")&&t.toLowerCase().endsWith(n)),Ms=n=>(n=n.toLowerCase(),t=>t.toLowerCase().endsWith(n)),Ns=/^\*+\.\*+$/,_s=n=>!n.startsWith(".")&&n.includes("."),Ls=n=>n!=="."&&n!==".."&&n.includes("."),Ws=/^\.\*+$/,Ps=n=>n!=="."&&n!==".."&&n.startsWith("."),js=/^\*+$/,Is=n=>n.length!==0&&!n.startsWith("."),zs=n=>n.length!==0&&n!=="."&&n!=="..",Bs=/^\?+([^+@!?\*\[\(]*)?$/,Us=([n,t=""])=>{let e=Ce([n]);return t?(t=t.toLowerCase(),s=>e(s)&&s.toLowerCase().endsWith(t)):e},$s=([n,t=""])=>{let e=Te([n]);return t?(t=t.toLowerCase(),s=>e(s)&&s.toLowerCase().endsWith(t)):e},Gs=([n,t=""])=>{let e=Te([n]);return t?s=>e(s)&&s.endsWith(t):e},Hs=([n,t=""])=>{let e=Ce([n]);return t?s=>e(s)&&s.endsWith(t):e},Ce=([n])=>{let t=n.length;return e=>e.length===t&&!e.startsWith(".")},Te=([n])=>{let t=n.length;return e=>e.length===t&&e!=="."&&e!==".."},Ae=typeof process=="object"&&process?typeof process.env=="object"&&process.env&&process.env.__MINIMATCH_TESTING_PLATFORM__||process.platform:"posix",xe={win32:{sep:"\\"},posix:{sep:"/"}},qs=Ae==="win32"?xe.win32.sep:xe.posix.sep;O.sep=qs;var A=Symbol("globstar **");O.GLOBSTAR=A;var Ks="[^/]",Vs=Ks+"*?",Ys="(?:(?!(?:\\/|^)(?:\\.{1,2})($|\\/)).)*?",Xs="(?:(?!(?:\\/|^)\\.).)*?",Js=(n,t={})=>e=>O(e,n,t);O.filter=Js;var N=(n,t={})=>Object.assign({},n,t),Zs=n=>{if(!n||typeof n!="object"||!Object.keys(n).length)return O;let t=O;return Object.assign((s,i,r={})=>t(s,i,N(n,r)),{Minimatch:class extends t.Minimatch{constructor(i,r={}){super(i,N(n,r))}static defaults(i){return t.defaults(N(n,i)).Minimatch}},AST:class extends t.AST{constructor(i,r,o={}){super(i,r,N(n,o))}static fromGlob(i,r={}){return t.AST.fromGlob(i,N(n,r))}},unescape:(s,i={})=>t.unescape(s,N(n,i)),escape:(s,i={})=>t.escape(s,N(n,i)),filter:(s,i={})=>t.filter(s,N(n,i)),defaults:s=>t.defaults(N(n,s)),makeRe:(s,i={})=>t.makeRe(s,N(n,i)),braceExpand:(s,i={})=>t.braceExpand(s,N(n,i)),match:(s,i,r={})=>t.match(s,i,N(n,r)),sep:t.sep,GLOBSTAR:A})};O.defaults=Zs;var ke=(n,t={})=>(at(n),t.nobrace||!/\{(?:(?!\{).)*\}/.test(n)?[n]:ge(n,{max:t.braceExpandMax}));O.braceExpand=ke;var Qs=(n,t={})=>new D(n,t).makeRe();O.makeRe=Qs;var ti=(n,t,e={})=>{let s=new D(t,e);return n=n.filter(i=>s.match(i)),s.options.nonull&&!n.length&&n.push(t),n};O.match=ti;var ve=/[?*]|[+@!]\(.*?\)|\[|\]/,ei=n=>n.replace(/[-[\]{}()*+?.,\\^$|#\s]/g,"\\$&"),D=class{options;set;pattern;windowsPathsNoEscape;nonegate;negate;comment;empty;preserveMultipleSlashes;partial;globSet;globParts;nocase;isWindows;platform;windowsNoMagicRoot;regexp;constructor(t,e={}){at(t),e=e||{},this.options=e,this.pattern=t,this.platform=e.platform||Ae,this.isWindows=this.platform==="win32";let s="allowWindowsEscape";this.windowsPathsNoEscape=!!e.windowsPathsNoEscape||e[s]===!1,this.windowsPathsNoEscape&&(this.pattern=this.pattern.replace(/\\/g,"/")),this.preserveMultipleSlashes=!!e.preserveMultipleSlashes,this.regexp=null,this.negate=!1,this.nonegate=!!e.nonegate,this.comment=!1,this.empty=!1,this.partial=!!e.partial,this.nocase=!!this.options.nocase,this.windowsNoMagicRoot=e.windowsNoMagicRoot!==void 0?e.windowsNoMagicRoot:!!(this.isWindows&&this.nocase),this.globSet=[],this.globParts=[],this.set=[],this.make()}hasMagic(){if(this.options.magicalBraces&&this.set.length>1)return!0;for(let t of this.set)for(let e of t)if(typeof e!="string")return!0;return!1}debug(...t){}make(){let t=this.pattern,e=this.options;if(!e.nocomment&&t.charAt(0)==="#"){this.comment=!0;return}if(!t){this.empty=!0;return}this.parseNegate(),this.globSet=[...new Set(this.braceExpand())],e.debug&&(this.debug=(...r)=>console.error(...r)),this.debug(this.pattern,this.globSet);let s=this.globSet.map(r=>this.slashSplit(r));this.globParts=this.preprocess(s),this.debug(this.pattern,this.globParts);let i=this.globParts.map((r,o,h)=>{if(this.isWindows&&this.windowsNoMagicRoot){let a=r[0]===""&&r[1]===""&&(r[2]==="?"||!ve.test(r[2]))&&!ve.test(r[3]),l=/^[a-z]:/i.test(r[0]);if(a)return[...r.slice(0,4),...r.slice(4).map(u=>this.parse(u))];if(l)return[r[0],...r.slice(1).map(u=>this.parse(u))]}return r.map(a=>this.parse(a))});if(this.debug(this.pattern,i),this.set=i.filter(r=>r.indexOf(!1)===-1),this.isWindows)for(let r=0;r<this.set.length;r++){let o=this.set[r];o[0]===""&&o[1]===""&&this.globParts[r][2]==="?"&&typeof o[3]=="string"&&/^[a-z]:$/i.test(o[3])&&(o[2]="?")}this.debug(this.pattern,this.set)}preprocess(t){if(this.options.noglobstar)for(let s=0;s<t.length;s++)for(let i=0;i<t[s].length;i++)t[s][i]==="**"&&(t[s][i]="*");let{optimizationLevel:e=1}=this.options;return e>=2?(t=this.firstPhasePreProcess(t),t=this.secondPhasePreProcess(t)):e>=1?t=this.levelOneOptimize(t):t=this.adjascentGlobstarOptimize(t),t}adjascentGlobstarOptimize(t){return t.map(e=>{let s=-1;for(;(s=e.indexOf("**",s+1))!==-1;){let i=s;for(;e[i+1]==="**";)i++;i!==s&&e.splice(s,i-s)}return e})}levelOneOptimize(t){return t.map(e=>(e=e.reduce((s,i)=>{let r=s[s.length-1];return i==="**"&&r==="**"?s:i===".."&&r&&r!==".."&&r!=="."&&r!=="**"?(s.pop(),s):(s.push(i),s)},[]),e.length===0?[""]:e))}levelTwoFileOptimize(t){Array.isArray(t)||(t=this.slashSplit(t));let e=!1;do{if(e=!1,!this.preserveMultipleSlashes){for(let i=1;i<t.length-1;i++){let r=t[i];i===1&&r===""&&t[0]===""||(r==="."||r==="")&&(e=!0,t.splice(i,1),i--)}t[0]==="."&&t.length===2&&(t[1]==="."||t[1]==="")&&(e=!0,t.pop())}let s=0;for(;(s=t.indexOf("..",s+1))!==-1;){let i=t[s-1];i&&i!=="."&&i!==".."&&i!=="**"&&(e=!0,t.splice(s-1,2),s-=2)}}while(e);return t.length===0?[""]:t}firstPhasePreProcess(t){let e=!1;do{e=!1;for(let s of t){let i=-1;for(;(i=s.indexOf("**",i+1))!==-1;){let o=i;for(;s[o+1]==="**";)o++;o>i&&s.splice(i+1,o-i);let h=s[i+1],a=s[i+2],l=s[i+3];if(h!==".."||!a||a==="."||a===".."||!l||l==="."||l==="..")continue;e=!0,s.splice(i,1);let u=s.slice(0);u[i]="**",t.push(u),i--}if(!this.preserveMultipleSlashes){for(let o=1;o<s.length-1;o++){let h=s[o];o===1&&h===""&&s[0]===""||(h==="."||h==="")&&(e=!0,s.splice(o,1),o--)}s[0]==="."&&s.length===2&&(s[1]==="."||s[1]==="")&&(e=!0,s.pop())}let r=0;for(;(r=s.indexOf("..",r+1))!==-1;){let o=s[r-1];if(o&&o!=="."&&o!==".."&&o!=="**"){e=!0;let a=r===1&&s[r+1]==="**"?["."]:[];s.splice(r-1,2,...a),s.length===0&&s.push(""),r-=2}}}}while(e);return t}secondPhasePreProcess(t){for(let e=0;e<t.length-1;e++)for(let s=e+1;s<t.length;s++){let i=this.partsMatch(t[e],t[s],!this.preserveMultipleSlashes);if(i){t[e]=[],t[s]=i;break}}return t.filter(e=>e.length)}partsMatch(t,e,s=!1){let i=0,r=0,o=[],h="";for(;i<t.length&&r<e.length;)if(t[i]===e[r])o.push(h==="b"?e[r]:t[i]),i++,r++;else if(s&&t[i]==="**"&&e[r]===t[i+1])o.push(t[i]),i++;else if(s&&e[r]==="**"&&t[i]===e[r+1])o.push(e[r]),r++;else if(t[i]==="*"&&e[r]&&(this.options.dot||!e[r].startsWith("."))&&e[r]!=="**"){if(h==="b")return!1;h="a",o.push(t[i]),i++,r++}else if(e[r]==="*"&&t[i]&&(this.options.dot||!t[i].startsWith("."))&&t[i]!=="**"){if(h==="a")return!1;h="b",o.push(e[r]),i++,r++}else return!1;return t.length===e.length&&o}parseNegate(){if(this.nonegate)return;let t=this.pattern,e=!1,s=0;for(let i=0;i<t.length&&t.charAt(i)==="!";i++)e=!e,s++;s&&(this.pattern=t.slice(s)),this.negate=e}matchOne(t,e,s=!1){let i=this.options;if(this.isWindows){let p=typeof t[0]=="string"&&/^[a-z]:$/i.test(t[0]),w=!p&&t[0]===""&&t[1]===""&&t[2]==="?"&&/^[a-z]:$/i.test(t[3]),g=typeof e[0]=="string"&&/^[a-z]:$/i.test(e[0]),S=!g&&e[0]===""&&e[1]===""&&e[2]==="?"&&typeof e[3]=="string"&&/^[a-z]:$/i.test(e[3]),E=w?3:p?0:void 0,y=S?3:g?0:void 0;if(typeof E=="number"&&typeof y=="number"){let[b,z]=[t[E],e[y]];b.toLowerCase()===z.toLowerCase()&&(e[y]=b,y>E?e=e.slice(y):E>y&&(t=t.slice(E)))}}let{optimizationLevel:r=1}=this.options;r>=2&&(t=this.levelTwoFileOptimize(t)),this.debug("matchOne",this,{file:t,pattern:e}),this.debug("matchOne",t.length,e.length);for(var o=0,h=0,a=t.length,l=e.length;o<a&&h<l;o++,h++){this.debug("matchOne loop");var u=e[h],c=t[o];if(this.debug(e,u,c),u===!1)return!1;if(u===A){this.debug("GLOBSTAR",[e,u,c]);var d=o,f=h+1;if(f===l){for(this.debug("** at the end");o<a;o++)if(t[o]==="."||t[o]===".."||!i.dot&&t[o].charAt(0)===".")return!1;return!0}for(;d<a;){var m=t[d];if(this.debug(`
-globstar while`,t,d,e,f,m),this.matchOne(t.slice(d),e.slice(f),s))return this.debug("globstar found match!",d,a,m),!0;if(m==="."||m===".."||!i.dot&&m.charAt(0)==="."){this.debug("dot detected!",t,d,e,f);break}this.debug("globstar swallow a segment, and continue"),d++}return!!(s&&(this.debug(`
->>> no match, partial?`,t,d,e,f),d===a))}let p;if(typeof u=="string"?(p=c===u,this.debug("string match",u,c,p)):(p=u.test(c),this.debug("pattern match",u,c,p)),!p)return!1}if(o===a&&h===l)return!0;if(o===a)return s;if(h===l)return o===a-1&&t[o]==="";throw new Error("wtf?")}braceExpand(){return ke(this.pattern,this.options)}parse(t){at(t);let e=this.options;if(t==="**")return A;if(t==="")return"";let s,i=null;(s=t.match(js))?i=e.dot?zs:Is:(s=t.match(Rs))?i=(e.nocase?e.dot?Ms:Ds:e.dot?Fs:Os)(s[1]):(s=t.match(Bs))?i=(e.nocase?e.dot?$s:Us:e.dot?Gs:Hs)(s):(s=t.match(Ns))?i=e.dot?Ls:_s:(s=t.match(Ws))&&(i=Ps);let r=Q.fromGlob(t,this.options).toMMPattern();return i&&typeof r=="object"&&Reflect.defineProperty(r,"test",{value:i}),r}makeRe(){if(this.regexp||this.regexp===!1)return this.regexp;let t=this.set;if(!t.length)return this.regexp=!1,this.regexp;let e=this.options,s=e.noglobstar?Vs:e.dot?Ys:Xs,i=new Set(e.nocase?["i"]:[]),r=t.map(a=>{let l=a.map(c=>{if(c instanceof RegExp)for(let d of c.flags.split(""))i.add(d);return typeof c=="string"?ei(c):c===A?A:c._src});l.forEach((c,d)=>{let f=l[d+1],m=l[d-1];c!==A||m===A||(m===void 0?f!==void 0&&f!==A?l[d+1]="(?:\\/|"+s+"\\/)?"+f:l[d]=s:f===void 0?l[d-1]=m+"(?:\\/|\\/"+s+")?":f!==A&&(l[d-1]=m+"(?:\\/|\\/"+s+"\\/)"+f,l[d+1]=A))});let u=l.filter(c=>c!==A);if(this.partial&&u.length>=1){let c=[];for(let d=1;d<=u.length;d++)c.push(u.slice(0,d).join("/"));return"(?:"+c.join("|")+")"}return u.join("/")}).join("|"),[o,h]=t.length>1?["(?:",")"]:["",""];r="^"+o+r+h+"$",this.partial&&(r="^(?:\\/|"+o+r.slice(1,-1)+h+")$"),this.negate&&(r="^(?!"+r+").+$");try{this.regexp=new RegExp(r,[...i].join(""))}catch{this.regexp=!1}return this.regexp}slashSplit(t){return this.preserveMultipleSlashes?t.split("/"):this.isWindows&&/^\/\/[^\/]+/.test(t)?["",...t.split(/\/+/)]:t.split(/\/+/)}match(t,e=this.partial){if(this.debug("match",t,this.pattern),this.comment)return!1;if(this.empty)return t==="";if(t==="/"&&e)return!0;let s=this.options;this.isWindows&&(t=t.split("\\").join("/"));let i=this.slashSplit(t);this.debug(this.pattern,"split",i);let r=this.set;this.debug(this.pattern,"set",r);let o=i[i.length-1];if(!o)for(let h=i.length-2;!o&&h>=0;h--)o=i[h];for(let h=0;h<r.length;h++){let a=r[h],l=i;if(s.matchBase&&a.length===1&&(l=[o]),this.matchOne(l,a,e))return s.flipNegate?!0:!this.negate}return s.flipNegate?!1:this.negate}static defaults(t){return O.defaults(t).Minimatch}};O.AST=Q;O.Minimatch=D;O.escape=tt;O.unescape=W;var si=typeof performance=="object"&&performance&&typeof performance.now=="function"?performance:Date,Oe=new Set,Vt=typeof process=="object"&&process?process:{},Fe=(n,t,e,s)=>{typeof Vt.emitWarning=="function"?Vt.emitWarning(n,t,e,s):console.error(`[${e}] ${t}: ${n}`)},At=globalThis.AbortController,Re=globalThis.AbortSignal;if(typeof At>"u"){Re=class{onabort;_onabort=[];reason;aborted=!1;addEventListener(e,s){this._onabort.push(s)}},At=class{constructor(){t()}signal=new Re;abort(e){if(!this.signal.aborted){this.signal.reason=e,this.signal.aborted=!0;for(let s of this.signal._onabort)s(e);this.signal.onabort?.(e)}}};let n=Vt.env?.LRU_CACHE_IGNORE_AC_WARNING!=="1",t=()=>{n&&(n=!1,Fe("AbortController is not defined. If using lru-cache in node 14, load an AbortController polyfill from the `node-abort-controller` package. A minimal polyfill is provided for use by LRUCache.fetch(), but it should not be relied upon in other contexts (eg, passing it to other APIs that use AbortController/AbortSignal might have undesirable effects). You may disable this with LRU_CACHE_IGNORE_AC_WARNING=1 in the env.","NO_ABORT_CONTROLLER","ENOTSUP",t))}}var ii=n=>!Oe.has(n);var q=n=>n&&n===Math.floor(n)&&n>0&&isFinite(n),De=n=>q(n)?n<=Math.pow(2,8)?Uint8Array:n<=Math.pow(2,16)?Uint16Array:n<=Math.pow(2,32)?Uint32Array:n<=Number.MAX_SAFE_INTEGER?Tt:null:null,Tt=class extends Array{constructor(n){super(n),this.fill(0)}},ri=class ct{heap;length;static#t=!1;static create(t){let e=De(t);if(!e)return[];ct.#t=!0;let s=new ct(t,e);return ct.#t=!1,s}constructor(t,e){if(!ct.#t)throw new TypeError("instantiate Stack using Stack.create(n)");this.heap=new e(t),this.length=0}push(t){this.heap[this.length++]=t}pop(){return this.heap[--this.length]}},ft=class Me{#t;#s;#n;#r;#o;#S;#w;#c;get perf(){return this.#c}ttl;ttlResolution;ttlAutopurge;updateAgeOnGet;updateAgeOnHas;allowStale;noDisposeOnSet;noUpdateTTL;maxEntrySize;sizeCalculation;noDeleteOnFetchRejection;noDeleteOnStaleGet;allowStaleOnFetchAbort;allowStaleOnFetchRejection;ignoreFetchAbort;#h;#u;#f;#a;#i;#d;#E;#b;#p;#R;#m;#C;#T;#g;#y;#x;#A;#e;#_;static unsafeExposeInternals(t){return{starts:t.#T,ttls:t.#g,autopurgeTimers:t.#y,sizes:t.#C,keyMap:t.#f,keyList:t.#a,valList:t.#i,next:t.#d,prev:t.#E,get head(){return t.#b},get tail(){return t.#p},free:t.#R,isBackgroundFetch:e=>t.#l(e),backgroundFetch:(e,s,i,r)=>t.#U(e,s,i,r),moveToTail:e=>t.#W(e),indexes:e=>t.#F(e),rindexes:e=>t.#D(e),isStale:e=>t.#v(e)}}get max(){return this.#t}get maxSize(){return this.#s}get calculatedSize(){return this.#u}get size(){return this.#h}get fetchMethod(){return this.#S}get memoMethod(){return this.#w}get dispose(){return this.#n}get onInsert(){return this.#r}get disposeAfter(){return this.#o}constructor(t){let{max:e=0,ttl:s,ttlResolution:i=1,ttlAutopurge:r,updateAgeOnGet:o,updateAgeOnHas:h,allowStale:a,dispose:l,onInsert:u,disposeAfter:c,noDisposeOnSet:d,noUpdateTTL:f,maxSize:m=0,maxEntrySize:p=0,sizeCalculation:w,fetchMethod:g,memoMethod:S,noDeleteOnFetchRejection:E,noDeleteOnStaleGet:y,allowStaleOnFetchRejection:b,allowStaleOnFetchAbort:z,ignoreFetchAbort:$,perf:J}=t;if(J!==void 0&&typeof J?.now!="function")throw new TypeError("perf option must have a now() method if specified");if(this.#c=J??si,e!==0&&!q(e))throw new TypeError("max option must be a nonnegative integer");let Z=e?De(e):Array;if(!Z)throw new Error("invalid max value: "+e);if(this.#t=e,this.#s=m,this.maxEntrySize=p||this.#s,this.sizeCalculation=w,this.sizeCalculation){if(!this.#s&&!this.maxEntrySize)throw new TypeError("cannot set sizeCalculation without setting maxSize or maxEntrySize");if(typeof this.sizeCalculation!="function")throw new TypeError("sizeCalculation set to non-function")}if(S!==void 0&&typeof S!="function")throw new TypeError("memoMethod must be a function if defined");if(this.#w=S,g!==void 0&&typeof g!="function")throw new TypeError("fetchMethod must be a function if specified");if(this.#S=g,this.#A=!!g,this.#f=new Map,this.#a=new Array(e).fill(void 0),this.#i=new Array(e).fill(void 0),this.#d=new Z(e),this.#E=new Z(e),this.#b=0,this.#p=0,this.#R=ri.create(e),this.#h=0,this.#u=0,typeof l=="function"&&(this.#n=l),typeof u=="function"&&(this.#r=u),typeof c=="function"?(this.#o=c,this.#m=[]):(this.#o=void 0,this.#m=void 0),this.#x=!!this.#n,this.#_=!!this.#r,this.#e=!!this.#o,this.noDisposeOnSet=!!d,this.noUpdateTTL=!!f,this.noDeleteOnFetchRejection=!!E,this.allowStaleOnFetchRejection=!!b,this.allowStaleOnFetchAbort=!!z,this.ignoreFetchAbort=!!$,this.maxEntrySize!==0){if(this.#s!==0&&!q(this.#s))throw new TypeError("maxSize must be a positive integer if specified");if(!q(this.maxEntrySize))throw new TypeError("maxEntrySize must be a positive integer if specified");this.#G()}if(this.allowStale=!!a,this.noDeleteOnStaleGet=!!y,this.updateAgeOnGet=!!o,this.updateAgeOnHas=!!h,this.ttlResolution=q(i)||i===0?i:1,this.ttlAutopurge=!!r,this.ttl=s||0,this.ttl){if(!q(this.ttl))throw new TypeError("ttl must be a positive integer if specified");this.#M()}if(this.#t===0&&this.ttl===0&&this.#s===0)throw new TypeError("At least one of max, maxSize, or ttl is required");if(!this.ttlAutopurge&&!this.#t&&!this.#s){let $t="LRU_CACHE_UNBOUNDED";ii($t)&&(Oe.add($t),Fe("TTL caching without ttlAutopurge, max, or maxSize can result in unbounded memory consumption.","UnboundedCacheWarning",$t,Me))}}getRemainingTTL(t){return this.#f.has(t)?1/0:0}#M(){let t=new Tt(this.#t),e=new Tt(this.#t);this.#g=t,this.#T=e;let s=this.ttlAutopurge?new Array(this.#t):void 0;this.#y=s,this.#j=(o,h,a=this.#c.now())=>{if(e[o]=h!==0?a:0,t[o]=h,s?.[o]&&(clearTimeout(s[o]),s[o]=void 0),h!==0&&s){let l=setTimeout(()=>{this.#v(o)&&this.#O(this.#a[o],"expire")},h+1);l.unref&&l.unref(),s[o]=l}},this.#k=o=>{e[o]=t[o]!==0?this.#c.now():0},this.#N=(o,h)=>{if(t[h]){let a=t[h],l=e[h];if(!a||!l)return;o.ttl=a,o.start=l,o.now=i||r();let u=o.now-l;o.remainingTTL=a-u}};let i=0,r=()=>{let o=this.#c.now();if(this.ttlResolution>0){i=o;let h=setTimeout(()=>i=0,this.ttlResolution);h.unref&&h.unref()}return o};this.getRemainingTTL=o=>{let h=this.#f.get(o);if(h===void 0)return 0;let a=t[h],l=e[h];if(!a||!l)return 1/0;let u=(i||r())-l;return a-u},this.#v=o=>{let h=e[o],a=t[o];return!!a&&!!h&&(i||r())-h>a}}#k=()=>{};#N=()=>{};#j=()=>{};#v=()=>!1;#G(){let t=new Tt(this.#t);this.#u=0,this.#C=t,this.#P=e=>{this.#u-=t[e],t[e]=0},this.#I=(e,s,i,r)=>{if(this.#l(s))return 0;if(!q(i))if(r){if(typeof r!="function")throw new TypeError("sizeCalculation must be a function");if(i=r(s,e),!q(i))throw new TypeError("sizeCalculation return invalid (expect positive integer)")}else throw new TypeError("invalid size value (must be positive integer). When maxSize or maxEntrySize is used, sizeCalculation or size must be set.");return i},this.#L=(e,s,i)=>{if(t[e]=s,this.#s){let r=this.#s-t[e];for(;this.#u>r;)this.#B(!0)}this.#u+=t[e],i&&(i.entrySize=s,i.totalCalculatedSize=this.#u)}}#P=t=>{};#L=(t,e,s)=>{};#I=(t,e,s,i)=>{if(s||i)throw new TypeError("cannot set size without setting maxSize or maxEntrySize on cache");return 0};*#F({allowStale:t=this.allowStale}={}){if(this.#h)for(let e=this.#p;!(!this.#z(e)||((t||!this.#v(e))&&(yield e),e===this.#b));)e=this.#E[e]}*#D({allowStale:t=this.allowStale}={}){if(this.#h)for(let e=this.#b;!(!this.#z(e)||((t||!this.#v(e))&&(yield e),e===this.#p));)e=this.#d[e]}#z(t){return t!==void 0&&this.#f.get(this.#a[t])===t}*entries(){for(let t of this.#F())this.#i[t]!==void 0&&this.#a[t]!==void 0&&!this.#l(this.#i[t])&&(yield[this.#a[t],this.#i[t]])}*rentries(){for(let t of this.#D())this.#i[t]!==void 0&&this.#a[t]!==void 0&&!this.#l(this.#i[t])&&(yield[this.#a[t],this.#i[t]])}*keys(){for(let t of this.#F()){let e=this.#a[t];e!==void 0&&!this.#l(this.#i[t])&&(yield e)}}*rkeys(){for(let t of this.#D()){let e=this.#a[t];e!==void 0&&!this.#l(this.#i[t])&&(yield e)}}*values(){for(let t of this.#F())this.#i[t]!==void 0&&!this.#l(this.#i[t])&&(yield this.#i[t])}*rvalues(){for(let t of this.#D())this.#i[t]!==void 0&&!this.#l(this.#i[t])&&(yield this.#i[t])}[Symbol.iterator](){return this.entries()}[Symbol.toStringTag]="LRUCache";find(t,e={}){for(let s of this.#F()){let i=this.#i[s],r=this.#l(i)?i.__staleWhileFetching:i;if(r!==void 0&&t(r,this.#a[s],this))return this.get(this.#a[s],e)}}forEach(t,e=this){for(let s of this.#F()){let i=this.#i[s],r=this.#l(i)?i.__staleWhileFetching:i;r!==void 0&&t.call(e,r,this.#a[s],this)}}rforEach(t,e=this){for(let s of this.#D()){let i=this.#i[s],r=this.#l(i)?i.__staleWhileFetching:i;r!==void 0&&t.call(e,r,this.#a[s],this)}}purgeStale(){let t=!1;for(let e of this.#D({allowStale:!0}))this.#v(e)&&(this.#O(this.#a[e],"expire"),t=!0);return t}info(t){let e=this.#f.get(t);if(e===void 0)return;let s=this.#i[e],i=this.#l(s)?s.__staleWhileFetching:s;if(i===void 0)return;let r={value:i};if(this.#g&&this.#T){let o=this.#g[e],h=this.#T[e];if(o&&h){let a=o-(this.#c.now()-h);r.ttl=a,r.start=Date.now()}}return this.#C&&(r.size=this.#C[e]),r}dump(){let t=[];for(let e of this.#F({allowStale:!0})){let s=this.#a[e],i=this.#i[e],r=this.#l(i)?i.__staleWhileFetching:i;if(r===void 0||s===void 0)continue;let o={value:r};if(this.#g&&this.#T){o.ttl=this.#g[e];let h=this.#c.now()-this.#T[e];o.start=Math.floor(Date.now()-h)}this.#C&&(o.size=this.#C[e]),t.unshift([s,o])}return t}load(t){this.clear();for(let[e,s]of t){if(s.start){let i=Date.now()-s.start;s.start=this.#c.now()-i}this.set(e,s.value,s)}}set(t,e,s={}){if(e===void 0)return this.delete(t),this;let{ttl:i=this.ttl,start:r,noDisposeOnSet:o=this.noDisposeOnSet,sizeCalculation:h=this.sizeCalculation,status:a}=s,{noUpdateTTL:l=this.noUpdateTTL}=s,u=this.#I(t,e,s.size||0,h);if(this.maxEntrySize&&u>this.maxEntrySize)return a&&(a.set="miss",a.maxEntrySizeExceeded=!0),this.#O(t,"set"),this;let c=this.#h===0?void 0:this.#f.get(t);if(c===void 0)c=this.#h===0?this.#p:this.#R.length!==0?this.#R.pop():this.#h===this.#t?this.#B(!1):this.#h,this.#a[c]=t,this.#i[c]=e,this.#f.set(t,c),this.#d[this.#p]=c,this.#E[c]=this.#p,this.#p=c,this.#h++,this.#L(c,u,a),a&&(a.set="add"),l=!1,this.#_&&this.#r?.(e,t,"add");else{this.#W(c);let d=this.#i[c];if(e!==d){if(this.#A&&this.#l(d)){d.__abortController.abort(new Error("replaced"));let{__staleWhileFetching:f}=d;f!==void 0&&!o&&(this.#x&&this.#n?.(f,t,"set"),this.#e&&this.#m?.push([f,t,"set"]))}else o||(this.#x&&this.#n?.(d,t,"set"),this.#e&&this.#m?.push([d,t,"set"]));if(this.#P(c),this.#L(c,u,a),this.#i[c]=e,a){a.set="replace";let f=d&&this.#l(d)?d.__staleWhileFetching:d;f!==void 0&&(a.oldValue=f)}}else a&&(a.set="update");this.#_&&this.onInsert?.(e,t,e===d?"update":"replace")}if(i!==0&&!this.#g&&this.#M(),this.#g&&(l||this.#j(c,i,r),a&&this.#N(a,c)),!o&&this.#e&&this.#m){let d=this.#m,f;for(;f=d?.shift();)this.#o?.(...f)}return this}pop(){try{for(;this.#h;){let t=this.#i[this.#b];if(this.#B(!0),this.#l(t)){if(t.__staleWhileFetching)return t.__staleWhileFetching}else if(t!==void 0)return t}}finally{if(this.#e&&this.#m){let t=this.#m,e;for(;e=t?.shift();)this.#o?.(...e)}}}#B(t){let e=this.#b,s=this.#a[e],i=this.#i[e];return this.#A&&this.#l(i)?i.__abortController.abort(new Error("evicted")):(this.#x||this.#e)&&(this.#x&&this.#n?.(i,s,"evict"),this.#e&&this.#m?.push([i,s,"evict"])),this.#P(e),this.#y?.[e]&&(clearTimeout(this.#y[e]),this.#y[e]=void 0),t&&(this.#a[e]=void 0,this.#i[e]=void 0,this.#R.push(e)),this.#h===1?(this.#b=this.#p=0,this.#R.length=0):this.#b=this.#d[e],this.#f.delete(s),this.#h--,e}has(t,e={}){let{updateAgeOnHas:s=this.updateAgeOnHas,status:i}=e,r=this.#f.get(t);if(r!==void 0){let o=this.#i[r];if(this.#l(o)&&o.__staleWhileFetching===void 0)return!1;if(this.#v(r))i&&(i.has="stale",this.#N(i,r));else return s&&this.#k(r),i&&(i.has="hit",this.#N(i,r)),!0}else i&&(i.has="miss");return!1}peek(t,e={}){let{allowStale:s=this.allowStale}=e,i=this.#f.get(t);if(i===void 0||!s&&this.#v(i))return;let r=this.#i[i];return this.#l(r)?r.__staleWhileFetching:r}#U(t,e,s,i){let r=e===void 0?void 0:this.#i[e];if(this.#l(r))return r;let o=new At,{signal:h}=s;h?.addEventListener("abort",()=>o.abort(h.reason),{signal:o.signal});let a={signal:o.signal,options:s,context:i},l=(p,w=!1)=>{let{aborted:g}=o.signal,S=s.ignoreFetchAbort&&p!==void 0,E=s.ignoreFetchAbort||!!(s.allowStaleOnFetchAbort&&p!==void 0);if(s.status&&(g&&!w?(s.status.fetchAborted=!0,s.status.fetchError=o.signal.reason,S&&(s.status.fetchAbortIgnored=!0)):s.status.fetchResolved=!0),g&&!S&&!w)return c(o.signal.reason,E);let y=f,b=this.#i[e];return(b===f||S&&w&&b===void 0)&&(p===void 0?y.__staleWhileFetching!==void 0?this.#i[e]=y.__staleWhileFetching:this.#O(t,"fetch"):(s.status&&(s.status.fetchUpdated=!0),this.set(t,p,a.options))),p},u=p=>(s.status&&(s.status.fetchRejected=!0,s.status.fetchError=p),c(p,!1)),c=(p,w)=>{let{aborted:g}=o.signal,S=g&&s.allowStaleOnFetchAbort,E=S||s.allowStaleOnFetchRejection,y=E||s.noDeleteOnFetchRejection,b=f;if(this.#i[e]===f&&(!y||!w&&b.__staleWhileFetching===void 0?this.#O(t,"fetch"):S||(this.#i[e]=b.__staleWhileFetching)),E)return s.status&&b.__staleWhileFetching!==void 0&&(s.status.returnedStale=!0),b.__staleWhileFetching;if(b.__returned===b)throw p},d=(p,w)=>{let g=this.#S?.(t,r,a);g&&g instanceof Promise&&g.then(S=>p(S===void 0?void 0:S),w),o.signal.addEventListener("abort",()=>{(!s.ignoreFetchAbort||s.allowStaleOnFetchAbort)&&(p(void 0),s.allowStaleOnFetchAbort&&(p=S=>l(S,!0)))})};s.status&&(s.status.fetchDispatched=!0);let f=new Promise(d).then(l,u),m=Object.assign(f,{__abortController:o,__staleWhileFetching:r,__returned:void 0});return e===void 0?(this.set(t,m,{...a.options,status:void 0}),e=this.#f.get(t)):this.#i[e]=m,m}#l(t){if(!this.#A)return!1;let e=t;return!!e&&e instanceof Promise&&e.hasOwnProperty("__staleWhileFetching")&&e.__abortController instanceof At}async fetch(t,e={}){let{allowStale:s=this.allowStale,updateAgeOnGet:i=this.updateAgeOnGet,noDeleteOnStaleGet:r=this.noDeleteOnStaleGet,ttl:o=this.ttl,noDisposeOnSet:h=this.noDisposeOnSet,size:a=0,sizeCalculation:l=this.sizeCalculation,noUpdateTTL:u=this.noUpdateTTL,noDeleteOnFetchRejection:c=this.noDeleteOnFetchRejection,allowStaleOnFetchRejection:d=this.allowStaleOnFetchRejection,ignoreFetchAbort:f=this.ignoreFetchAbort,allowStaleOnFetchAbort:m=this.allowStaleOnFetchAbort,context:p,forceRefresh:w=!1,status:g,signal:S}=e;if(!this.#A)return g&&(g.fetch="get"),this.get(t,{allowStale:s,updateAgeOnGet:i,noDeleteOnStaleGet:r,status:g});let E={allowStale:s,updateAgeOnGet:i,noDeleteOnStaleGet:r,ttl:o,noDisposeOnSet:h,size:a,sizeCalculation:l,noUpdateTTL:u,noDeleteOnFetchRejection:c,allowStaleOnFetchRejection:d,allowStaleOnFetchAbort:m,ignoreFetchAbort:f,status:g,signal:S},y=this.#f.get(t);if(y===void 0){g&&(g.fetch="miss");let b=this.#U(t,y,E,p);return b.__returned=b}else{let b=this.#i[y];if(this.#l(b)){let Z=s&&b.__staleWhileFetching!==void 0;return g&&(g.fetch="inflight",Z&&(g.returnedStale=!0)),Z?b.__staleWhileFetching:b.__returned=b}let z=this.#v(y);if(!w&&!z)return g&&(g.fetch="hit"),this.#W(y),i&&this.#k(y),g&&this.#N(g,y),b;let $=this.#U(t,y,E,p),J=$.__staleWhileFetching!==void 0&&s;return g&&(g.fetch=z?"stale":"refresh",J&&z&&(g.returnedStale=!0)),J?$.__staleWhileFetching:$.__returned=$}}async forceFetch(t,e={}){let s=await this.fetch(t,e);if(s===void 0)throw new Error("fetch() returned undefined");return s}memo(t,e={}){let s=this.#w;if(!s)throw new Error("no memoMethod provided to constructor");let{context:i,forceRefresh:r,...o}=e,h=this.get(t,o);if(!r&&h!==void 0)return h;let a=s(t,h,{options:o,context:i});return this.set(t,a,o),a}get(t,e={}){let{allowStale:s=this.allowStale,updateAgeOnGet:i=this.updateAgeOnGet,noDeleteOnStaleGet:r=this.noDeleteOnStaleGet,status:o}=e,h=this.#f.get(t);if(h!==void 0){let a=this.#i[h],l=this.#l(a);return o&&this.#N(o,h),this.#v(h)?(o&&(o.get="stale"),l?(o&&s&&a.__staleWhileFetching!==void 0&&(o.returnedStale=!0),s?a.__staleWhileFetching:void 0):(r||this.#O(t,"expire"),o&&s&&(o.returnedStale=!0),s?a:void 0)):(o&&(o.get="hit"),l?a.__staleWhileFetching:(this.#W(h),i&&this.#k(h),a))}else o&&(o.get="miss")}#$(t,e){this.#E[e]=t,this.#d[t]=e}#W(t){t!==this.#p&&(t===this.#b?this.#b=this.#d[t]:this.#$(this.#E[t],this.#d[t]),this.#$(this.#p,t),this.#p=t)}delete(t){return this.#O(t,"delete")}#O(t,e){let s=!1;if(this.#h!==0){let i=this.#f.get(t);if(i!==void 0)if(this.#y?.[i]&&(clearTimeout(this.#y?.[i]),this.#y[i]=void 0),s=!0,this.#h===1)this.#H(e);else{this.#P(i);let r=this.#i[i];if(this.#l(r)?r.__abortController.abort(new Error("deleted")):(this.#x||this.#e)&&(this.#x&&this.#n?.(r,t,e),this.#e&&this.#m?.push([r,t,e])),this.#f.delete(t),this.#a[i]=void 0,this.#i[i]=void 0,i===this.#p)this.#p=this.#E[i];else if(i===this.#b)this.#b=this.#d[i];else{let o=this.#E[i];this.#d[o]=this.#d[i];let h=this.#d[i];this.#E[h]=this.#E[i]}this.#h--,this.#R.push(i)}}if(this.#e&&this.#m?.length){let i=this.#m,r;for(;r=i?.shift();)this.#o?.(...r)}return s}clear(){return this.#H("delete")}#H(t){for(let e of this.#D({allowStale:!0})){let s=this.#i[e];if(this.#l(s))s.__abortController.abort(new Error("deleted"));else{let i=this.#a[e];this.#x&&this.#n?.(s,i,t),this.#e&&this.#m?.push([s,i,t])}}if(this.#f.clear(),this.#i.fill(void 0),this.#a.fill(void 0),this.#g&&this.#T){this.#g.fill(0),this.#T.fill(0);for(let e of this.#y??[])e!==void 0&&clearTimeout(e);this.#y?.fill(void 0)}if(this.#C&&this.#C.fill(0),this.#b=0,this.#p=0,this.#R.length=0,this.#u=0,this.#h=0,this.#e&&this.#m){let e=this.#m,s;for(;s=e?.shift();)this.#o?.(...s)}}};var Ne=typeof process=="object"&&process?process:{stdout:null,stderr:null},oi=n=>!!n&&typeof n=="object"&&(n instanceof V||n instanceof external_node_stream_||hi(n)||ai(n)),hi=n=>!!n&&typeof n=="object"&&n instanceof external_node_events_.EventEmitter&&typeof n.pipe=="function"&&n.pipe!==external_node_stream_.Writable.prototype.pipe,ai=n=>!!n&&typeof n=="object"&&n instanceof external_node_events_.EventEmitter&&typeof n.write=="function"&&typeof n.end=="function",G=Symbol("EOF"),H=Symbol("maybeEmitEnd"),K=Symbol("emittedEnd"),kt=Symbol("emittingEnd"),ut=Symbol("emittedError"),Rt=Symbol("closed"),_e=Symbol("read"),Ot=Symbol("flush"),Le=Symbol("flushChunk"),P=Symbol("encoding"),et=Symbol("decoder"),v=Symbol("flowing"),dt=Symbol("paused"),st=Symbol("resume"),C=Symbol("buffer"),F=Symbol("pipes"),T=Symbol("bufferLength"),Yt=Symbol("bufferPush"),Ft=Symbol("bufferShift"),k=Symbol("objectMode"),x=Symbol("destroyed"),Xt=Symbol("error"),Jt=Symbol("emitData"),We=Symbol("emitEnd"),Zt=Symbol("emitEnd2"),B=Symbol("async"),Qt=Symbol("abort"),Dt=Symbol("aborted"),pt=Symbol("signal"),Y=Symbol("dataListeners"),M=Symbol("discarded"),mt=n=>Promise.resolve().then(n),li=n=>n(),ci=n=>n==="end"||n==="finish"||n==="prefinish",fi=n=>n instanceof ArrayBuffer||!!n&&typeof n=="object"&&n.constructor&&n.constructor.name==="ArrayBuffer"&&n.byteLength>=0,ui=n=>!Buffer.isBuffer(n)&&ArrayBuffer.isView(n),Mt=class{src;dest;opts;ondrain;constructor(t,e,s){this.src=t,this.dest=e,this.opts=s,this.ondrain=()=>t[st](),this.dest.on("drain",this.ondrain)}unpipe(){this.dest.removeListener("drain",this.ondrain)}proxyErrors(t){}end(){this.unpipe(),this.opts.end&&this.dest.end()}},te=class extends Mt{unpipe(){this.src.removeListener("error",this.proxyErrors),super.unpipe()}constructor(t,e,s){super(t,e,s),this.proxyErrors=i=>this.dest.emit("error",i),t.on("error",this.proxyErrors)}},di=n=>!!n.objectMode,pi=n=>!n.objectMode&&!!n.encoding&&n.encoding!=="buffer",V=class extends external_node_events_.EventEmitter{[v]=!1;[dt]=!1;[F]=[];[C]=[];[k];[P];[B];[et];[G]=!1;[K]=!1;[kt]=!1;[Rt]=!1;[ut]=null;[T]=0;[x]=!1;[pt];[Dt]=!1;[Y]=0;[M]=!1;writable=!0;readable=!0;constructor(...t){let e=t[0]||{};if(super(),e.objectMode&&typeof e.encoding=="string")throw new TypeError("Encoding and objectMode may not be used together");di(e)?(this[k]=!0,this[P]=null):pi(e)?(this[P]=e.encoding,this[k]=!1):(this[k]=!1,this[P]=null),this[B]=!!e.async,this[et]=this[P]?new external_node_string_decoder_.StringDecoder(this[P]):null,e&&e.debugExposeBuffer===!0&&Object.defineProperty(this,"buffer",{get:()=>this[C]}),e&&e.debugExposePipes===!0&&Object.defineProperty(this,"pipes",{get:()=>this[F]});let{signal:s}=e;s&&(this[pt]=s,s.aborted?this[Qt]():s.addEventListener("abort",()=>this[Qt]()))}get bufferLength(){return this[T]}get encoding(){return this[P]}set encoding(t){throw new Error("Encoding must be set at instantiation time")}setEncoding(t){throw new Error("Encoding must be set at instantiation time")}get objectMode(){return this[k]}set objectMode(t){throw new Error("objectMode must be set at instantiation time")}get async(){return this[B]}set async(t){this[B]=this[B]||!!t}[Qt](){this[Dt]=!0,this.emit("abort",this[pt]?.reason),this.destroy(this[pt]?.reason)}get aborted(){return this[Dt]}set aborted(t){}write(t,e,s){if(this[Dt])return!1;if(this[G])throw new Error("write after end");if(this[x])return this.emit("error",Object.assign(new Error("Cannot call write after a stream was destroyed"),{code:"ERR_STREAM_DESTROYED"})),!0;typeof e=="function"&&(s=e,e="utf8"),e||(e="utf8");let i=this[B]?mt:li;if(!this[k]&&!Buffer.isBuffer(t)){if(ui(t))t=Buffer.from(t.buffer,t.byteOffset,t.byteLength);else if(fi(t))t=Buffer.from(t);else if(typeof t!="string")throw new Error("Non-contiguous data written to non-objectMode stream")}return this[k]?(this[v]&&this[T]!==0&&this[Ot](!0),this[v]?this.emit("data",t):this[Yt](t),this[T]!==0&&this.emit("readable"),s&&i(s),this[v]):t.length?(typeof t=="string"&&!(e===this[P]&&!this[et]?.lastNeed)&&(t=Buffer.from(t,e)),Buffer.isBuffer(t)&&this[P]&&(t=this[et].write(t)),this[v]&&this[T]!==0&&this[Ot](!0),this[v]?this.emit("data",t):this[Yt](t),this[T]!==0&&this.emit("readable"),s&&i(s),this[v]):(this[T]!==0&&this.emit("readable"),s&&i(s),this[v])}read(t){if(this[x])return null;if(this[M]=!1,this[T]===0||t===0||t&&t>this[T])return this[H](),null;this[k]&&(t=null),this[C].length>1&&!this[k]&&(this[C]=[this[P]?this[C].join(""):Buffer.concat(this[C],this[T])]);let e=this[_e](t||null,this[C][0]);return this[H](),e}[_e](t,e){if(this[k])this[Ft]();else{let s=e;t===s.length||t===null?this[Ft]():typeof s=="string"?(this[C][0]=s.slice(t),e=s.slice(0,t),this[T]-=t):(this[C][0]=s.subarray(t),e=s.subarray(0,t),this[T]-=t)}return this.emit("data",e),!this[C].length&&!this[G]&&this.emit("drain"),e}end(t,e,s){return typeof t=="function"&&(s=t,t=void 0),typeof e=="function"&&(s=e,e="utf8"),t!==void 0&&this.write(t,e),s&&this.once("end",s),this[G]=!0,this.writable=!1,(this[v]||!this[dt])&&this[H](),this}[st](){this[x]||(!this[Y]&&!this[F].length&&(this[M]=!0),this[dt]=!1,this[v]=!0,this.emit("resume"),this[C].length?this[Ot]():this[G]?this[H]():this.emit("drain"))}resume(){return this[st]()}pause(){this[v]=!1,this[dt]=!0,this[M]=!1}get destroyed(){return this[x]}get flowing(){return this[v]}get paused(){return this[dt]}[Yt](t){this[k]?this[T]+=1:this[T]+=t.length,this[C].push(t)}[Ft](){return this[k]?this[T]-=1:this[T]-=this[C][0].length,this[C].shift()}[Ot](t=!1){do;while(this[Le](this[Ft]())&&this[C].length);!t&&!this[C].length&&!this[G]&&this.emit("drain")}[Le](t){return this.emit("data",t),this[v]}pipe(t,e){if(this[x])return t;this[M]=!1;let s=this[K];return e=e||{},t===Ne.stdout||t===Ne.stderr?e.end=!1:e.end=e.end!==!1,e.proxyErrors=!!e.proxyErrors,s?e.end&&t.end():(this[F].push(e.proxyErrors?new te(this,t,e):new Mt(this,t,e)),this[B]?mt(()=>this[st]()):this[st]()),t}unpipe(t){let e=this[F].find(s=>s.dest===t);e&&(this[F].length===1?(this[v]&&this[Y]===0&&(this[v]=!1),this[F]=[]):this[F].splice(this[F].indexOf(e),1),e.unpipe())}addListener(t,e){return this.on(t,e)}on(t,e){let s=super.on(t,e);if(t==="data")this[M]=!1,this[Y]++,!this[F].length&&!this[v]&&this[st]();else if(t==="readable"&&this[T]!==0)super.emit("readable");else if(ci(t)&&this[K])super.emit(t),this.removeAllListeners(t);else if(t==="error"&&this[ut]){let i=e;this[B]?mt(()=>i.call(this,this[ut])):i.call(this,this[ut])}return s}removeListener(t,e){return this.off(t,e)}off(t,e){let s=super.off(t,e);return t==="data"&&(this[Y]=this.listeners("data").length,this[Y]===0&&!this[M]&&!this[F].length&&(this[v]=!1)),s}removeAllListeners(t){let e=super.removeAllListeners(t);return(t==="data"||t===void 0)&&(this[Y]=0,!this[M]&&!this[F].length&&(this[v]=!1)),e}get emittedEnd(){return this[K]}[H](){!this[kt]&&!this[K]&&!this[x]&&this[C].length===0&&this[G]&&(this[kt]=!0,this.emit("end"),this.emit("prefinish"),this.emit("finish"),this[Rt]&&this.emit("close"),this[kt]=!1)}emit(t,...e){let s=e[0];if(t!=="error"&&t!=="close"&&t!==x&&this[x])return!1;if(t==="data")return!this[k]&&!s?!1:this[B]?(mt(()=>this[Jt](s)),!0):this[Jt](s);if(t==="end")return this[We]();if(t==="close"){if(this[Rt]=!0,!this[K]&&!this[x])return!1;let r=super.emit("close");return this.removeAllListeners("close"),r}else if(t==="error"){this[ut]=s,super.emit(Xt,s);let r=!this[pt]||this.listeners("error").length?super.emit("error",s):!1;return this[H](),r}else if(t==="resume"){let r=super.emit("resume");return this[H](),r}else if(t==="finish"||t==="prefinish"){let r=super.emit(t);return this.removeAllListeners(t),r}let i=super.emit(t,...e);return this[H](),i}[Jt](t){for(let s of this[F])s.dest.write(t)===!1&&this.pause();let e=this[M]?!1:super.emit("data",t);return this[H](),e}[We](){return this[K]?!1:(this[K]=!0,this.readable=!1,this[B]?(mt(()=>this[Zt]()),!0):this[Zt]())}[Zt](){if(this[et]){let e=this[et].end();if(e){for(let s of this[F])s.dest.write(e);this[M]||super.emit("data",e)}}for(let e of this[F])e.end();let t=super.emit("end");return this.removeAllListeners("end"),t}async collect(){let t=Object.assign([],{dataLength:0});this[k]||(t.dataLength=0);let e=this.promise();return this.on("data",s=>{t.push(s),this[k]||(t.dataLength+=s.length)}),await e,t}async concat(){if(this[k])throw new Error("cannot concat in objectMode");let t=await this.collect();return this[P]?t.join(""):Buffer.concat(t,t.dataLength)}async promise(){return new Promise((t,e)=>{this.on(x,()=>e(new Error("stream destroyed"))),this.on("error",s=>e(s)),this.on("end",()=>t())})}[Symbol.asyncIterator](){this[M]=!1;let t=!1,e=async()=>(this.pause(),t=!0,{value:void 0,done:!0});return{next:()=>{if(t)return e();let i=this.read();if(i!==null)return Promise.resolve({done:!1,value:i});if(this[G])return e();let r,o,h=c=>{this.off("data",a),this.off("end",l),this.off(x,u),e(),o(c)},a=c=>{this.off("error",h),this.off("end",l),this.off(x,u),this.pause(),r({value:c,done:!!this[G]})},l=()=>{this.off("error",h),this.off("data",a),this.off(x,u),e(),r({done:!0,value:void 0})},u=()=>h(new Error("stream destroyed"));return new Promise((c,d)=>{o=d,r=c,this.once(x,u),this.once("error",h),this.once("end",l),this.once("data",a)})},throw:e,return:e,[Symbol.asyncIterator](){return this},[Symbol.asyncDispose]:async()=>{}}}[Symbol.iterator](){this[M]=!1;let t=!1,e=()=>(this.pause(),this.off(Xt,e),this.off(x,e),this.off("end",e),t=!0,{done:!0,value:void 0}),s=()=>{if(t)return e();let i=this.read();return i===null?e():{done:!1,value:i}};return this.once("end",e),this.once(Xt,e),this.once(x,e),{next:s,throw:e,return:e,[Symbol.iterator](){return this},[Symbol.dispose]:()=>{}}}destroy(t){if(this[x])return t?this.emit("error",t):this.emit(x),this;this[x]=!0,this[M]=!0,this[C].length=0,this[T]=0;let e=this;return typeof e.close=="function"&&!this[Rt]&&e.close(),t?this.emit("error",t):this.emit(x),this}static get isStream(){return oi}};var vi=external_fs_.realpathSync.native,wt={lstatSync:external_fs_.lstatSync,readdir:external_fs_.readdir,readdirSync:external_fs_.readdirSync,readlinkSync:external_fs_.readlinkSync,realpathSync:vi,promises:{lstat:promises_.lstat,readdir:promises_.readdir,readlink:promises_.readlink,realpath:promises_.realpath}},Ue=n=>!n||n===wt||n===external_node_fs_namespaceObject?wt:{...wt,...n,promises:{...wt.promises,...n.promises||{}}},$e=/^\\\\\?\\([a-z]:)\\?$/i,Ri=n=>n.replace(/\//g,"\\").replace($e,"$1\\"),Oi=/[\\\/]/,L=0,Ge=1,He=2,U=4,qe=6,Ke=8,X=10,Ve=12,_=15,gt=~_,se=16,je=32,yt=64,j=128,Nt=256,Lt=512,Ie=yt|j|Lt,Fi=1023,ie=n=>n.isFile()?Ke:n.isDirectory()?U:n.isSymbolicLink()?X:n.isCharacterDevice()?He:n.isBlockDevice()?qe:n.isSocket()?Ve:n.isFIFO()?Ge:L,ze=new ft({max:2**12}),bt=n=>{let t=ze.get(n);if(t)return t;let e=n.normalize("NFKD");return ze.set(n,e),e},Be=new ft({max:2**12}),_t=n=>{let t=Be.get(n);if(t)return t;let e=bt(n.toLowerCase());return Be.set(n,e),e},Wt=class extends ft{constructor(){super({max:256})}},ne=class extends ft{constructor(t=16*1024){super({maxSize:t,sizeCalculation:e=>e.length+1})}},Ye=Symbol("PathScurry setAsCwd"),R=class{name;root;roots;parent;nocase;isCWD=!1;#t;#s;get dev(){return this.#s}#n;get mode(){return this.#n}#r;get nlink(){return this.#r}#o;get uid(){return this.#o}#S;get gid(){return this.#S}#w;get rdev(){return this.#w}#c;get blksize(){return this.#c}#h;get ino(){return this.#h}#u;get size(){return this.#u}#f;get blocks(){return this.#f}#a;get atimeMs(){return this.#a}#i;get mtimeMs(){return this.#i}#d;get ctimeMs(){return this.#d}#E;get birthtimeMs(){return this.#E}#b;get atime(){return this.#b}#p;get mtime(){return this.#p}#R;get ctime(){return this.#R}#m;get birthtime(){return this.#m}#C;#T;#g;#y;#x;#A;#e;#_;#M;#k;get parentPath(){return(this.parent||this).fullpath()}get path(){return this.parentPath}constructor(t,e=L,s,i,r,o,h){this.name=t,this.#C=r?_t(t):bt(t),this.#e=e&Fi,this.nocase=r,this.roots=i,this.root=s||this,this.#_=o,this.#g=h.fullpath,this.#x=h.relative,this.#A=h.relativePosix,this.parent=h.parent,this.parent?this.#t=this.parent.#t:this.#t=Ue(h.fs)}depth(){return this.#T!==void 0?this.#T:this.parent?this.#T=this.parent.depth()+1:this.#T=0}childrenCache(){return this.#_}resolve(t){if(!t)return this;let e=this.getRootString(t),i=t.substring(e.length).split(this.splitSep);return e?this.getRoot(e).#N(i):this.#N(i)}#N(t){let e=this;for(let s of t)e=e.child(s);return e}children(){let t=this.#_.get(this);if(t)return t;let e=Object.assign([],{provisional:0});return this.#_.set(this,e),this.#e&=~se,e}child(t,e){if(t===""||t===".")return this;if(t==="..")return this.parent||this;let s=this.children(),i=this.nocase?_t(t):bt(t);for(let a of s)if(a.#C===i)return a;let r=this.parent?this.sep:"",o=this.#g?this.#g+r+t:void 0,h=this.newChild(t,L,{...e,parent:this,fullpath:o});return this.canReaddir()||(h.#e|=j),s.push(h),h}relative(){if(this.isCWD)return"";if(this.#x!==void 0)return this.#x;let t=this.name,e=this.parent;if(!e)return this.#x=this.name;let s=e.relative();return s+(!s||!e.parent?"":this.sep)+t}relativePosix(){if(this.sep==="/")return this.relative();if(this.isCWD)return"";if(this.#A!==void 0)return this.#A;let t=this.name,e=this.parent;if(!e)return this.#A=this.fullpathPosix();let s=e.relativePosix();return s+(!s||!e.parent?"":"/")+t}fullpath(){if(this.#g!==void 0)return this.#g;let t=this.name,e=this.parent;if(!e)return this.#g=this.name;let i=e.fullpath()+(e.parent?this.sep:"")+t;return this.#g=i}fullpathPosix(){if(this.#y!==void 0)return this.#y;if(this.sep==="/")return this.#y=this.fullpath();if(!this.parent){let i=this.fullpath().replace(/\\/g,"/");return/^[a-z]:\//i.test(i)?this.#y=`//?/${i}`:this.#y=i}let t=this.parent,e=t.fullpathPosix(),s=e+(!e||!t.parent?"":"/")+this.name;return this.#y=s}isUnknown(){return(this.#e&_)===L}isType(t){return this[`is${t}`]()}getType(){return this.isUnknown()?"Unknown":this.isDirectory()?"Directory":this.isFile()?"File":this.isSymbolicLink()?"SymbolicLink":this.isFIFO()?"FIFO":this.isCharacterDevice()?"CharacterDevice":this.isBlockDevice()?"BlockDevice":this.isSocket()?"Socket":"Unknown"}isFile(){return(this.#e&_)===Ke}isDirectory(){return(this.#e&_)===U}isCharacterDevice(){return(this.#e&_)===He}isBlockDevice(){return(this.#e&_)===qe}isFIFO(){return(this.#e&_)===Ge}isSocket(){return(this.#e&_)===Ve}isSymbolicLink(){return(this.#e&X)===X}lstatCached(){return this.#e&je?this:void 0}readlinkCached(){return this.#M}realpathCached(){return this.#k}readdirCached(){let t=this.children();return t.slice(0,t.provisional)}canReadlink(){if(this.#M)return!0;if(!this.parent)return!1;let t=this.#e&_;return!(t!==L&&t!==X||this.#e&Nt||this.#e&j)}calledReaddir(){return!!(this.#e&se)}isENOENT(){return!!(this.#e&j)}isNamed(t){return this.nocase?this.#C===_t(t):this.#C===bt(t)}async readlink(){let t=this.#M;if(t)return t;if(this.canReadlink()&&this.parent)try{let e=await this.#t.promises.readlink(this.fullpath()),s=(await this.parent.realpath())?.resolve(e);if(s)return this.#M=s}catch(e){this.#D(e.code);return}}readlinkSync(){let t=this.#M;if(t)return t;if(this.canReadlink()&&this.parent)try{let e=this.#t.readlinkSync(this.fullpath()),s=this.parent.realpathSync()?.resolve(e);if(s)return this.#M=s}catch(e){this.#D(e.code);return}}#j(t){this.#e|=se;for(let e=t.provisional;e<t.length;e++){let s=t[e];s&&s.#v()}}#v(){this.#e&j||(this.#e=(this.#e|j)&gt,this.#G())}#G(){let t=this.children();t.provisional=0;for(let e of t)e.#v()}#P(){this.#e|=Lt,this.#L()}#L(){if(this.#e&yt)return;let t=this.#e;(t&_)===U&&(t&=gt),this.#e=t|yt,this.#G()}#I(t=""){t==="ENOTDIR"||t==="EPERM"?this.#L():t==="ENOENT"?this.#v():this.children().provisional=0}#F(t=""){t==="ENOTDIR"?this.parent.#L():t==="ENOENT"&&this.#v()}#D(t=""){let e=this.#e;e|=Nt,t==="ENOENT"&&(e|=j),(t==="EINVAL"||t==="UNKNOWN")&&(e&=gt),this.#e=e,t==="ENOTDIR"&&this.parent&&this.parent.#L()}#z(t,e){return this.#U(t,e)||this.#B(t,e)}#B(t,e){let s=ie(t),i=this.newChild(t.name,s,{parent:this}),r=i.#e&_;return r!==U&&r!==X&&r!==L&&(i.#e|=yt),e.unshift(i),e.provisional++,i}#U(t,e){for(let s=e.provisional;s<e.length;s++){let i=e[s];if((this.nocase?_t(t.name):bt(t.name))===i.#C)return this.#l(t,i,s,e)}}#l(t,e,s,i){let r=e.name;return e.#e=e.#e&gt|ie(t),r!==t.name&&(e.name=t.name),s!==i.provisional&&(s===i.length-1?i.pop():i.splice(s,1),i.unshift(e)),i.provisional++,e}async lstat(){if((this.#e&j)===0)try{return this.#$(await this.#t.promises.lstat(this.fullpath())),this}catch(t){this.#F(t.code)}}lstatSync(){if((this.#e&j)===0)try{return this.#$(this.#t.lstatSync(this.fullpath())),this}catch(t){this.#F(t.code)}}#$(t){let{atime:e,atimeMs:s,birthtime:i,birthtimeMs:r,blksize:o,blocks:h,ctime:a,ctimeMs:l,dev:u,gid:c,ino:d,mode:f,mtime:m,mtimeMs:p,nlink:w,rdev:g,size:S,uid:E}=t;this.#b=e,this.#a=s,this.#m=i,this.#E=r,this.#c=o,this.#f=h,this.#R=a,this.#d=l,this.#s=u,this.#S=c,this.#h=d,this.#n=f,this.#p=m,this.#i=p,this.#r=w,this.#w=g,this.#u=S,this.#o=E;let y=ie(t);this.#e=this.#e&gt|y|je,y!==L&&y!==U&&y!==X&&(this.#e|=yt)}#W=[];#O=!1;#H(t){this.#O=!1;let e=this.#W.slice();this.#W.length=0,e.forEach(s=>s(null,t))}readdirCB(t,e=!1){if(!this.canReaddir()){e?t(null,[]):queueMicrotask(()=>t(null,[]));return}let s=this.children();if(this.calledReaddir()){let r=s.slice(0,s.provisional);e?t(null,r):queueMicrotask(()=>t(null,r));return}if(this.#W.push(t),this.#O)return;this.#O=!0;let i=this.fullpath();this.#t.readdir(i,{withFileTypes:!0},(r,o)=>{if(r)this.#I(r.code),s.provisional=0;else{for(let h of o)this.#z(h,s);this.#j(s)}this.#H(s.slice(0,s.provisional))})}#q;async readdir(){if(!this.canReaddir())return[];let t=this.children();if(this.calledReaddir())return t.slice(0,t.provisional);let e=this.fullpath();if(this.#q)await this.#q;else{let s=()=>{};this.#q=new Promise(i=>s=i);try{for(let i of await this.#t.promises.readdir(e,{withFileTypes:!0}))this.#z(i,t);this.#j(t)}catch(i){this.#I(i.code),t.provisional=0}this.#q=void 0,s()}return t.slice(0,t.provisional)}readdirSync(){if(!this.canReaddir())return[];let t=this.children();if(this.calledReaddir())return t.slice(0,t.provisional);let e=this.fullpath();try{for(let s of this.#t.readdirSync(e,{withFileTypes:!0}))this.#z(s,t);this.#j(t)}catch(s){this.#I(s.code),t.provisional=0}return t.slice(0,t.provisional)}canReaddir(){if(this.#e&Ie)return!1;let t=_&this.#e;return t===L||t===U||t===X}shouldWalk(t,e){return(this.#e&U)===U&&!(this.#e&Ie)&&!t.has(this)&&(!e||e(this))}async realpath(){if(this.#k)return this.#k;if(!((Lt|Nt|j)&this.#e))try{let t=await this.#t.promises.realpath(this.fullpath());return this.#k=this.resolve(t)}catch{this.#P()}}realpathSync(){if(this.#k)return this.#k;if(!((Lt|Nt|j)&this.#e))try{let t=this.#t.realpathSync(this.fullpath());return this.#k=this.resolve(t)}catch{this.#P()}}[Ye](t){if(t===this)return;t.isCWD=!1,this.isCWD=!0;let e=new Set([]),s=[],i=this;for(;i&&i.parent;)e.add(i),i.#x=s.join(this.sep),i.#A=s.join("/"),i=i.parent,s.push("..");for(i=t;i&&i.parent&&!e.has(i);)i.#x=void 0,i.#A=void 0,i=i.parent}},Pt=class n extends R{sep="\\";splitSep=Oi;constructor(t,e=L,s,i,r,o,h){super(t,e,s,i,r,o,h)}newChild(t,e=L,s={}){return new n(t,e,this.root,this.roots,this.nocase,this.childrenCache(),s)}getRootString(t){return external_node_path_.win32.parse(t).root}getRoot(t){if(t=Ri(t.toUpperCase()),t===this.root.name)return this.root;for(let[e,s]of Object.entries(this.roots))if(this.sameRoot(t,e))return this.roots[t]=s;return this.roots[t]=new it(t,this).root}sameRoot(t,e=this.root.name){return t=t.toUpperCase().replace(/\//g,"\\").replace($e,"$1\\"),t===e}},jt=class n extends R{splitSep="/";sep="/";constructor(t,e=L,s,i,r,o,h){super(t,e,s,i,r,o,h)}getRootString(t){return t.startsWith("/")?"/":""}getRoot(t){return this.root}newChild(t,e=L,s={}){return new n(t,e,this.root,this.roots,this.nocase,this.childrenCache(),s)}},It=class{root;rootPath;roots;cwd;#t;#s;#n;nocase;#r;constructor(t=process.cwd(),e,s,{nocase:i,childrenCacheSize:r=16*1024,fs:o=wt}={}){this.#r=Ue(o),(t instanceof URL||t.startsWith("file://"))&&(t=(0,external_node_url_.fileURLToPath)(t));let h=e.resolve(t);this.roots=Object.create(null),this.rootPath=this.parseRootPath(h),this.#t=new Wt,this.#s=new Wt,this.#n=new ne(r);let a=h.substring(this.rootPath.length).split(s);if(a.length===1&&!a[0]&&a.pop(),i===void 0)throw new TypeError("must provide nocase setting to PathScurryBase ctor");this.nocase=i,this.root=this.newRoot(this.#r),this.roots[this.rootPath]=this.root;let l=this.root,u=a.length-1,c=e.sep,d=this.rootPath,f=!1;for(let m of a){let p=u--;l=l.child(m,{relative:new Array(p).fill("..").join(c),relativePosix:new Array(p).fill("..").join("/"),fullpath:d+=(f?"":c)+m}),f=!0}this.cwd=l}depth(t=this.cwd){return typeof t=="string"&&(t=this.cwd.resolve(t)),t.depth()}childrenCache(){return this.#n}resolve(...t){let e="";for(let r=t.length-1;r>=0;r--){let o=t[r];if(!(!o||o===".")&&(e=e?`${o}/${e}`:o,this.isAbsolute(o)))break}let s=this.#t.get(e);if(s!==void 0)return s;let i=this.cwd.resolve(e).fullpath();return this.#t.set(e,i),i}resolvePosix(...t){let e="";for(let r=t.length-1;r>=0;r--){let o=t[r];if(!(!o||o===".")&&(e=e?`${o}/${e}`:o,this.isAbsolute(o)))break}let s=this.#s.get(e);if(s!==void 0)return s;let i=this.cwd.resolve(e).fullpathPosix();return this.#s.set(e,i),i}relative(t=this.cwd){return typeof t=="string"&&(t=this.cwd.resolve(t)),t.relative()}relativePosix(t=this.cwd){return typeof t=="string"&&(t=this.cwd.resolve(t)),t.relativePosix()}basename(t=this.cwd){return typeof t=="string"&&(t=this.cwd.resolve(t)),t.name}dirname(t=this.cwd){return typeof t=="string"&&(t=this.cwd.resolve(t)),(t.parent||t).fullpath()}async readdir(t=this.cwd,e={withFileTypes:!0}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t,t=this.cwd);let{withFileTypes:s}=e;if(t.canReaddir()){let i=await t.readdir();return s?i:i.map(r=>r.name)}else return[]}readdirSync(t=this.cwd,e={withFileTypes:!0}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t,t=this.cwd);let{withFileTypes:s=!0}=e;return t.canReaddir()?s?t.readdirSync():t.readdirSync().map(i=>i.name):[]}async lstat(t=this.cwd){return typeof t=="string"&&(t=this.cwd.resolve(t)),t.lstat()}lstatSync(t=this.cwd){return typeof t=="string"&&(t=this.cwd.resolve(t)),t.lstatSync()}async readlink(t=this.cwd,{withFileTypes:e}={withFileTypes:!1}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t.withFileTypes,t=this.cwd);let s=await t.readlink();return e?s:s?.fullpath()}readlinkSync(t=this.cwd,{withFileTypes:e}={withFileTypes:!1}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t.withFileTypes,t=this.cwd);let s=t.readlinkSync();return e?s:s?.fullpath()}async realpath(t=this.cwd,{withFileTypes:e}={withFileTypes:!1}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t.withFileTypes,t=this.cwd);let s=await t.realpath();return e?s:s?.fullpath()}realpathSync(t=this.cwd,{withFileTypes:e}={withFileTypes:!1}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t.withFileTypes,t=this.cwd);let s=t.realpathSync();return e?s:s?.fullpath()}async walk(t=this.cwd,e={}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t,t=this.cwd);let{withFileTypes:s=!0,follow:i=!1,filter:r,walkFilter:o}=e,h=[];(!r||r(t))&&h.push(s?t:t.fullpath());let a=new Set,l=(c,d)=>{a.add(c),c.readdirCB((f,m)=>{if(f)return d(f);let p=m.length;if(!p)return d();let w=()=>{--p===0&&d()};for(let g of m)(!r||r(g))&&h.push(s?g:g.fullpath()),i&&g.isSymbolicLink()?g.realpath().then(S=>S?.isUnknown()?S.lstat():S).then(S=>S?.shouldWalk(a,o)?l(S,w):w()):g.shouldWalk(a,o)?l(g,w):w()},!0)},u=t;return new Promise((c,d)=>{l(u,f=>{if(f)return d(f);c(h)})})}walkSync(t=this.cwd,e={}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t,t=this.cwd);let{withFileTypes:s=!0,follow:i=!1,filter:r,walkFilter:o}=e,h=[];(!r||r(t))&&h.push(s?t:t.fullpath());let a=new Set([t]);for(let l of a){let u=l.readdirSync();for(let c of u){(!r||r(c))&&h.push(s?c:c.fullpath());let d=c;if(c.isSymbolicLink()){if(!(i&&(d=c.realpathSync())))continue;d.isUnknown()&&d.lstatSync()}d.shouldWalk(a,o)&&a.add(d)}}return h}[Symbol.asyncIterator](){return this.iterate()}iterate(t=this.cwd,e={}){return typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t,t=this.cwd),this.stream(t,e)[Symbol.asyncIterator]()}[Symbol.iterator](){return this.iterateSync()}*iterateSync(t=this.cwd,e={}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t,t=this.cwd);let{withFileTypes:s=!0,follow:i=!1,filter:r,walkFilter:o}=e;(!r||r(t))&&(yield s?t:t.fullpath());let h=new Set([t]);for(let a of h){let l=a.readdirSync();for(let u of l){(!r||r(u))&&(yield s?u:u.fullpath());let c=u;if(u.isSymbolicLink()){if(!(i&&(c=u.realpathSync())))continue;c.isUnknown()&&c.lstatSync()}c.shouldWalk(h,o)&&h.add(c)}}}stream(t=this.cwd,e={}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t,t=this.cwd);let{withFileTypes:s=!0,follow:i=!1,filter:r,walkFilter:o}=e,h=new V({objectMode:!0});(!r||r(t))&&h.write(s?t:t.fullpath());let a=new Set,l=[t],u=0,c=()=>{let d=!1;for(;!d;){let f=l.shift();if(!f){u===0&&h.end();return}u++,a.add(f);let m=(w,g,S=!1)=>{if(w)return h.emit("error",w);if(i&&!S){let E=[];for(let y of g)y.isSymbolicLink()&&E.push(y.realpath().then(b=>b?.isUnknown()?b.lstat():b));if(E.length){Promise.all(E).then(()=>m(null,g,!0));return}}for(let E of g)E&&(!r||r(E))&&(h.write(s?E:E.fullpath())||(d=!0));u--;for(let E of g){let y=E.realpathCached()||E;y.shouldWalk(a,o)&&l.push(y)}d&&!h.flowing?h.once("drain",c):p||c()},p=!0;f.readdirCB(m,!0),p=!1}};return c(),h}streamSync(t=this.cwd,e={}){typeof t=="string"?t=this.cwd.resolve(t):t instanceof R||(e=t,t=this.cwd);let{withFileTypes:s=!0,follow:i=!1,filter:r,walkFilter:o}=e,h=new V({objectMode:!0}),a=new Set;(!r||r(t))&&h.write(s?t:t.fullpath());let l=[t],u=0,c=()=>{let d=!1;for(;!d;){let f=l.shift();if(!f){u===0&&h.end();return}u++,a.add(f);let m=f.readdirSync();for(let p of m)(!r||r(p))&&(h.write(s?p:p.fullpath())||(d=!0));u--;for(let p of m){let w=p;if(p.isSymbolicLink()){if(!(i&&(w=p.realpathSync())))continue;w.isUnknown()&&w.lstatSync()}w.shouldWalk(a,o)&&l.push(w)}}d&&!h.flowing&&h.once("drain",c)};return c(),h}chdir(t=this.cwd){let e=this.cwd;this.cwd=typeof t=="string"?this.cwd.resolve(t):t,this.cwd[Ye](e)}},it=class extends It{sep="\\";constructor(t=process.cwd(),e={}){let{nocase:s=!0}=e;super(t,external_node_path_.win32,"\\",{...e,nocase:s}),this.nocase=s;for(let i=this.cwd;i;i=i.parent)i.nocase=this.nocase}parseRootPath(t){return external_node_path_.win32.parse(t).root.toUpperCase()}newRoot(t){return new Pt(this.rootPath,U,void 0,this.roots,this.nocase,this.childrenCache(),{fs:t})}isAbsolute(t){return t.startsWith("/")||t.startsWith("\\")||/^[a-z]:(\/|\\)/i.test(t)}},rt=class extends It{sep="/";constructor(t=process.cwd(),e={}){let{nocase:s=!1}=e;super(t,external_node_path_.posix,"/",{...e,nocase:s}),this.nocase=s}parseRootPath(t){return"/"}newRoot(t){return new jt(this.rootPath,U,void 0,this.roots,this.nocase,this.childrenCache(),{fs:t})}isAbsolute(t){return t.startsWith("/")}},St=class extends rt{constructor(t=process.cwd(),e={}){let{nocase:s=!0}=e;super(t,{...e,nocase:s})}},Cr=process.platform==="win32"?Pt:jt,Xe=process.platform==="win32"?it:process.platform==="darwin"?St:rt;var Di=n=>n.length>=1,Mi=n=>n.length>=1,Ni=Symbol.for("nodejs.util.inspect.custom"),nt=class n{#t;#s;#n;length;#r;#o;#S;#w;#c;#h;#u=!0;constructor(t,e,s,i){if(!Di(t))throw new TypeError("empty pattern list");if(!Mi(e))throw new TypeError("empty glob list");if(e.length!==t.length)throw new TypeError("mismatched pattern list and glob list lengths");if(this.length=t.length,s<0||s>=this.length)throw new TypeError("index out of range");if(this.#t=t,this.#s=e,this.#n=s,this.#r=i,this.#n===0){if(this.isUNC()){let[r,o,h,a,...l]=this.#t,[u,c,d,f,...m]=this.#s;l[0]===""&&(l.shift(),m.shift());let p=[r,o,h,a,""].join("/"),w=[u,c,d,f,""].join("/");this.#t=[p,...l],this.#s=[w,...m],this.length=this.#t.length}else if(this.isDrive()||this.isAbsolute()){let[r,...o]=this.#t,[h,...a]=this.#s;o[0]===""&&(o.shift(),a.shift());let l=r+"/",u=h+"/";this.#t=[l,...o],this.#s=[u,...a],this.length=this.#t.length}}}[Ni](){return"Pattern <"+this.#s.slice(this.#n).join("/")+">"}pattern(){return this.#t[this.#n]}isString(){return typeof this.#t[this.#n]=="string"}isGlobstar(){return this.#t[this.#n]===A}isRegExp(){return this.#t[this.#n]instanceof RegExp}globString(){return this.#S=this.#S||(this.#n===0?this.isAbsolute()?this.#s[0]+this.#s.slice(1).join("/"):this.#s.join("/"):this.#s.slice(this.#n).join("/"))}hasMore(){return this.length>this.#n+1}rest(){return this.#o!==void 0?this.#o:this.hasMore()?(this.#o=new n(this.#t,this.#s,this.#n+1,this.#r),this.#o.#h=this.#h,this.#o.#c=this.#c,this.#o.#w=this.#w,this.#o):this.#o=null}isUNC(){let t=this.#t;return this.#c!==void 0?this.#c:this.#c=this.#r==="win32"&&this.#n===0&&t[0]===""&&t[1]===""&&typeof t[2]=="string"&&!!t[2]&&typeof t[3]=="string"&&!!t[3]}isDrive(){let t=this.#t;return this.#w!==void 0?this.#w:this.#w=this.#r==="win32"&&this.#n===0&&this.length>1&&typeof t[0]=="string"&&/^[a-z]:$/i.test(t[0])}isAbsolute(){let t=this.#t;return this.#h!==void 0?this.#h:this.#h=t[0]===""&&t.length>1||this.isDrive()||this.isUNC()}root(){let t=this.#t[0];return typeof t=="string"&&this.isAbsolute()&&this.#n===0?t:""}checkFollowGlobstar(){return!(this.#n===0||!this.isGlobstar()||!this.#u)}markFollowGlobstar(){return this.#n===0||!this.isGlobstar()||!this.#u?!1:(this.#u=!1,!0)}};var _i=typeof process=="object"&&process&&typeof process.platform=="string"?process.platform:"linux",ot=class{relative;relativeChildren;absolute;absoluteChildren;platform;mmopts;constructor(t,{nobrace:e,nocase:s,noext:i,noglobstar:r,platform:o=_i}){this.relative=[],this.absolute=[],this.relativeChildren=[],this.absoluteChildren=[],this.platform=o,this.mmopts={dot:!0,nobrace:e,nocase:s,noext:i,noglobstar:r,optimizationLevel:2,platform:o,nocomment:!0,nonegate:!0};for(let h of t)this.add(h)}add(t){let e=new D(t,this.mmopts);for(let s=0;s<e.set.length;s++){let i=e.set[s],r=e.globParts[s];if(!i||!r)throw new Error("invalid pattern object");for(;i[0]==="."&&r[0]===".";)i.shift(),r.shift();let o=new nt(i,r,0,this.platform),h=new D(o.globString(),this.mmopts),a=r[r.length-1]==="**",l=o.isAbsolute();l?this.absolute.push(h):this.relative.push(h),a&&(l?this.absoluteChildren.push(h):this.relativeChildren.push(h))}}ignored(t){let e=t.fullpath(),s=`${e}/`,i=t.relative()||".",r=`${i}/`;for(let o of this.relative)if(o.match(i)||o.match(r))return!0;for(let o of this.absolute)if(o.match(e)||o.match(s))return!0;return!1}childrenIgnored(t){let e=t.fullpath()+"/",s=(t.relative()||".")+"/";for(let i of this.relativeChildren)if(i.match(s))return!0;for(let i of this.absoluteChildren)if(i.match(e))return!0;return!1}};var oe=class n{store;constructor(t=new Map){this.store=t}copy(){return new n(new Map(this.store))}hasWalked(t,e){return this.store.get(t.fullpath())?.has(e.globString())}storeWalked(t,e){let s=t.fullpath(),i=this.store.get(s);i?i.add(e.globString()):this.store.set(s,new Set([e.globString()]))}},he=class{store=new Map;add(t,e,s){let i=(e?2:0)|(s?1:0),r=this.store.get(t);this.store.set(t,r===void 0?i:i&r)}entries(){return[...this.store.entries()].map(([t,e])=>[t,!!(e&2),!!(e&1)])}},ae=class{store=new Map;add(t,e){if(!t.canReaddir())return;let s=this.store.get(t);s?s.find(i=>i.globString()===e.globString())||s.push(e):this.store.set(t,[e])}get(t){let e=this.store.get(t);if(!e)throw new Error("attempting to walk unknown path");return e}entries(){return this.keys().map(t=>[t,this.store.get(t)])}keys(){return[...this.store.keys()].filter(t=>t.canReaddir())}},Et=class n{hasWalkedCache;matches=new he;subwalks=new ae;patterns;follow;dot;opts;constructor(t,e){this.opts=t,this.follow=!!t.follow,this.dot=!!t.dot,this.hasWalkedCache=e?e.copy():new oe}processPatterns(t,e){this.patterns=e;let s=e.map(i=>[t,i]);for(let[i,r]of s){this.hasWalkedCache.storeWalked(i,r);let o=r.root(),h=r.isAbsolute()&&this.opts.absolute!==!1;if(o){i=i.resolve(o==="/"&&this.opts.root!==void 0?this.opts.root:o);let c=r.rest();if(c)r=c;else{this.matches.add(i,!0,!1);continue}}if(i.isENOENT())continue;let a,l,u=!1;for(;typeof(a=r.pattern())=="string"&&(l=r.rest());)i=i.resolve(a),r=l,u=!0;if(a=r.pattern(),l=r.rest(),u){if(this.hasWalkedCache.hasWalked(i,r))continue;this.hasWalkedCache.storeWalked(i,r)}if(typeof a=="string"){let c=a===".."||a===""||a===".";this.matches.add(i.resolve(a),h,c);continue}else if(a===A){(!i.isSymbolicLink()||this.follow||r.checkFollowGlobstar())&&this.subwalks.add(i,r);let c=l?.pattern(),d=l?.rest();if(!l||(c===""||c===".")&&!d)this.matches.add(i,h,c===""||c===".");else if(c===".."){let f=i.parent||i;d?this.hasWalkedCache.hasWalked(f,d)||this.subwalks.add(f,d):this.matches.add(f,h,!0)}}else a instanceof RegExp&&this.subwalks.add(i,r)}return this}subwalkTargets(){return this.subwalks.keys()}child(){return new n(this.opts,this.hasWalkedCache)}filterEntries(t,e){let s=this.subwalks.get(t),i=this.child();for(let r of e)for(let o of s){let h=o.isAbsolute(),a=o.pattern(),l=o.rest();a===A?i.testGlobstar(r,o,l,h):a instanceof RegExp?i.testRegExp(r,a,l,h):i.testString(r,a,l,h)}return i}testGlobstar(t,e,s,i){if((this.dot||!t.name.startsWith("."))&&(e.hasMore()||this.matches.add(t,i,!1),t.canReaddir()&&(this.follow||!t.isSymbolicLink()?this.subwalks.add(t,e):t.isSymbolicLink()&&(s&&e.checkFollowGlobstar()?this.subwalks.add(t,s):e.markFollowGlobstar()&&this.subwalks.add(t,e)))),s){let r=s.pattern();if(typeof r=="string"&&r!==".."&&r!==""&&r!==".")this.testString(t,r,s.rest(),i);else if(r===".."){let o=t.parent||t;this.subwalks.add(o,s)}else r instanceof RegExp&&this.testRegExp(t,r,s.rest(),i)}}testRegExp(t,e,s,i){e.test(t.name)&&(s?this.subwalks.add(t,s):this.matches.add(t,i,!1))}testString(t,e,s,i){t.isNamed(e)&&(s?this.subwalks.add(t,s):this.matches.add(t,i,!1))}};var Li=(n,t)=>typeof n=="string"?new ot([n],t):Array.isArray(n)?new ot(n,t):n,zt=class{path;patterns;opts;seen=new Set;paused=!1;aborted=!1;#t=[];#s;#n;signal;maxDepth;includeChildMatches;constructor(t,e,s){if(this.patterns=t,this.path=e,this.opts=s,this.#n=!s.posix&&s.platform==="win32"?"\\":"/",this.includeChildMatches=s.includeChildMatches!==!1,(s.ignore||!this.includeChildMatches)&&(this.#s=Li(s.ignore??[],s),!this.includeChildMatches&&typeof this.#s.add!="function")){let i="cannot ignore child matches, ignore lacks add() method.";throw new Error(i)}this.maxDepth=s.maxDepth||1/0,s.signal&&(this.signal=s.signal,this.signal.addEventListener("abort",()=>{this.#t.length=0}))}#r(t){return this.seen.has(t)||!!this.#s?.ignored?.(t)}#o(t){return!!this.#s?.childrenIgnored?.(t)}pause(){this.paused=!0}resume(){if(this.signal?.aborted)return;this.paused=!1;let t;for(;!this.paused&&(t=this.#t.shift());)t()}onResume(t){this.signal?.aborted||(this.paused?this.#t.push(t):t())}async matchCheck(t,e){if(e&&this.opts.nodir)return;let s;if(this.opts.realpath){if(s=t.realpathCached()||await t.realpath(),!s)return;t=s}let r=t.isUnknown()||this.opts.stat?await t.lstat():t;if(this.opts.follow&&this.opts.nodir&&r?.isSymbolicLink()){let o=await r.realpath();o&&(o.isUnknown()||this.opts.stat)&&await o.lstat()}return this.matchCheckTest(r,e)}matchCheckTest(t,e){return t&&(this.maxDepth===1/0||t.depth()<=this.maxDepth)&&(!e||t.canReaddir())&&(!this.opts.nodir||!t.isDirectory())&&(!this.opts.nodir||!this.opts.follow||!t.isSymbolicLink()||!t.realpathCached()?.isDirectory())&&!this.#r(t)?t:void 0}matchCheckSync(t,e){if(e&&this.opts.nodir)return;let s;if(this.opts.realpath){if(s=t.realpathCached()||t.realpathSync(),!s)return;t=s}let r=t.isUnknown()||this.opts.stat?t.lstatSync():t;if(this.opts.follow&&this.opts.nodir&&r?.isSymbolicLink()){let o=r.realpathSync();o&&(o?.isUnknown()||this.opts.stat)&&o.lstatSync()}return this.matchCheckTest(r,e)}matchFinish(t,e){if(this.#r(t))return;if(!this.includeChildMatches&&this.#s?.add){let r=`${t.relativePosix()}/**`;this.#s.add(r)}let s=this.opts.absolute===void 0?e:this.opts.absolute;this.seen.add(t);let i=this.opts.mark&&t.isDirectory()?this.#n:"";if(this.opts.withFileTypes)this.matchEmit(t);else if(s){let r=this.opts.posix?t.fullpathPosix():t.fullpath();this.matchEmit(r+i)}else{let r=this.opts.posix?t.relativePosix():t.relative(),o=this.opts.dotRelative&&!r.startsWith(".."+this.#n)?"."+this.#n:"";this.matchEmit(r?o+r+i:"."+i)}}async match(t,e,s){let i=await this.matchCheck(t,s);i&&this.matchFinish(i,e)}matchSync(t,e,s){let i=this.matchCheckSync(t,s);i&&this.matchFinish(i,e)}walkCB(t,e,s){this.signal?.aborted&&s(),this.walkCB2(t,e,new Et(this.opts),s)}walkCB2(t,e,s,i){if(this.#o(t))return i();if(this.signal?.aborted&&i(),this.paused){this.onResume(()=>this.walkCB2(t,e,s,i));return}s.processPatterns(t,e);let r=1,o=()=>{--r===0&&i()};for(let[h,a,l]of s.matches.entries())this.#r(h)||(r++,this.match(h,a,l).then(()=>o()));for(let h of s.subwalkTargets()){if(this.maxDepth!==1/0&&h.depth()>=this.maxDepth)continue;r++;let a=h.readdirCached();h.calledReaddir()?this.walkCB3(h,a,s,o):h.readdirCB((l,u)=>this.walkCB3(h,u,s,o),!0)}o()}walkCB3(t,e,s,i){s=s.filterEntries(t,e);let r=1,o=()=>{--r===0&&i()};for(let[h,a,l]of s.matches.entries())this.#r(h)||(r++,this.match(h,a,l).then(()=>o()));for(let[h,a]of s.subwalks.entries())r++,this.walkCB2(h,a,s.child(),o);o()}walkCBSync(t,e,s){this.signal?.aborted&&s(),this.walkCB2Sync(t,e,new Et(this.opts),s)}walkCB2Sync(t,e,s,i){if(this.#o(t))return i();if(this.signal?.aborted&&i(),this.paused){this.onResume(()=>this.walkCB2Sync(t,e,s,i));return}s.processPatterns(t,e);let r=1,o=()=>{--r===0&&i()};for(let[h,a,l]of s.matches.entries())this.#r(h)||this.matchSync(h,a,l);for(let h of s.subwalkTargets()){if(this.maxDepth!==1/0&&h.depth()>=this.maxDepth)continue;r++;let a=h.readdirSync();this.walkCB3Sync(h,a,s,o)}o()}walkCB3Sync(t,e,s,i){s=s.filterEntries(t,e);let r=1,o=()=>{--r===0&&i()};for(let[h,a,l]of s.matches.entries())this.#r(h)||this.matchSync(h,a,l);for(let[h,a]of s.subwalks.entries())r++,this.walkCB2Sync(h,a,s.child(),o);o()}},xt=class extends zt{matches=new Set;constructor(t,e,s){super(t,e,s)}matchEmit(t){this.matches.add(t)}async walk(){if(this.signal?.aborted)throw this.signal.reason;return this.path.isUnknown()&&await this.path.lstat(),await new Promise((t,e)=>{this.walkCB(this.path,this.patterns,()=>{this.signal?.aborted?e(this.signal.reason):t(this.matches)})}),this.matches}walkSync(){if(this.signal?.aborted)throw this.signal.reason;return this.path.isUnknown()&&this.path.lstatSync(),this.walkCBSync(this.path,this.patterns,()=>{if(this.signal?.aborted)throw this.signal.reason}),this.matches}},vt=class extends zt{results;constructor(t,e,s){super(t,e,s),this.results=new V({signal:this.signal,objectMode:!0}),this.results.on("drain",()=>this.resume()),this.results.on("resume",()=>this.resume())}matchEmit(t){this.results.write(t),this.results.flowing||this.pause()}stream(){let t=this.path;return t.isUnknown()?t.lstat().then(()=>{this.walkCB(t,this.patterns,()=>this.results.end())}):this.walkCB(t,this.patterns,()=>this.results.end()),this.results}streamSync(){return this.path.isUnknown()&&this.path.lstatSync(),this.walkCBSync(this.path,this.patterns,()=>this.results.end()),this.results}};var Pi=typeof process=="object"&&process&&typeof process.platform=="string"?process.platform:"linux",I=class{absolute;cwd;root;dot;dotRelative;follow;ignore;magicalBraces;mark;matchBase;maxDepth;nobrace;nocase;nodir;noext;noglobstar;pattern;platform;realpath;scurry;stat;signal;windowsPathsNoEscape;withFileTypes;includeChildMatches;opts;patterns;constructor(t,e){if(!e)throw new TypeError("glob options required");if(this.withFileTypes=!!e.withFileTypes,this.signal=e.signal,this.follow=!!e.follow,this.dot=!!e.dot,this.dotRelative=!!e.dotRelative,this.nodir=!!e.nodir,this.mark=!!e.mark,e.cwd?(e.cwd instanceof URL||e.cwd.startsWith("file://"))&&(e.cwd=(0,external_node_url_.fileURLToPath)(e.cwd)):this.cwd="",this.cwd=e.cwd||"",this.root=e.root,this.magicalBraces=!!e.magicalBraces,this.nobrace=!!e.nobrace,this.noext=!!e.noext,this.realpath=!!e.realpath,this.absolute=e.absolute,this.includeChildMatches=e.includeChildMatches!==!1,this.noglobstar=!!e.noglobstar,this.matchBase=!!e.matchBase,this.maxDepth=typeof e.maxDepth=="number"?e.maxDepth:1/0,this.stat=!!e.stat,this.ignore=e.ignore,this.withFileTypes&&this.absolute!==void 0)throw new Error("cannot set absolute and withFileTypes:true");if(typeof t=="string"&&(t=[t]),this.windowsPathsNoEscape=!!e.windowsPathsNoEscape||e.allowWindowsEscape===!1,this.windowsPathsNoEscape&&(t=t.map(a=>a.replace(/\\/g,"/"))),this.matchBase){if(e.noglobstar)throw new TypeError("base matching requires globstar");t=t.map(a=>a.includes("/")?a:`./**/${a}`)}if(this.pattern=t,this.platform=e.platform||Pi,this.opts={...e,platform:this.platform},e.scurry){if(this.scurry=e.scurry,e.nocase!==void 0&&e.nocase!==e.scurry.nocase)throw new Error("nocase option contradicts provided scurry option")}else{let a=e.platform==="win32"?it:e.platform==="darwin"?St:e.platform?rt:Xe;this.scurry=new a(this.cwd,{nocase:e.nocase,fs:e.fs})}this.nocase=this.scurry.nocase;let s=this.platform==="darwin"||this.platform==="win32",i={braceExpandMax:1e4,...e,dot:this.dot,matchBase:this.matchBase,nobrace:this.nobrace,nocase:this.nocase,nocaseMagicOnly:s,nocomment:!0,noext:this.noext,nonegate:!0,optimizationLevel:2,platform:this.platform,windowsPathsNoEscape:this.windowsPathsNoEscape,debug:!!this.opts.debug},r=this.pattern.map(a=>new D(a,i)),[o,h]=r.reduce((a,l)=>(a[0].push(...l.set),a[1].push(...l.globParts),a),[[],[]]);this.patterns=o.map((a,l)=>{let u=h[l];if(!u)throw new Error("invalid pattern object");return new nt(a,u,0,this.platform)})}async walk(){return[...await new xt(this.patterns,this.scurry.cwd,{...this.opts,maxDepth:this.maxDepth!==1/0?this.maxDepth+this.scurry.cwd.depth():1/0,platform:this.platform,nocase:this.nocase,includeChildMatches:this.includeChildMatches}).walk()]}walkSync(){return[...new xt(this.patterns,this.scurry.cwd,{...this.opts,maxDepth:this.maxDepth!==1/0?this.maxDepth+this.scurry.cwd.depth():1/0,platform:this.platform,nocase:this.nocase,includeChildMatches:this.includeChildMatches}).walkSync()]}stream(){return new vt(this.patterns,this.scurry.cwd,{...this.opts,maxDepth:this.maxDepth!==1/0?this.maxDepth+this.scurry.cwd.depth():1/0,platform:this.platform,nocase:this.nocase,includeChildMatches:this.includeChildMatches}).stream()}streamSync(){return new vt(this.patterns,this.scurry.cwd,{...this.opts,maxDepth:this.maxDepth!==1/0?this.maxDepth+this.scurry.cwd.depth():1/0,platform:this.platform,nocase:this.nocase,includeChildMatches:this.includeChildMatches}).streamSync()}iterateSync(){return this.streamSync()[Symbol.iterator]()}[Symbol.iterator](){return this.iterateSync()}iterate(){return this.stream()[Symbol.asyncIterator]()}[Symbol.asyncIterator](){return this.iterate()}};var le=(n,t={})=>{Array.isArray(n)||(n=[n]);for(let e of n)if(new D(e,t).hasMagic())return!0;return!1};function Bt(n,t={}){return new I(n,t).streamSync()}function Qe(n,t={}){return new I(n,t).stream()}function ts(n,t={}){return new I(n,t).walkSync()}async function Je(n,t={}){return new I(n,t).walk()}function Ut(n,t={}){return new I(n,t).iterateSync()}function es(n,t={}){return new I(n,t).iterate()}var ji=Bt,Ii=Object.assign(Qe,{sync:Bt}),zi=Ut,Bi=Object.assign(es,{sync:Ut}),Ui=Object.assign(ts,{stream:Bt,iterate:Ut}),Ze=Object.assign(Je,{glob:Je,globSync:ts,sync:Ui,globStream:Qe,stream:Ii,globStreamSync:Bt,streamSync:ji,globIterate:es,iterate:Bi,globIterateSync:Ut,iterateSync:zi,Glob:I,hasMagic:le,escape:tt,unescape:W});Ze.glob=Ze;
-//# sourceMappingURL=index.min.js.map
-
-;// CONCATENATED MODULE: ./node_modules/@electron/asar/lib/crawlfs.js
-
-
-
-async function determineFileType(filename) {
-    const stat = await wrappedFs.lstat(filename);
-    if (stat.isFile()) {
-        return { type: 'file', stat };
-    }
-    else if (stat.isDirectory()) {
-        return { type: 'directory', stat };
-    }
-    else if (stat.isSymbolicLink()) {
-        return { type: 'link', stat };
-    }
-    return null;
-}
-async function crawl(dir, options) {
-    const metadata = {};
-    // TODO replace with `fs.glob`
-    const crawled = await Ze(dir, {
-        windowsPathsNoEscape: true,
-        ...options,
-    });
-    const results = await Promise.all(crawled.sort().map(async (filename) => [filename, await determineFileType(filename)]));
-    const links = [];
-    const linkSet = new Set();
-    const filenames = results
-        .map(([filename, type]) => {
-        if (type) {
-            metadata[filename] = type;
-            if (type.type === 'link') {
-                links.push(filename);
-                linkSet.add(filename);
-            }
-        }
-        return filename;
-    })
-        .filter((filename) => {
-        if (links.length === 0)
-            return true;
-        // Newer glob can return files inside symlinked directories, to avoid
-        // those appearing in archives we need to manually exclude them here
-        const isExactLink = linkSet.has(filename);
-        for (const link of links) {
-            if (isExactLink && filename === link)
-                continue;
-            if (filename.startsWith(link)) {
-                // symlink may point outside the directory: https://github.com/electron/asar/issues/303
-                const relativePath = external_node_path_.relative(link, external_node_path_.dirname(filename));
-                if (!relativePath.startsWith('..'))
-                    return false;
-            }
-        }
-        return true;
-    });
-    return [filenames, metadata];
-}
-//# sourceMappingURL=crawlfs.js.map
-;// CONCATENATED MODULE: ./node_modules/@electron/asar/lib/asar.js
-
-
-
-
-
-
-/**
- * Whether a directory should be excluded from packing due to the `--unpack-dir" option.
- *
- * @param dirPath - directory path to check
- * @param pattern - literal prefix [for backward compatibility] or glob pattern
- * @param unpackDirs - Array of directory paths previously marked as unpacked
- */
-function isUnpackedDir(dirPath, pattern, unpackDirs) {
-    if (dirPath.startsWith(pattern) || minimatch(dirPath, pattern)) {
-        unpackDirs.add(dirPath);
-        return true;
-    }
-    else {
-        for (const unpackDir of unpackDirs) {
-            if (dirPath.startsWith(unpackDir) && !external_node_path_.relative(unpackDir, dirPath).startsWith('..')) {
-                return true;
-            }
-        }
-        return false;
-    }
-}
-async function createPackage(src, dest) {
-    return createPackageWithOptions(src, dest, {});
-}
-async function createPackageWithOptions(src, dest, options) {
-    const globOptions = options.globOptions ? options.globOptions : {};
-    globOptions.dot = options.dot === undefined ? true : options.dot;
-    const pattern = src + (options.pattern ? options.pattern : '/**/*');
-    const [filenames, metadata] = await crawl(pattern, globOptions);
-    return createPackageFromFiles(src, dest, filenames, metadata, options);
-}
-/**
- * Create an ASAR archive from a list of filenames.
- *
- * @param src - Base path. All files are relative to this.
- * @param dest - Archive filename (& path).
- * @param filenames - List of filenames relative to src.
- * @param [metadata] - Object with filenames as keys and {type='directory|file|link', stat: fs.stat} as values. (Optional)
- * @param [options] - Options passed to `createPackageWithOptions`.
- */
-async function createPackageFromFiles(src, dest, filenames, metadata = {}, options = {}) {
-    src = external_node_path_.normalize(src);
-    dest = external_node_path_.normalize(dest);
-    filenames = filenames.map(function (filename) {
-        return external_node_path_.normalize(filename);
-    });
-    const filesystem = new Filesystem(src);
-    const files = [];
-    const links = [];
-    const unpackDirs = new Set();
-    let filenamesSorted = [];
-    if (options.ordering) {
-        const orderingFiles = (await wrappedFs.readFile(options.ordering))
-            .toString()
-            .split('\n')
-            .map((line) => {
-            if (line.includes(':')) {
-                line = line.split(':').pop();
-            }
-            line = line.trim();
-            if (line.startsWith('/')) {
-                line = line.slice(1);
-            }
-            return line;
-        });
-        const ordering = [];
-        for (const file of orderingFiles) {
-            const pathComponents = file.split(external_node_path_.sep);
-            let str = src;
-            for (const pathComponent of pathComponents) {
-                str = external_node_path_.join(str, pathComponent);
-                ordering.push(str);
-            }
-        }
-        let missing = 0;
-        const total = filenames.length;
-        const filenameSet = new Set(filenames);
-        const sortedSet = new Set();
-        for (const file of ordering) {
-            if (!sortedSet.has(file) && filenameSet.has(file)) {
-                filenamesSorted.push(file);
-                sortedSet.add(file);
-            }
-        }
-        for (const file of filenames) {
-            if (!sortedSet.has(file)) {
-                filenamesSorted.push(file);
-                sortedSet.add(file);
-                missing += 1;
-            }
-        }
-        console.log(`Ordering file has ${((total - missing) / total) * 100}% coverage.`);
-    }
-    else {
-        filenamesSorted = filenames;
-    }
-    const shouldUnpackPath = function (filename, relativePath, unpack, unpackDir) {
-        let shouldUnpack = false;
-        if (unpack) {
-            shouldUnpack = minimatch(filename, unpack, { matchBase: true });
-        }
-        if (!shouldUnpack && unpackDir) {
-            shouldUnpack = isUnpackedDir(relativePath, unpackDir, unpackDirs);
-        }
-        return shouldUnpack;
-    };
-    // Batch-resolve metadata for files missing it (parallelized)
-    const missingMetadata = filenamesSorted.filter((f) => !metadata[f]);
-    if (missingMetadata.length > 0) {
-        const resolved = await Promise.all(missingMetadata.map(async (filename) => {
-            const fileType = await determineFileType(filename);
-            if (!fileType) {
-                throw new Error('Unknown file type for file: ' + filename);
-            }
-            return [filename, fileType];
-        }));
-        for (const [filename, fileType] of resolved) {
-            metadata[filename] = fileType;
-        }
-    }
-    // Process files in original sorted order to preserve header key ordering
-    for (const filename of filenamesSorted) {
-        const file = metadata[filename];
-        let shouldUnpack;
-        switch (file.type) {
-            case 'directory':
-                shouldUnpack = shouldUnpackPath(filename, external_node_path_.relative(src, filename), undefined, options.unpackDir);
-                filesystem.insertDirectory(filename, shouldUnpack);
-                break;
-            case 'file':
-                shouldUnpack = shouldUnpackPath(filename, external_node_path_.relative(src, external_node_path_.dirname(filename)), options.unpack, options.unpackDir);
-                files.push({ filename, unpack: shouldUnpack });
-                await filesystem.insertFile(filename, () => wrappedFs.createReadStream(filename), shouldUnpack, file, options);
-                break;
-            case 'link':
-                shouldUnpack = shouldUnpackPath(filename, external_node_path_.relative(src, filename), options.unpack, options.unpackDir);
-                links.push({ filename, unpack: shouldUnpack });
-                filesystem.insertLink(filename, shouldUnpack);
-                break;
-        }
-    }
-    await wrappedFs.mkdirp(external_node_path_.dirname(dest));
-    return writeFilesystem(dest, filesystem, { files, links }, metadata);
-}
-/**
- * Create an ASAR archive from a list of streams.
- *
- * @param dest - Archive filename (& path).
- * @param streams - List of streams to be piped in-memory into asar filesystem. Insertion order is preserved.
- */
-async function createPackageFromStreams(dest, streams) {
-    // We use an ambiguous root `src` since we're piping directly from a stream and the `filePath` for the stream is already relative to the src/root
-    const src = '.';
-    const filesystem = new Filesystem(src);
-    const files = [];
-    const links = [];
-    const handleFile = async function (stream) {
-        const { path: destinationPath, type } = stream;
-        const filename = external_node_path_.normalize(destinationPath);
-        switch (type) {
-            case 'directory':
-                filesystem.insertDirectory(filename, stream.unpacked);
-                break;
-            case 'file':
-                files.push({
-                    filename,
-                    streamGenerator: stream.streamGenerator,
-                    link: undefined,
-                    mode: stream.stat.mode,
-                    unpack: stream.unpacked,
-                });
-                return filesystem.insertFile(filename, stream.streamGenerator, stream.unpacked, {
-                    type: 'file',
-                    stat: stream.stat,
-                });
-            case 'link':
-                links.push({
-                    filename,
-                    streamGenerator: stream.streamGenerator,
-                    link: stream.symlink,
-                    mode: stream.stat.mode,
-                    unpack: stream.unpacked,
-                });
-                filesystem.insertLink(filename, stream.unpacked, external_node_path_.dirname(filename), stream.symlink, src);
-                break;
-        }
-        return Promise.resolve();
-    };
-    const insertsDone = async function () {
-        await wrappedFs.mkdirp(external_node_path_.dirname(dest));
-        return streamFilesystem(dest, filesystem, { files, links });
-    };
-    const streamQueue = streams.slice();
-    const next = async function (stream) {
-        if (!stream) {
-            return insertsDone();
-        }
-        await handleFile(stream);
-        return next(streamQueue.shift());
-    };
-    return next(streamQueue.shift());
-}
-function statFile(archivePath, filename, followLinks = true) {
-    const filesystem = readFilesystemSync(archivePath);
-    return filesystem.getFile(filename, followLinks);
-}
-function getRawHeader(archivePath) {
-    return readArchiveHeaderSync(archivePath);
-}
-function listPackage(archivePath, options) {
-    return readFilesystemSync(archivePath).listFiles(options);
-}
-function extractFile(archivePath, filename, followLinks = true) {
-    const filesystem = readFilesystemSync(archivePath);
-    const fileInfo = filesystem.getFile(filename, followLinks);
-    if ('link' in fileInfo || 'files' in fileInfo) {
-        throw new Error('Expected to find file at: ' + filename + ' but found a directory or link');
-    }
-    return readFileSync(filesystem, filename, fileInfo);
-}
-function extractAll(archivePath, dest) {
-    const filesystem = readFilesystemSync(archivePath);
-    const filenames = filesystem.listFiles();
-    // under windows just extract links as regular files
-    const followLinks = process.platform === 'win32';
-    // create destination directory
-    wrappedFs.mkdirpSync(dest);
-    // Read the entire data section at once — one syscall instead of one per file.
-    const headerSize = filesystem.getHeaderSize();
-    const archiveSize = wrappedFs.statSync(archivePath).size;
-    const dataStart = 8 + headerSize;
-    const dataSize = archiveSize - dataStart;
-    let dataBuf = null;
-    if (dataSize > 0) {
-        dataBuf = Buffer.alloc(dataSize);
-        const fd = wrappedFs.openSync(archivePath, 'r');
-        try {
-            wrappedFs.readSync(fd, dataBuf, 0, dataSize, dataStart);
-        }
-        finally {
-            wrappedFs.closeSync(fd);
-        }
-    }
-    const extractionErrors = [];
-    for (const fullPath of filenames) {
-        // Remove leading slash
-        const filename = fullPath.substr(1);
-        const destFilename = external_node_path_.join(dest, filename);
-        const file = filesystem.getFile(filename, followLinks);
-        if (external_node_path_.relative(dest, destFilename).startsWith('..')) {
-            throw new Error(`${fullPath}: file "${destFilename}" writes out of the package`);
-        }
-        if ('files' in file) {
-            // it's a directory, create it and continue with the next entry
-            wrappedFs.mkdirpSync(destFilename);
-        }
-        else if ('link' in file) {
-            // it's a symlink, create a symlink
-            const linkSrcPath = external_node_path_.dirname(external_node_path_.join(dest, file.link));
-            const linkDestPath = external_node_path_.dirname(destFilename);
-            const relativePath = external_node_path_.relative(linkDestPath, linkSrcPath);
-            // try to delete output file, because we can't overwrite a link
-            try {
-                wrappedFs.unlinkSync(destFilename);
-            }
-            catch { }
-            const linkTo = external_node_path_.join(relativePath, external_node_path_.basename(file.link));
-            if (external_node_path_.relative(dest, linkSrcPath).startsWith('..')) {
-                throw new Error(`${fullPath}: file "${file.link}" links out of the package to "${linkSrcPath}"`);
-            }
-            wrappedFs.symlinkSync(linkTo, destFilename);
-        }
-        else {
-            // it's a file, try to extract it
-            try {
-                let content;
-                if (file.unpacked) {
-                    content = wrappedFs.readFileSync(external_node_path_.join(`${filesystem.getRootPath()}.unpacked`, filename));
-                }
-                else if (file.size <= 0) {
-                    content = Buffer.alloc(0);
-                }
-                else {
-                    // Slice from the pre-read data buffer — zero-copy view
-                    const offset = parseInt(file.offset);
-                    content = dataBuf.subarray(offset, offset + file.size);
-                }
-                wrappedFs.writeFileSync(destFilename, content);
-                if (file.executable) {
-                    wrappedFs.chmodSync(destFilename, '755');
-                }
-            }
-            catch (e) {
-                extractionErrors.push(e);
-            }
-        }
-    }
-    if (extractionErrors.length) {
-        throw new Error('Unable to extract some files:\n\n' +
-            extractionErrors.map((error) => error.stack).join('\n\n'));
-    }
-}
-
-//# sourceMappingURL=asar.js.map
-
 /***/ })
 
 /******/ 	});
@@ -55224,64 +45653,6 @@ function extractAll(archivePath, dest) {
 /******/ 	}
 /******/ 	
 /************************************************************************/
-/******/ 	/* webpack/runtime/create fake namespace object */
-/******/ 	(() => {
-/******/ 		var getProto = Object.getPrototypeOf ? (obj) => (Object.getPrototypeOf(obj)) : (obj) => (obj.__proto__);
-/******/ 		var leafPrototypes;
-/******/ 		// create a fake namespace object
-/******/ 		// mode & 1: value is a module id, require it
-/******/ 		// mode & 2: merge all properties of value into the ns
-/******/ 		// mode & 4: return value when already ns object
-/******/ 		// mode & 16: return value when it's Promise-like
-/******/ 		// mode & 8|1: behave like require
-/******/ 		__nccwpck_require__.t = function(value, mode) {
-/******/ 			if(mode & 1) value = this(value);
-/******/ 			if(mode & 8) return value;
-/******/ 			if(typeof value === 'object' && value) {
-/******/ 				if((mode & 4) && value.__esModule) return value;
-/******/ 				if((mode & 16) && typeof value.then === 'function') return value;
-/******/ 			}
-/******/ 			var ns = Object.create(null);
-/******/ 			__nccwpck_require__.r(ns);
-/******/ 			var def = {};
-/******/ 			leafPrototypes = leafPrototypes || [null, getProto({}), getProto([]), getProto(getProto)];
-/******/ 			for(var current = mode & 2 && value; typeof current == 'object' && !~leafPrototypes.indexOf(current); current = getProto(current)) {
-/******/ 				Object.getOwnPropertyNames(current).forEach((key) => (def[key] = () => (value[key])));
-/******/ 			}
-/******/ 			def['default'] = () => (value);
-/******/ 			__nccwpck_require__.d(ns, def);
-/******/ 			return ns;
-/******/ 		};
-/******/ 	})();
-/******/ 	
-/******/ 	/* webpack/runtime/define property getters */
-/******/ 	(() => {
-/******/ 		// define getter functions for harmony exports
-/******/ 		__nccwpck_require__.d = (exports, definition) => {
-/******/ 			for(var key in definition) {
-/******/ 				if(__nccwpck_require__.o(definition, key) && !__nccwpck_require__.o(exports, key)) {
-/******/ 					Object.defineProperty(exports, key, { enumerable: true, get: definition[key] });
-/******/ 				}
-/******/ 			}
-/******/ 		};
-/******/ 	})();
-/******/ 	
-/******/ 	/* webpack/runtime/hasOwnProperty shorthand */
-/******/ 	(() => {
-/******/ 		__nccwpck_require__.o = (obj, prop) => (Object.prototype.hasOwnProperty.call(obj, prop))
-/******/ 	})();
-/******/ 	
-/******/ 	/* webpack/runtime/make namespace object */
-/******/ 	(() => {
-/******/ 		// define __esModule on exports
-/******/ 		__nccwpck_require__.r = (exports) => {
-/******/ 			if(typeof Symbol !== 'undefined' && Symbol.toStringTag) {
-/******/ 				Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' });
-/******/ 			}
-/******/ 			Object.defineProperty(exports, '__esModule', { value: true });
-/******/ 		};
-/******/ 	})();
-/******/ 	
 /******/ 	/* webpack/runtime/compat */
 /******/ 	
 /******/ 	if (typeof __nccwpck_require__ !== 'undefined') __nccwpck_require__.ab = __dirname + "/";

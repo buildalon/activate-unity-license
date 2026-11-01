@@ -12,6 +12,9 @@ on:
         required: true
       UNITY_PASSWORD:
         required: true
+      CI_TOKEN:
+        description: Keys the encrypted run license that macOS and Linux rows activate from.
+        required: false
 jobs:
   build:
     name: ${{ matrix.name }}
@@ -19,21 +22,53 @@ jobs:
       matrix: ${{ fromJSON(inputs.matrix) }}
       fail-fast: false
     runs-on: ${{ matrix.os }}
+    # a hung editor or licensing call must not hold the matrix
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v6
-      - uses: buildalon/unity-setup@main
+      - uses: buildalon/unity-setup@v3
         with:
           version-file: None
           unity-version: ${{ matrix.unity-version }}
           build-targets: ${{ matrix.build-target }}
+      # macOS and Linux runners all report the same machine identity to Unity, so the license the license job activated
+      # once for this run serves every macOS or Linux row; it arrives as an encrypted artifact and is never returned.
+      # Without it, the action signs in with the account. Windows runners are a new machine every job, so Windows rows
+      # sign in and return the license. 4.x and 5.x editors need their own license version, so they always sign in.
+      - name: Download run license
+        id: download-run-license
+        if: ${{ runner.os != 'Windows' && !startsWith(matrix.unity-version, '4.') && !startsWith(matrix.unity-version, '5.') }}
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: unity-license-${{ runner.os }}
+          path: ${{ runner.temp }}/unity-license
+      - name: Decrypt run license
+        id: run-license
+        if: ${{ steps.download-run-license.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          CI_TOKEN: ${{ secrets.CI_TOKEN }}
+        run: |
+          set -euo pipefail
+          dir="${RUNNER_TEMP}/unity-license"
+          license="${dir}/Unity_lic.ulf"
+          # the key never reaches a command line: openssl reads it from the environment
+          export LICENSE_KEY="${CI_TOKEN}:${GITHUB_RUN_ID}"
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -in "${dir}/unity-license.enc" -out "${license}" -pass env:LICENSE_KEY
+          echo "path=${license}" >> "${GITHUB_OUTPUT}"
       - uses: ./ # buildalon/activate-unity-license
+        env:
+          # activates from the run license when it fits this machine, otherwise signs in with the account
+          UNITY_LICENSE: ${{ steps.run-license.outputs.path }}
         with:
           license: Personal
           username: ${{ secrets.UNITY_USERNAME }}
           password: ${{ secrets.UNITY_PASSWORD }}
-      - uses: buildalon/unity-action@main
+      - uses: buildalon/unity-action@v3
         timeout-minutes: 10
         with:
           args: -quit -nographics -createProject "${{ github.workspace }}/Test Project"
