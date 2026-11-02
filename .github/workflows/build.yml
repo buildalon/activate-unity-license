@@ -70,7 +70,7 @@ jobs:
           license: Personal
           username: ${{ secrets.UNITY_USERNAME }}
           password: ${{ secrets.UNITY_PASSWORD }}
-      - uses: buildalon/unity-action@v4
+      - uses: buildalon/unity-action@v3
         timeout-minutes: 10
         with:
           args: -quit -nographics -createProject "${{ github.workspace }}/Test Project"
