@@ -1,8 +1,8 @@
 name: 'Buildalon Activate Unity License'
-description: 'A GitHub Action to activate a Unity Game Engine license for CI/CD workflows.'
+description: A GitHub Action to activate a Unity Game Engine license for CI/CD workflows.
 branding:
   color: 'red'
-  icon: 'log-in'
+  icon: log-in
 inputs:
   license:
     description: 'Must be one of `personal`, `professional`, or `floating`.'
@@ -29,10 +29,15 @@ inputs:
     deprecationMessage: 'Use the `configuration` input instead of `services-config`.'
     required: false
     default: ''
+  return-license:
+    description: 'When the post step returns the license: `auto` skips a `personal` license on GitHub-hosted macOS and Linux runners, which share one machine identity; `always` returns it; `never` keeps it. Floating licenses always release their lease.'
+    required: false
+    default: 'auto'
   license-version:
-    description: 'Must be one of `5.x` (Unity 5.x), `6.x` (Unity 2017+)'
+    description: 'Deprecated. The license version is detected from the installed editor.'
+    deprecationMessage: 'The license version is detected from the installed editor; remove the `license-version` input.'
     required: false
 runs:
-  using: 'node24'
-  main: 'dist/index.js'
-  post: 'dist/index.js'
+  using: node24
+  main: dist/index.js
+  post: dist/index.js
