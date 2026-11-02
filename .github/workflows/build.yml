@@ -33,6 +33,8 @@ jobs:
           version-file: None
           unity-version: ${{ matrix.unity-version }}
           build-targets: ${{ matrix.build-target }}
+          # the matrix includes legacy editors with known security alerts, which only need to install and activate
+          allow-security-alert: true
       # macOS and Linux runners all report the same machine identity to Unity, so the license the license job activated
       # once for this run serves every macOS or Linux row; it arrives as an encrypted artifact and is never returned.
       # Without it, the action signs in with the account. Windows runners are a new machine every job, so Windows rows
@@ -68,7 +70,7 @@ jobs:
           license: Personal
           username: ${{ secrets.UNITY_USERNAME }}
           password: ${{ secrets.UNITY_PASSWORD }}
-      - uses: buildalon/unity-action@v3
+      - uses: buildalon/unity-action@v4
         timeout-minutes: 10
         with:
           args: -quit -nographics -createProject "${{ github.workspace }}/Test Project"
