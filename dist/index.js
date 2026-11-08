@@ -45448,6 +45448,9 @@ async function Deactivate() {
         if (license === unity_cli_1.LicenseType.professional && when === 'auto') {
             when = 'always';
         }
+        if (license === unity_cli_1.LicenseType.floating) {
+            when = 'always';
+        }
         if (license === unity_cli_1.LicenseType.professional && when === 'never') {
             core.warning(`The Unity professional license was not returned, so it keeps holding a seat. ${exports.SEAT_FIX}`);
         }

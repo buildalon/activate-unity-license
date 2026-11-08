@@ -26,6 +26,11 @@ export async function Deactivate(): Promise<void> {
             when = 'always';
         }
 
+        // a floating lease is always released, so `never` cannot leave it held on the license server
+        if (license === LicenseType.floating) {
+            when = 'always';
+        }
+
         if (license === LicenseType.professional && when === 'never') {
             core.warning(`The Unity professional license was not returned, so it keeps holding a seat. ${SEAT_FIX}`);
         }
