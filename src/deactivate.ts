@@ -1,4 +1,4 @@
-import core = require('@actions/core');
+import * as core from '@actions/core';
 import {
     LicenseType,
     ReturnLicense,
@@ -28,6 +28,10 @@ export async function Deactivate(): Promise<void> {
 
         // a floating lease is always released, so `never` cannot leave it held on the license server
         if (license === LicenseType.floating) {
+            if (when === 'never') {
+                core.info('return-license: never does not apply to floating licenses, so the lease is released.');
+            }
+
             when = 'always';
         }
 

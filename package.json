@@ -21,20 +21,15 @@
     "action"
   ],
   "dependencies": {
-    "@actions/core": "^1.11.1",
-    "@actions/exec": "^1.1.1",
+    "@actions/core": "^3.0.1",
+    "@actions/exec": "^3.0.0",
     "@rage-against-the-pixel/unity-cli": "^4.1.2"
   },
-  "overrides": {
-    "@actions/core": {
-      "@actions/http-client": "^3.0.2"
-    }
-  },
   "devDependencies": {
-    "@types/node": "^24.12.4",
-    "@vercel/ncc": "^0.34.0",
+    "@types/node": "^24.19.2",
+    "@vercel/ncc": "^0.45.0",
     "shx": "^0.4.0",
-    "typescript": "^5.9.3"
+    "typescript": "^6.0.3"
   },
   "scripts": {
     "build": "npm run clean && npm run bundle",
