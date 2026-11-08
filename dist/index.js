@@ -264,6 +264,7 @@ exports.FindLicenseExhaustedLine = FindLicenseExhaustedLine;
 exports.ReportFailure = ReportFailure;
 const logging_1 = __nccwpck_require__(4191);
 const unity_security_1 = __nccwpck_require__(886);
+const unity_cli_1 = __nccwpck_require__(4812);
 /** Annotation title for a failure a later rerun can clear because a license seat was taken. */
 exports.LICENSE_EXHAUSTED_MARKER = 'unity-license-exhausted';
 /** Annotation title for a network or CDN failure a later rerun can clear. */
@@ -272,8 +273,9 @@ exports.TRANSIENT_FAILURE_MARKER = 'unity-transient-failure';
 // "acquiring license failed" also cover a wrong password or a revoked license, which a rerun would only repeat.
 // Literal alternations only, so matching stays linear on any message.
 const LICENSE_EXHAUSTED_PATTERN = /activations? limit|maximum number of activations|max activations|no free seats?|no available seats?|seat limit|0 free entitlements|sign-in rate limit/i;
-// a refused connection usually means a wrong host or port, which a rerun repeats, so it is not listed
-const TRANSIENT_PATTERN = /HTTP 5\d\d|Bad Gateway|Service Unavailable|Gateway Time-?out|ECONNRESET|ECONNABORTED|ETIMEDOUT|EAI_AGAIN|socket hang up/i;
+// a refused connection usually means a wrong host or port, which a rerun repeats, so it is not listed; "retryable exit code"
+// is the installer's network, install-locked or timeout exit after its own retry
+const TRANSIENT_PATTERN = /HTTP 5\d\d|Bad Gateway|Service Unavailable|Gateway Time-?out|ECONNRESET|ECONNABORTED|ETIMEDOUT|EAI_AGAIN|socket hang up|retryable exit code/i;
 /**
  * The marker for a failure a rerun after other jobs finish can clear, if the message names one.
  * @param message The error message.
@@ -311,9 +313,17 @@ function ReportFailure(error) {
         logging_1.Logger.instance.annotate(logging_1.LogLevel.ERROR, message, undefined, undefined, undefined, undefined, undefined, error.title);
         return;
     }
-    const marker = ClassifyFailure(message);
+    // the official CLI's exit 8 means tests ran and failed, which a rerun repeats whatever the message says
+    const marker = error instanceof unity_cli_1.UnityCliError && error.exitCode === unity_cli_1.UNITY_CLI_TESTS_FAILED_EXIT_CODE
+        ? undefined
+        : ClassifyFailure(message);
     if (marker) {
         logging_1.Logger.instance.annotate(logging_1.LogLevel.INFO, `Retryable failure: ${message}`, undefined, undefined, undefined, undefined, undefined, marker);
+    }
+    // the official CLI already annotated its own error in github format, so this line stays in the log only, at every log level
+    if (error instanceof unity_cli_1.UnityCliError && error.annotated) {
+        logging_1.Logger.instance.ci(message);
+        return;
     }
     logging_1.Logger.instance.error(message);
 }
@@ -3148,7 +3158,10 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.UnityCli = void 0;
+exports.UnityCli = exports.UnityCliError = exports.UNITY_CLI_TESTS_FAILED_EXIT_CODE = exports.UNITY_CLI_SERVICE_UNREACHABLE_EXIT_CODE = void 0;
+exports.HasErrorAnnotation = HasErrorAnnotation;
+exports.UnityCliEnvironment = UnityCliEnvironment;
+exports.UnityCliExitPhrase = UnityCliExitPhrase;
 exports.FindAbsolutePath = FindAbsolutePath;
 const fs = __importStar(__nccwpck_require__(9896));
 const os = __importStar(__nccwpck_require__(857));
@@ -3162,6 +3175,47 @@ const CDN_BASE = 'https://public-cdn.cloud.unity3d.com/hub/prod/cli/';
 const TOOL_NAME = 'unity-cli';
 const EXE_NAME = process.platform === 'win32' ? 'unity.exe' : 'unity';
 const VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+/** The official CLI's exit code for a Unity service it could not reach even after its own retries: safe to rerun. */
+exports.UNITY_CLI_SERVICE_UNREACHABLE_EXIT_CODE = 7;
+/** The official CLI's exit code for `unity test` runs whose tests ran and failed: a rerun repeats it, so it is never retried. */
+exports.UNITY_CLI_TESTS_FAILED_EXIT_CODE = 8;
+/** A failed official CLI command, with its exit code and whether the CLI already printed its own error annotation. */
+class UnityCliError extends Error {
+    exitCode;
+    annotated;
+    constructor(message, exitCode, annotated = false) {
+        super(message);
+        this.exitCode = exitCode;
+        this.annotated = annotated;
+        this.name = 'UnityCliError';
+    }
+}
+exports.UnityCliError = UnityCliError;
+/**
+ * Whether official CLI output holds an error annotation it wrote in github format (`::error::...`).
+ * @param output The CLI's stdout and stderr.
+ */
+function HasErrorAnnotation(output) {
+    return /^::error(?: [^:\r\n]*)?::/m.test(output);
+}
+/**
+ * The environment for an official CLI process. Under GitHub Actions, UNITY_FORMAT defaults to github, so the CLI writes its
+ * own failures as annotations; an explicit UNITY_FORMAT or `--format` still wins. The job's environment is not changed.
+ * @param base The environment to start from. Defaults to process.env.
+ */
+function UnityCliEnvironment(base = process.env) {
+    if (base.GITHUB_ACTIONS === 'true' && !base.UNITY_FORMAT && !base.HUB_FORMAT) {
+        return { ...base, UNITY_FORMAT: 'github' };
+    }
+    return { ...base };
+}
+/**
+ * The phrase a failure message uses for an official CLI exit code. Exit 7 is named retryable, so ClassifyFailure marks it.
+ * @param exitCode The CLI's exit code.
+ */
+function UnityCliExitPhrase(exitCode) {
+    return `${exitCode === exports.UNITY_CLI_SERVICE_UNREACHABLE_EXIT_CODE ? 'retryable ' : ''}exit code ${exitCode}`;
+}
 /**
  * A thin wrapper over Unity's official CLI (`unity`).
  * @see https://docs.unity.com/en-us/cli
@@ -3314,7 +3368,7 @@ class UnityCli {
                 const child = (0, child_process_1.spawn)(this.executable, args, {
                     shell: false,
                     stdio: ['ignore', 'pipe', 'pipe'],
-                    env: process.env,
+                    env: UnityCliEnvironment(),
                     ...(0, process_tracker_1.OwnedSpawnOptions)(),
                 });
                 // helpers the CLI leaves running, such as its licensing client, stay reachable through this record
@@ -3397,7 +3451,9 @@ class UnityCli {
         const result = await this.Run(args, { stream: true, ...options });
         if (result.exitCode !== 0) {
             const tail = options.stream === false ? `\n${result.stdout}${stripHint(result.stderr)}` : '';
-            throw new Error(`unity ${(0, utilities_1.redactSensitiveLiterals)(args.join(' '), options.redactLiterals)} failed with exit code ${result.exitCode}${tail}`);
+            // a streamed github-format error is already on the run summary, so ReportFailure does not annotate this one again
+            const annotated = options.stream !== false && HasErrorAnnotation(`${result.stdout}\n${result.stderr}`);
+            throw new UnityCliError(`unity ${(0, utilities_1.redactSensitiveLiterals)(args.join(' '), options.redactLiterals)} failed with ${UnityCliExitPhrase(result.exitCode)}${tail}`, result.exitCode, annotated);
         }
         return result.stdout;
     }
@@ -3423,7 +3479,7 @@ class UnityCli {
         const { exitCode, envelope, stdout, stderr } = await this.RunJson(args, options);
         if (exitCode !== 0 || !envelope || envelope.success === false) {
             const errors = envelope?.errors?.map(e => `${e.code}: ${e.message}`).join('\n') || `${stdout}${stripHint(stderr)}`.trim();
-            throw new Error(`unity ${(0, utilities_1.redactSensitiveLiterals)(args.join(' '), options.redactLiterals)} failed with exit code ${exitCode}\n${errors}`);
+            throw new UnityCliError(`unity ${(0, utilities_1.redactSensitiveLiterals)(args.join(' '), options.redactLiterals)} failed with ${UnityCliExitPhrase(exitCode)}\n${errors}`, exitCode);
         }
         return envelope.data;
     }
@@ -3948,6 +4004,7 @@ class UnityEditor {
         let unityProcess;
         let unityRunOutput = undefined;
         let editorLogPath = undefined;
+        let cliAnnotated = false;
         const editorRootPath = this.editorRootPath;
         let runStartedAt = 0;
         let runPaths = [];
@@ -4054,7 +4111,7 @@ class UnityEditor {
                 const child = (0, child_process_1.spawn)(unityCli.executable, runArgs, {
                     stdio: ['ignore', 'pipe', 'pipe'],
                     ...(0, process_tracker_1.OwnedSpawnOptions)(),
-                    env: baseEditorEnv
+                    env: (0, unity_cli_1.UnityCliEnvironment)(baseEditorEnv)
                 });
                 const collect = (data) => { unityRunOutput += data.toString(); };
                 child.stdout.on('data', collect);
@@ -4153,7 +4210,9 @@ class UnityEditor {
                         throw new UnityProjectOpenError(`unity run did not start the editor:\n${output}`, parseInt(projectOpen[1], 10));
                     }
                     if (output.length > 0) {
-                        this.logger.info(`unity run output:\n${output}`);
+                        // printed at every log level, so github-format error lines in it always become the run's annotations
+                        this.logger.ci(`unity run output:\n${output}`);
+                        cliAnnotated = (0, unity_cli_1.HasErrorAnnotation)(output);
                     }
                 }
                 if (exitCode !== undefined && exitCode !== 0) {
@@ -4165,7 +4224,12 @@ class UnityEditor {
                 else if (exitCode !== 0) {
                     // a run that stopped because no license seat was free names it, so the failure is marked retryable
                     const licenseLine = (0, failure_markers_1.FindLicenseExhaustedLine)(logTail?.errorLines ?? []);
-                    throw Error(`Unity failed with exit code ${exitCode}${licenseLine ? `: ${licenseLine}` : ''}`);
+                    const detail = licenseLine ? `: ${licenseLine}` : '';
+                    // only unity run's exit codes follow the official CLI's table; an editor launched directly keeps its own
+                    if (unityRunOutput !== undefined) {
+                        throw new unity_cli_1.UnityCliError(`Unity failed with ${(0, unity_cli_1.UnityCliExitPhrase)(exitCode)}${detail}`, exitCode, cliAnnotated);
+                    }
+                    throw Error(`Unity failed with exit code ${exitCode}${detail}`);
                 }
             }
             else {
@@ -4687,7 +4751,9 @@ class UnityInstaller {
             return;
         }
         if (result.exitCode !== 0) {
-            throw new Error(`unity ${args.join(' ')} failed with exit code ${result.exitCode}`);
+            // a retryable code that outlasts the retry is named as one, so ClassifyFailure marks it for a later rerun
+            const retryable = RETRYABLE_EXIT_CODES.includes(result.exitCode) ? 'retryable ' : '';
+            throw new unity_cli_1.UnityCliError(`unity ${args.join(' ')} failed with ${retryable}exit code ${result.exitCode}`, result.exitCode, (0, unity_cli_1.HasErrorAnnotation)(`${result.stdout}\n${result.stderr}`));
         }
     }
     /**
