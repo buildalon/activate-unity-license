@@ -27,7 +27,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: buildalon/unity-setup@v3
         with:
           version-file: None
@@ -70,7 +70,7 @@ jobs:
           license: Personal
           username: ${{ secrets.UNITY_USERNAME }}
           password: ${{ secrets.UNITY_PASSWORD }}
-      - uses: buildalon/unity-action@v3
+      - uses: buildalon/unity-action@v4
         timeout-minutes: 10
         with:
           args: -quit -nographics -createProject "${{ github.workspace }}/Test Project"
