@@ -1,6 +1,6 @@
 {
   "name": "activate-unity-license",
-  "version": "3.0.2",
+  "version": "3.0.3",
   "description": "A GitHub Action to activate a Unity Game Engine license for CI/CD workflows.",
   "author": "buildalon",
   "license": "MIT",
@@ -23,7 +23,7 @@
   "dependencies": {
     "@actions/core": "^3.0.1",
     "@actions/exec": "^3.0.0",
-    "@rage-against-the-pixel/unity-cli": "^4.2.2"
+    "@rage-against-the-pixel/unity-cli": "^4.2.4"
   },
   "devDependencies": {
     "@types/node": "^24.19.2",
@@ -34,6 +34,6 @@
   "scripts": {
     "build": "npm run clean && npm run bundle",
     "bundle": "ncc build src/index.ts -o dist --source-map --license licenses.txt",
-    "clean": "npm install && shx rm -rf dist/ out/ node_modules/ && npm ci"
+    "clean": "npm install && npm update && shx rm -rf dist/ out/ node_modules/ && npm ci"
   }
 }
