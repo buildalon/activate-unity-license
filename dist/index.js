@@ -381,11 +381,13 @@ const TRANSIENT_PATTERN = /HTTP 5\d\d|Bad Gateway|Service Unavailable|Gateway Ti
  * @returns The marker, or undefined for a failure a rerun would repeat.
  */
 function ClassifyFailure(message) {
-    if (LICENSE_EXHAUSTED_PATTERN.test(message)) {
+    // only classify the final failure, not an earlier CLI error appended as context after a fallback
+    const primary = message.split('\nBefore the fallback:')[0] ?? message;
+    if (LICENSE_EXHAUSTED_PATTERN.test(primary)) {
         return exports.LICENSE_EXHAUSTED_MARKER;
     }
     // Node reports a download cut off mid-stream with a bare "aborted"
-    if (TRANSIENT_PATTERN.test(message) || /^(Error: )?aborted$/.test(message.trim())) {
+    if (TRANSIENT_PATTERN.test(primary) || /^(Error: )?aborted$/.test(primary.trim())) {
         return exports.TRANSIENT_FAILURE_MARKER;
     }
     return undefined;
@@ -1696,6 +1698,8 @@ async function ActivateLicense(options) {
     logger.CI_setOutput('license-source', 'account');
     let cliError;
     let inconsistent = false;
+    let unreleasedLease = false;
+    let releaseError;
     try {
         const result = await activateWithUnityCli(options);
         if (result.activated) {
@@ -1704,9 +1708,17 @@ async function ActivateLicense(options) {
         }
         cliError = result.reason;
         inconsistent = result.inconsistent === true;
+        unreleasedLease = result.unreleasedLease === true;
+        releaseError = result.releaseError;
     }
     catch (error) {
         cliError = error;
+    }
+    if (unreleasedLease) {
+        const releaseMessage = releaseError instanceof Error ? releaseError.message : String(releaseError);
+        const detail = `${cliError}\nCould not release the leftover lease, so skipping fallback activation to avoid occupying a second seat: ${releaseMessage}`;
+        logger.annotate(logging_1.LogLevel.WARN, `Unity CLI reported a successful activation without an active license.\n${detail}`, undefined, undefined, undefined, undefined, undefined, 'unity-cli-inconsistent-activation');
+        throw new Error(detail, { cause: releaseError });
     }
     if (inconsistent) {
         logger.annotate(logging_1.LogLevel.WARN, `Unity CLI reported a successful activation without an active license, falling back to the Unity Licensing Client.\n${cliError}`, undefined, undefined, undefined, undefined, undefined, 'unity-cli-inconsistent-activation');
@@ -1957,6 +1969,7 @@ async function activateWithUnityCli(options) {
             logging_1.Logger.instance.CI_mask(leftover);
         }
         let released = 'no';
+        let releaseError;
         if (options.licenseType === LicenseType.personal && IsSharedRunnerIdentity()) {
             // same safeguard as ReturnLicense: a return here would revoke the license for every job and repo on this identity
             released = 'skipped on a shared runner identity';
@@ -1967,12 +1980,15 @@ async function activateWithUnityCli(options) {
                 released = 'yes';
             }
             catch (error) {
+                releaseError = error;
                 logging_1.Logger.instance.warn(`Could not release the lease left by the inconsistent activation.\n${error}`);
             }
         }
         return {
             activated: false,
             inconsistent: true,
+            unreleasedLease: Boolean(leftover && releaseError !== undefined),
+            releaseError,
             reason: `unity license activate exited ${exitCode} and reported success, but unity license status reports no active license` +
                 ` (token in response: ${leftover ? 'yes' : 'no'}, lease released: ${released})`,
         };

@@ -23,7 +23,7 @@
   "dependencies": {
     "@actions/core": "^3.0.1",
     "@actions/exec": "^3.0.0",
-    "@rage-against-the-pixel/unity-cli": "^4.2.3"
+    "@rage-against-the-pixel/unity-cli": "^4.2.4"
   },
   "devDependencies": {
     "@types/node": "^24.19.2",
