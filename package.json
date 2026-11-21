@@ -34,6 +34,6 @@
   "scripts": {
     "build": "npm run clean && npm run bundle",
     "bundle": "ncc build src/index.ts -o dist --source-map --license licenses.txt",
-    "clean": "npm install && shx rm -rf dist/ out/ node_modules/ && npm ci"
+    "clean": "npm install && npm update && shx rm -rf dist/ out/ node_modules/ && npm ci"
   }
 }
